@@ -1,0 +1,42 @@
+// wrangler.jsonc — Cloudflare Workers deployment config for peer.ooo
+{
+  "name": "peer-ooo-worker",
+  "main": "src/index.js",
+  "compatibility_date": "2024-09-23",
+
+  // ESM modules format required for native Workers APIs
+  "compatibility_flags": ["nodejs_compat"],
+
+  // KV namespace binding — create with:
+  //   wrangler kv namespace create PEERS
+  // then paste the resulting id below
+  "kv_namespaces": [
+    {
+      "binding": "PEERS",
+      "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID",
+      // For local dev: wrangler kv namespace create PEERS --preview
+      "preview_id": "REPLACE_WITH_YOUR_PREVIEW_KV_NAMESPACE_ID"
+    }
+  ],
+
+  // Route for peer.ooo — configure after adding the zone in Cloudflare
+  "routes": [
+    {
+      "pattern": "peer.ooo/*",
+      "zone_name": "peer.ooo"
+    }
+  ],
+
+  // Optional: environment-specific overrides
+  "env": {
+    "production": {
+      "name": "peer-ooo-worker",
+      "routes": [
+        {
+          "pattern": "peer.ooo/*",
+          "zone_name": "peer.ooo"
+        }
+      ]
+    }
+  }
+}

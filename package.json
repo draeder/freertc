@@ -1,0 +1,15 @@
+{
+  "name": "peer-ooo-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WebRTC rendezvous and signaling Worker for peer.ooo",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^3.101.0"
+  }
+}

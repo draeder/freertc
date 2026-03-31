@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>peer.ooo — WebRTC Signaling Demo</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+
+    body {
+      font-family: 'Courier New', Courier, monospace;
+      background: #0d1117;
+      color: #c9d1d9;
+      margin: 0;
+      padding: 1rem;
+    }
+
+    h1 { color: #58a6ff; margin-bottom: 0.25rem; }
+    h2 { color: #79c0ff; margin: 1.25rem 0 0.5rem; font-size: 1rem; }
+
+    .note {
+      background: #161b22;
+      border-left: 3px solid #f0883e;
+      padding: 0.5rem 0.75rem;
+      font-size: 0.85rem;
+      color: #e3b341;
+      margin-bottom: 1rem;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+    }
+
+    @media (max-width: 768px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+
+    .panel {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 1rem;
+    }
+
+    label { display: block; margin-bottom: 0.25rem; font-size: 0.8rem; color: #8b949e; }
+
+    input, select, textarea {
+      width: 100%;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      color: #c9d1d9;
+      padding: 0.4rem 0.6rem;
+      border-radius: 4px;
+      font-family: inherit;
+      font-size: 0.85rem;
+      margin-bottom: 0.5rem;
+    }
+
+    button {
+      background: #238636;
+      color: #fff;
+      border: none;
+      padding: 0.4rem 0.9rem;
+      border-radius: 4px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.85rem;
+      margin-right: 0.4rem;
+      margin-bottom: 0.4rem;
+    }
+
+    button:disabled { background: #30363d; cursor: not-allowed; }
+    button.danger { background: #da3633; }
+    button.secondary { background: #1f6feb; }
+
+    #status-bar {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      padding: 0.4rem 0.75rem;
+      font-size: 0.8rem;
+      margin-bottom: 0.75rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    #status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #8b949e;
+      flex-shrink: 0;
+    }
+    #status-dot.connected  { background: #3fb950; }
+    #status-dot.registered { background: #58a6ff; }
+    #status-dot.error      { background: #f85149; }
+
+    #log {
+      height: 260px;
+      overflow-y: auto;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      padding: 0.5rem;
+      font-size: 0.75rem;
+      line-height: 1.4;
+      color: #8b949e;
+    }
+
+    #log div { margin-bottom: 2px; }
+
+    #candidates-list {
+      max-height: 150px;
+      overflow-y: auto;
+      font-size: 0.75rem;
+      color: #8b949e;
+    }
+
+    #candidates-list div {
+      border-bottom: 1px solid #21262d;
+      padding: 0.2rem 0;
+    }
+
+    .peer-id-display {
+      font-size: 0.7rem;
+      word-break: break-all;
+      color: #58a6ff;
+      margin-bottom: 0.5rem;
+    }
+
+    .mesh-state {
+      font-size: 0.75rem;
+      color: #8b949e;
+    }
+
+    .mesh-state span { color: #e3b341; }
+  </style>
+</head>
+<body>
+  <h1>peer.ooo — Signaling Demo</h1>
+
+  <div class="note">
+    ⚠ The Worker is <strong>only a rendezvous and signaling edge</strong>.
+    It has no knowledge of the mesh topology. Bootstrap candidates may be stale.
+    Relay only works when both peers are on the <em>same Worker isolate</em>.
+    Your mesh owns the real state.
+  </div>
+
+  <!-- Status bar -->
+  <div id="status-bar">
+    <span id="status-dot"></span>
+    <span id="status-text">Disconnected</span>
+    <span style="flex:1"></span>
+    <span style="color:#8b949e;font-size:0.75rem" id="isolate-note"></span>
+  </div>
+
+  <div class="grid">
+
+    <!-- Left panel: identity + controls -->
+    <div class="panel">
+      <h2>Identity</h2>
+      <label>Peer ID (auto-generated, persisted in sessionStorage)</label>
+      <div class="peer-id-display" id="peer-id-display">—</div>
+
+      <label>Network ID</label>
+      <input type="text" id="network-id" value="default" />
+
+      <label>Signal URL</label>
+      <input type="text" id="signal-url" value="wss://peer.ooo/ws" />
+
+      <label>Capabilities (JSON object, optional)</label>
+      <input type="text" id="capabilities" value='{"role":"browser","version":"1"}' />
+
+      <button id="btn-connect">Connect &amp; Register</button>
+      <button id="btn-disconnect" class="danger" disabled>Disconnect</button>
+
+      <h2>Bootstrap</h2>
+      <button id="btn-bootstrap" disabled>Request Candidates</button>
+
+      <div id="candidates-list" style="margin-top:0.5rem">
+        <em style="color:#8b949e;font-size:0.75rem">No candidates yet</em>
+      </div>
+
+      <h2>Mesh State (local)</h2>
+      <div class="mesh-state">
+        Connections: <span id="mesh-connections">0</span><br/>
+        Bootstrap candidates: <span id="mesh-candidates">0</span><br/>
+        <em style="font-size:0.7rem">Kademlia buckets and liveness live here — not in the Worker.</em>
+      </div>
+    </div>
+
+    <!-- Right panel: relay + log -->
+    <div class="panel">
+      <h2>Manual Relay (signal a target peer)</h2>
+      <label>Target Peer ID</label>
+      <input type="text" id="relay-target" placeholder="64-char hex peer ID" />
+
+      <label>Relay Type</label>
+      <select id="relay-type">
+        <option value="offer">offer</option>
+        <option value="answer">answer</option>
+        <option value="candidate">candidate</option>
+        <option value="renegotiate">renegotiate</option>
+        <option value="bye">bye</option>
+      </select>
+
+      <label>Payload (JSON — for offer/answer this would be RTCSessionDescription)</label>
+      <textarea id="relay-payload" rows="4">{"type":"offer","sdp":"..."}</textarea>
+
+      <button id="btn-relay" class="secondary" disabled>Send Relay</button>
+
+      <h2>WebRTC Demo (to target peer)</h2>
+      <label>Target Peer ID for WebRTC offer</label>
+      <input type="text" id="webrtc-target" placeholder="64-char hex peer ID" />
+      <button id="btn-offer" class="secondary" disabled>Initiate WebRTC Offer</button>
+
+      <h2>Event Log</h2>
+      <div id="log"></div>
+      <button id="btn-clear-log" class="secondary" style="margin-top:0.4rem;font-size:0.75rem">Clear</button>
+    </div>
+  </div>
+
+  <script type="module">
+    // Import client library from same directory.
+    import { connect } from './client.js';
+
+    let client = null;
+
+    const $ = id => document.getElementById(id);
+
+    function setStatus(text) {
+      $('status-text').textContent = text;
+      const dot = $('status-dot');
+      dot.className = '';
+      if (text.startsWith('registered')) dot.classList.add('registered');
+      else if (text.startsWith('connected')) dot.classList.add('connected');
+      else if (text === 'error') dot.classList.add('error');
+    }
+
+    function refreshMeshDisplay() {
+      if (!client) return;
+      $('mesh-connections').textContent = client.mesh.connections.size;
+      $('mesh-candidates').textContent  = client.mesh.bootstrapCandidates.length;
+    }
+
+    $('btn-connect').addEventListener('click', () => {
+      const networkId  = $('network-id').value.trim() || 'default';
+      const signalUrl  = $('signal-url').value.trim();
+      let capabilities = {};
+      try { capabilities = JSON.parse($('capabilities').value); } catch {}
+
+      client = connect({
+        networkId,
+        signalUrl,
+        capabilities,
+
+        onStatusChange(status) {
+          setStatus(status);
+          refreshMeshDisplay();
+        },
+
+        onRegistered(msg) {
+          $('peer-id-display').textContent = msg.peerId;
+          $('btn-bootstrap').disabled = false;
+          $('btn-relay').disabled     = false;
+          $('btn-offer').disabled     = false;
+          $('btn-disconnect').disabled = false;
+          $('btn-connect').disabled   = true;
+          $('isolate-note').textContent = 'Note: relay succeeds only within same Worker isolate';
+        },
+
+        onBootstrap(candidates) {
+          const list = $('candidates-list');
+          list.innerHTML = '';
+          if (candidates.length === 0) {
+            list.innerHTML = '<em style="color:#8b949e">No candidates returned (network may be empty)</em>';
+            return;
+          }
+          for (const c of candidates) {
+            const div = document.createElement('div');
+            div.textContent = `${c.peerId.slice(0, 16)}… net=${c.networkId} age=${Math.round((Date.now() - c.advertisedAt) / 1000)}s${c.advisory ? ' [advisory]' : ''}`;
+            list.appendChild(div);
+          }
+          refreshMeshDisplay();
+        },
+
+        onIncomingRelay(msg) {
+          console.log('[demo] incoming relay:', msg.relayType, 'from', msg.fromPeerId);
+          refreshMeshDisplay();
+        },
+      });
+
+      $('peer-id-display').textContent = sessionStorage.getItem('peerId') ?? '—';
+    });
+
+    $('btn-disconnect').addEventListener('click', () => {
+      client?.disconnect();
+      client = null;
+      $('btn-connect').disabled    = false;
+      $('btn-disconnect').disabled = true;
+      $('btn-bootstrap').disabled  = true;
+      $('btn-relay').disabled      = true;
+      $('btn-offer').disabled      = true;
+      setStatus('Disconnected');
+    });
+
+    $('btn-bootstrap').addEventListener('click', () => {
+      client?.requestBootstrap();
+    });
+
+    $('btn-relay').addEventListener('click', () => {
+      const toPeerId   = $('relay-target').value.trim();
+      const relayType  = $('relay-type').value;
+      let payload;
+      try { payload = JSON.parse($('relay-payload').value); } catch { payload = $('relay-payload').value; }
+      client?.relay(toPeerId, relayType, payload);
+    });
+
+    $('btn-offer').addEventListener('click', async () => {
+      const toPeerId = $('webrtc-target').value.trim();
+      if (!toPeerId) { alert('Enter a target peer ID'); return; }
+      // Use public STUN servers for demo purposes.
+      await client?.initiateConnection(toPeerId, [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+      ]);
+    });
+
+    $('btn-clear-log').addEventListener('click', () => {
+      $('log').innerHTML = '';
+    });
+
+    // Refresh mesh display periodically.
+    setInterval(refreshMeshDisplay, 2000);
+  </script>
+</body>
+</html>
