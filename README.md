@@ -1,5 +1,7 @@
 # freertc — WebRTC Signaling Worker
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A production-ready WebRTC rendezvous and signaling service built on **Cloudflare Workers**, **WebSockets**, and **MongoDB Atlas**.
 
 **GitHub:** [github.com/draeder/freertc](https://github.com/draeder/freertc)
