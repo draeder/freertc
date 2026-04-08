@@ -1,0 +1,40 @@
+// wrangler.template.jsonc — Copy to wrangler.jsonc for local/deploy use.
+{
+  "name": "freertc",
+  "main": "src/index.js",
+  "compatibility_date": "2024-09-23",
+
+  // ESM modules format required for native Workers APIs
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Serve static files from the public directory.
+  "assets": {
+    "directory": "public"
+  },
+
+  // MongoDB Atlas connection string — store as a Worker secret:
+  //   wrangler secret put MONGODB_URI
+  // then paste the mongodb+srv://... URI when prompted.
+  // No binding is needed in wrangler.jsonc; secrets are injected via env.
+
+  // ── Custom domain (OPTIONAL) ──────────────────────────────────────────────
+  // If you have a domain on Cloudflare, add it here:
+  //
+  // "routes": [
+  //   {
+  //     "pattern": "your-domain.example/*",
+  //     "zone_name": "your-domain.example"
+  //   }
+  // ]
+  //
+  // Without routes, Cloudflare automatically assigns a free subdomain:
+  //   https://freertc.<your-account>.workers.dev
+  // That URL works for WebSocket signaling too (wss://...).
+
+  // Optional: environment-specific overrides
+  "env": {
+    "production": {
+      "name": "freertc"
+    }
+  }
+}

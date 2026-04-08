@@ -1,0 +1,20 @@
+{
+  "name": "freertc",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WebRTC rendezvous and signaling Worker for peer.ooo",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "cd demo && npm run build && cd .. && rm -rf public/assets && cp -r demo/dist/* public/ && npx wrangler deploy",
+    "tail": "wrangler tail",
+    "setup": "node scripts/install-wizard.js",
+    "setup-indexes": "node scripts/setup-mongo-indexes.js"
+  },
+  "dependencies": {
+    "mongodb": "^6.12.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.80.0"
+  }
+}

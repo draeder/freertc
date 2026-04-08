@@ -1,0 +1,6 @@
+name = "demo"
+pages_build_output_dir = "dist"
+
+# Build command for Cloudflare Pages CI
+[env.production]
+name = "demo"

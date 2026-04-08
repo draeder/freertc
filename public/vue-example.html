@@ -1,0 +1,790 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vue Peer Demo</title>
+  <style>
+    :root {
+      --bg: #f4f7f2;
+      --panel: #fdfffb;
+      --ink: #1f2d1f;
+      --muted: #5d6c5d;
+      --line: #dbe5d7;
+      --accent: #245f36;
+      --accent-2: #1a4d7f;
+      --ok: #2f7d32;
+      --warn: #8a3d1f;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: 'Trebuchet MS', Verdana, sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 10% 10%, rgba(36, 95, 54, 0.16), transparent 42%),
+        radial-gradient(circle at 90% 20%, rgba(26, 77, 127, 0.14), transparent 45%),
+        var(--bg);
+      display: grid;
+      place-items: center;
+      padding: 1rem;
+    }
+
+    .app {
+      width: min(980px, 100%);
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      box-shadow: 0 18px 48px rgba(31, 45, 31, 0.12);
+      overflow: hidden;
+    }
+
+    .hero {
+      padding: 1.15rem 1.3rem;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(120deg, rgba(36, 95, 54, 0.14), rgba(26, 77, 127, 0.12));
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 1.55rem;
+    }
+
+    .subtitle {
+      margin: 0.35rem 0 0;
+      color: var(--muted);
+      font-size: 0.93rem;
+      max-width: 70ch;
+    }
+
+    .content {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      gap: 1rem;
+      padding: 1rem;
+    }
+
+    @media (max-width: 860px) {
+      .content { grid-template-columns: 1fr; }
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+    }
+
+    .guide {
+      padding: 0.95rem;
+      background: linear-gradient(180deg, #fff, #f6fbf5);
+    }
+
+    .card h2 {
+      margin: 0 0 0.6rem;
+      font-size: 1rem;
+      letter-spacing: 0.3px;
+      text-transform: uppercase;
+      color: #225f36;
+    }
+
+    .steps {
+      margin: 0;
+      padding-left: 1.1rem;
+      color: var(--muted);
+      line-height: 1.5;
+      font-size: 0.92rem;
+    }
+
+    .steps li { margin-bottom: 0.5rem; }
+
+    .note {
+      margin-top: 0.75rem;
+      border-radius: 10px;
+      background: #eef7eb;
+      padding: 0.65rem 0.7rem;
+      font-size: 0.87rem;
+      color: #315137;
+      line-height: 1.45;
+    }
+
+    .board {
+      padding: 0.95rem;
+    }
+
+    .status {
+      margin-bottom: 0.7rem;
+      padding: 0.6rem 0.7rem;
+      border-radius: 10px;
+      background: #f4f7ff;
+      border: 1px solid #d8e1f2;
+      font-size: 0.9rem;
+      color: #224d72;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.55rem;
+      align-items: center;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #9aa9bb;
+      display: inline-block;
+    }
+
+    .dot.ready { background: var(--ok); }
+    .dot.warn { background: #b77a10; }
+    .dot.bad { background: #b43c21; }
+
+    .row {
+      display: flex;
+      gap: 0.55rem;
+      margin-bottom: 0.7rem;
+      flex-wrap: wrap;
+    }
+
+    input {
+      flex: 1;
+      min-width: 180px;
+      padding: 0.62rem 0.72rem;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      color: var(--ink);
+      font-size: 0.95rem;
+    }
+
+    input:focus,
+    textarea:focus {
+      outline: 2px solid rgba(21, 94, 117, 0.28);
+      border-color: var(--accent-2);
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 74px;
+      padding: 0.62rem 0.72rem;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      color: var(--ink);
+      font-size: 0.92rem;
+      resize: vertical;
+      margin-bottom: 0.7rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    button {
+      border: 1px solid transparent;
+      border-radius: 10px;
+      padding: 0.6rem 0.85rem;
+      font-size: 0.92rem;
+      cursor: pointer;
+      transition: transform 120ms ease, filter 120ms ease;
+      white-space: nowrap;
+    }
+
+    button:hover { transform: translateY(-1px); }
+    button:active { transform: translateY(0); }
+    button.primary { background: var(--accent); color: #fff; }
+    button.secondary { background: var(--accent-2); color: #fff; }
+    button.warn { background: #a44f2f; color: #fff; }
+    button.ghost {
+      background: transparent;
+      border-color: var(--line);
+      color: var(--ink);
+    }
+
+    .pair {
+      display: flex;
+      gap: 0.55rem;
+      flex-wrap: wrap;
+      margin-bottom: 0.7rem;
+    }
+
+    .my-id {
+      margin-bottom: 0.75rem;
+      border: 1px dashed #bfd3c8;
+      border-radius: 10px;
+      padding: 0.6rem;
+      background: #f8fcf7;
+      animation: fade-in 260ms ease;
+    }
+
+    .label {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-bottom: 0.2rem;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      word-break: break-all;
+      font-size: 0.85rem;
+      line-height: 1.38;
+    }
+
+    .connections {
+      margin-top: 0.8rem;
+      border-top: 1px solid var(--line);
+      padding-top: 0.75rem;
+    }
+
+    .conn-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border: 1px solid var(--line);
+      background: #fbfdf9;
+      border-radius: 8px;
+      padding: 0.45rem 0.55rem;
+      margin-bottom: 0.45rem;
+      gap: 0.55rem;
+    }
+
+    .state {
+      font-size: 0.82rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+
+    .empty {
+      padding: 0.6rem 0.1rem;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    #log {
+      margin-top: 0.8rem;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #f9fbf8;
+      min-height: 190px;
+      max-height: 280px;
+      overflow-y: auto;
+      padding: 0.55rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.78rem;
+      line-height: 1.45;
+      color: #39523d;
+    }
+
+    #log div {
+      margin-bottom: 0.2rem;
+      border-bottom: 1px dotted #dce7d8;
+      padding-bottom: 0.2rem;
+    }
+
+    .meta {
+      margin-top: 0.8rem;
+      font-size: 0.87rem;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+
+    @keyframes fade-in {
+      from { opacity: 0; transform: translateY(5px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <script type="module">
+    import {
+      createApp,
+      computed,
+      onBeforeUnmount,
+      onMounted,
+      ref,
+    } from 'https://unpkg.com/vue@3/dist/vue.esm-browser.prod.js';
+    import { connect } from './client.js';
+
+    createApp({
+      setup() {
+        const defaultSignalUrl = (() => {
+          const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+          return `${scheme}//${location.host}/ws`;
+        })();
+
+        const networkId = ref('default');
+        const signalUrl = ref(defaultSignalUrl);
+        const remotePeerId = ref('');
+        const status = ref('disconnected');
+        const localPeerId = ref('Not registered yet');
+        const bootstrapCandidates = ref([]);
+        const connections = ref([]);
+        const clientRef = ref(null);
+        const manualRelayPayload = ref('{"kind":"ping","text":"hello from vue demo"}');
+        const autoMode = ref(true);
+
+        let refreshTimer = null;
+        let bootstrapTimer = null;
+        let hasAutoSelectedThisSession = false;
+        let autoHandshakeTimer = null;
+        let autoConnectTimer = null;
+        const handshakeAttempts = new Map();
+        const failedPeers = new Map(); // peerId -> timestamp when it failed
+        const recentIncomingOffers = new Map(); // peerId -> timestamp of last incoming offer
+        const CONNECTING_RETRY_MS = 30000; // 30 seconds — allow real WebRTC negotiation to complete
+        const FAILED_PEER_BLACKLIST_MS = 10000; // 10 seconds — don't auto-select peers that just failed
+
+        const isConnected = computed(() => Boolean(clientRef.value));
+        const statusTone = computed(() => {
+          if (status.value.startsWith('registered')) return 'ready';
+          if (status.value.startsWith('connected')) return 'warn';
+          if (status.value.startsWith('error') || status.value.startsWith('disconnected')) return 'bad';
+          return '';
+        });
+
+        function short(id) {
+          if (!id) return 'n/a';
+          return `${id.slice(0, 14)}...`;
+        }
+
+        function refreshConnections() {
+          const client = clientRef.value;
+          if (!client) {
+            connections.value = [];
+            return;
+          }
+
+          const rows = [];
+          const now = Date.now();
+          for (const [peerId, entry] of client.mesh.connections.entries()) {
+            rows.push({
+              peerId,
+              state: entry.state,
+              ageSeconds: Math.max(0, Math.round((Date.now() - entry.lastSeen) / 1000)),
+            });
+            
+            // Track peers that failed recently to avoid auto-selecting stale peers
+            if (entry.state === 'failed' || entry.state === 'closed') {
+              failedPeers.set(peerId, now);
+            }
+          }
+          
+          // Clean up old failed peer entries
+          for (const [peerId, timestamp] of failedPeers.entries()) {
+            if (now - timestamp > FAILED_PEER_BLACKLIST_MS) {
+              failedPeers.delete(peerId);
+            }
+          }
+          
+          connections.value = rows;
+
+          const hasConnected = rows.some((row) => row.state === 'connected');
+          if (hasConnected) {
+            stopBootstrapLoop();
+          } else if (autoMode.value && status.value.startsWith('registered')) {
+            startBootstrapLoop();
+          }
+        }
+
+        function upsertConnectionRow(peerId, state) {
+          const now = Date.now();
+          const index = connections.value.findIndex((row) => row.peerId === peerId);
+          if (index >= 0) {
+            connections.value[index] = {
+              ...connections.value[index],
+              state,
+              ageSeconds: 0,
+              lastSeenMs: now,
+            };
+            return;
+          }
+
+          connections.value = [{ peerId, state, ageSeconds: 0, lastSeenMs: now }, ...connections.value];
+        }
+
+        function hasAnyConnectedPeer() {
+          const client = clientRef.value;
+          if (!client) return false;
+          for (const entry of client.mesh.connections.values()) {
+            if (entry.state === 'connected') return true;
+          }
+          return false;
+        }
+
+        function appendUiLog(text) {
+          const logEl = document.getElementById('log');
+          if (!logEl) return;
+          const line = document.createElement('div');
+          line.textContent = `${new Date().toISOString()} ${text}`;
+          logEl.appendChild(line);
+          logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        function connectPeer() {
+          if (clientRef.value) return;
+
+          appendUiLog(`[ui] connecting to ${signalUrl.value.trim()} net=${networkId.value.trim() || 'default'}`);
+
+          clientRef.value = connect({
+            networkId: networkId.value.trim() || 'default',
+            signalUrl: signalUrl.value.trim(),
+            capabilities: { role: 'vue-demo', ui: 'two-tab' },
+            onStatusChange(nextStatus) {
+              status.value = nextStatus;
+              appendUiLog(`[ui] status=${nextStatus}`);
+              refreshConnections();
+            },
+            onRegistered(msg) {
+              localPeerId.value = msg.peerId;
+              appendUiLog(`[ui] registered peerId=${short(msg.peerId)} network=${msg.networkId}`);
+              requestBootstrap();
+              startBootstrapLoop();
+              maybeStartAutoHandshake();
+            },
+            onBootstrap(candidates) {
+              bootstrapCandidates.value = candidates.filter(c => c.peerId !== localPeerId.value);
+              appendUiLog(`[ui] bootstrap candidates=${bootstrapCandidates.value.length}`);
+              if (autoMode.value && !hasAutoSelectedThisSession && !hasAnyConnectedPeer() && bootstrapCandidates.value.length > 0) {
+                // Filter out peers that recently failed
+                const viable = bootstrapCandidates.value.filter(c => !failedPeers.has(c.peerId));
+                if (viable.length > 0) {
+                  const best = viable[0].peerId;
+                  remotePeerId.value = best;
+                  hasAutoSelectedThisSession = true;
+                  appendUiLog(`[ui] auto-selected candidate ${short(remotePeerId.value)}`);
+                }
+              }
+              maybeStartAutoHandshake();
+            },
+            onIncomingRelay(msg) {
+              appendUiLog(`[relay] ${msg.relayType} from=${short(msg.fromPeerId)}`);
+              if (msg.relayType === 'offer') {
+                recentIncomingOffers.set(msg.fromPeerId, Date.now());
+                upsertConnectionRow(msg.fromPeerId, 'connecting');
+                if (!remotePeerId.value) {
+                  remotePeerId.value = msg.fromPeerId;
+                }
+                setTimeout(refreshConnections, 250);
+                return;
+              }
+
+              if (msg.relayType === 'answer' || msg.relayType === 'candidate' || msg.relayType === 'renegotiate') {
+                upsertConnectionRow(msg.fromPeerId, 'connecting');
+                setTimeout(refreshConnections, 250);
+                return;
+              }
+              refreshConnections();
+            },
+            onConnectionStateChange(evt) {
+              if (!evt?.peerId || !evt?.state) return;
+              upsertConnectionRow(evt.peerId, evt.state);
+              if (evt.state === 'connecting') {
+                status.value = 'registered (connecting)';
+              } else if (evt.state === 'connected') {
+                status.value = 'registered (connected)';
+              }
+            },
+          });
+        }
+
+        function disconnectPeer() {
+          if (!clientRef.value) return;
+          clientRef.value.disconnect();
+          clientRef.value = null;
+          status.value = 'disconnected';
+          connections.value = [];
+          remotePeerId.value = '';  // Clear remote peer to prevent reconnection to old peer
+          bootstrapCandidates.value = [];  // Clear stale bootstrap data
+          hasAutoSelectedThisSession = false;  // Reset so next connection can auto-select
+          failedPeers.clear();  // Clear failed peer blacklist on disconnect
+          stopBootstrapLoop();
+          stopAutoHandshakeLoop();
+          stopAutoConnectLoop();
+          handshakeAttempts.clear();
+          appendUiLog('[ui] disconnected');
+        }
+
+        function requestBootstrap() {
+          clientRef.value?.requestBootstrap();
+        }
+
+        function useFirstCandidate() {
+          const first = bootstrapCandidates.value[0];
+          if (first) remotePeerId.value = first.peerId;
+        }
+
+        async function copyMyPeerId() {
+          const id = localPeerId.value;
+          if (!id || id === 'Not registered yet') return;
+          try {
+            await navigator.clipboard.writeText(id);
+            appendUiLog('[ui] copied local peer ID to clipboard');
+          } catch {
+            appendUiLog('[ui] failed to copy peer ID (clipboard blocked)');
+          }
+        }
+
+        async function startWebRtc() {
+          const toPeer = remotePeerId.value.trim();
+          if (!clientRef.value || !toPeer) {
+            appendUiLog('[ui] set remote peer ID first');
+            return;
+          }
+
+          // Show connecting immediately for better UX symmetry across tabs.
+          if (!connections.value.some((row) => row.peerId === toPeer)) {
+            connections.value = [
+              { peerId: toPeer, state: 'connecting', ageSeconds: 0 },
+              ...connections.value,
+            ];
+          }
+
+          appendUiLog(`[ui] starting handshake to ${short(toPeer)}`);
+          try {
+            await clientRef.value.initiateConnection(toPeer, [
+              { urls: 'stun:stun.l.google.com:19302' },
+              { urls: 'stun:stun1.l.google.com:19302' },
+            ]);
+            refreshConnections();
+          } catch (err) {
+            appendUiLog(`[ui] initiate failed: ${String(err)}`);
+            refreshConnections();
+          }
+        }
+
+        function shouldAutoInitiate(toPeer) {
+          // If this peer has a selected target, allow initiating.
+          // Glare is reduced by suppressing initiation when we just received an offer.
+          return Boolean(toPeer);
+        }
+
+        function maybeStartAutoHandshake() {
+          if (!autoMode.value || !clientRef.value || !status.value.startsWith('registered')) return;
+          if (hasAnyConnectedPeer()) return;
+
+          const toPeer = remotePeerId.value.trim();
+          if (!toPeer || toPeer === localPeerId.value) return;
+
+          // Skip peers that recently failed — they're likely stale
+          if (failedPeers.has(toPeer)) return;
+
+          if (!shouldAutoInitiate(toPeer)) return;
+
+          const lastOfferAt = recentIncomingOffers.get(toPeer) ?? 0;
+          if (Date.now() - lastOfferAt < 6000) return;
+
+          const conn = clientRef.value.mesh.connections.get(toPeer);
+          if (conn && conn.state === 'connected') return;
+
+          if (conn && conn.state === 'connecting') {
+            const age = Date.now() - (conn.lastSeen ?? Date.now());
+            if (age < CONNECTING_RETRY_MS) return;
+
+            appendUiLog(`[ui] stale connecting state for ${short(toPeer)}; closing and retrying`);
+            try { conn.connection?.close(); } catch {}
+            clientRef.value.mesh.connections.delete(toPeer);
+          }
+
+          const now = Date.now();
+          const lastAttempt = handshakeAttempts.get(toPeer) ?? 0;
+          if (now - lastAttempt < 2500) return;
+          handshakeAttempts.set(toPeer, now);
+
+          appendUiLog(`[ui] auto-handshake: initiating to ${short(toPeer)}`);
+          startWebRtc();
+        }
+
+        function startBootstrapLoop() {
+          const hasConnected = connections.value.some((row) => row.state === 'connected');
+          if (hasConnected) return;
+          stopBootstrapLoop();
+          bootstrapTimer = setInterval(() => {
+            if (clientRef.value && status.value.startsWith('registered')) {
+              requestBootstrap();
+            }
+          }, 1200);
+        }
+
+        function stopBootstrapLoop() {
+          clearInterval(bootstrapTimer);
+          bootstrapTimer = null;
+        }
+
+        function startAutoHandshakeLoop() {
+          stopAutoHandshakeLoop();
+          autoHandshakeTimer = setInterval(() => {
+            maybeStartAutoHandshake();
+          }, 1000);
+        }
+
+        function stopAutoHandshakeLoop() {
+          clearInterval(autoHandshakeTimer);
+          autoHandshakeTimer = null;
+        }
+
+        function startAutoConnectLoop() {
+          stopAutoConnectLoop();
+          autoConnectTimer = setInterval(() => {
+            if (!autoMode.value) return;
+            if (!clientRef.value) {
+              connectPeer();
+            }
+          }, 2000);
+        }
+
+        function stopAutoConnectLoop() {
+          clearInterval(autoConnectTimer);
+          autoConnectTimer = null;
+        }
+
+        function sendManualRelay() {
+          const toPeer = remotePeerId.value.trim();
+          if (!clientRef.value || !toPeer) return;
+          let payload;
+          try {
+            payload = JSON.parse(manualRelayPayload.value);
+          } catch {
+            payload = { text: manualRelayPayload.value };
+          }
+          clientRef.value.relay(toPeer, 'renegotiate', payload);
+          appendUiLog(`[ui] sent manual relay payload to ${short(toPeer)}`);
+        }
+
+        function clearLog() {
+          const logEl = document.getElementById('log');
+          if (logEl) logEl.innerHTML = '';
+        }
+
+        onMounted(() => {
+          // Always start fresh — no stale peer IDs from previous session
+          remotePeerId.value = '';
+          bootstrapCandidates.value = [];
+          hasAutoSelectedThisSession = false;
+          
+          refreshTimer = setInterval(refreshConnections, 500);
+          if (autoMode.value) {
+            connectPeer();
+            startAutoConnectLoop();
+            startAutoHandshakeLoop();
+          }
+        });
+
+        onBeforeUnmount(() => {
+          clearInterval(refreshTimer);
+          stopBootstrapLoop();
+          stopAutoHandshakeLoop();
+          stopAutoConnectLoop();
+        });
+
+        return {
+          bootstrapCandidates,
+          autoMode,
+          clearLog,
+          connectPeer,
+          connections,
+          copyMyPeerId,
+          disconnectPeer,
+          isConnected,
+          localPeerId,
+          manualRelayPayload,
+          networkId,
+          remotePeerId,
+          requestBootstrap,
+          sendManualRelay,
+          signalUrl,
+          startWebRtc,
+          status,
+          statusTone,
+          useFirstCandidate,
+          short,
+        };
+      },
+      template: `
+        <section class="app">
+          <header class="hero">
+            <h1>Vue 3 Two-Tab Peer Connection Demo</h1>
+            <p class="subtitle">Open this page in two tabs. It auto-connects, auto-discovers peers, and auto-starts WebRTC handshake when a candidate appears.</p>
+          </header>
+          <main class="content">
+            <aside class="card guide">
+              <h2>How To Use</h2>
+              <ol class="steps">
+                <li>Open this URL in two browser tabs.</li>
+                <li>Leave both tabs on the same network ID and wait a few seconds.</li>
+                <li>Each tab auto-requests bootstrap candidates and selects a target peer.</li>
+                <li>Handshake starts automatically from a deterministic initiator.</li>
+                <li>Watch connection state change to connected in both tabs.</li>
+              </ol>
+              <p class="note">Relay uses direct in-isolate delivery first, then KV mailbox delivery across isolates. A fresh peer ID is generated on each page refresh.</p>
+            </aside>
+
+            <section class="card board">
+              <h2>Peer Controls</h2>
+              <div class="status">
+                <span class="dot" :class="statusTone"></span>
+                <strong>Status:</strong> {{ status }}
+              </div>
+
+              <div class="meta" style="margin-top:0;margin-bottom:0.7rem">Auto mode: {{ autoMode ? 'ON' : 'OFF' }}</div>
+
+              <div class="row">
+                <input v-model="networkId" placeholder="Network ID (same in both tabs)" />
+                <input v-model="signalUrl" placeholder="Signal URL" />
+              </div>
+
+            <div class="row">
+                <button class="primary" @click="connectPeer" :disabled="isConnected">Connect peer</button>
+                <button class="warn" @click="disconnectPeer" :disabled="!isConnected">Disconnect</button>
+                <button class="ghost" @click="requestBootstrap" :disabled="!isConnected">Request bootstrap</button>
+              </div>
+
+              <div class="my-id">
+                <div class="label">Local Peer ID</div>
+                <div class="mono">{{ localPeerId }}</div>
+                <div style="margin-top:0.45rem">
+                  <button class="ghost" @click="copyMyPeerId" :disabled="!isConnected">Copy Local Peer ID</button>
+                </div>
+              </div>
+
+              <div class="label">Remote Peer ID</div>
+              <div class="pair">
+                <input v-model="remotePeerId" placeholder="Paste peer ID from the other tab" autocomplete="off" />
+                <button class="secondary" @click="startWebRtc" :disabled="!isConnected">Start WebRTC handshake</button>
+              </div>
+
+              <div class="pair">
+                <button class="ghost" @click="useFirstCandidate" :disabled="bootstrapCandidates.length === 0">Use first bootstrap candidate</button>
+              </div>
+
+              <div class="label">Manual Relay Payload (JSON)</div>
+              <textarea v-model="manualRelayPayload"></textarea>
+              <button class="ghost" @click="sendManualRelay" :disabled="!isConnected">Send manual relay (renegotiate)</button>
+
+              <div class="connections">
+                <div class="label">Connections</div>
+                <div v-if="connections.length === 0" class="empty">No active peer connections yet.</div>
+                <div v-for="conn in connections" :key="conn.peerId" class="conn-row">
+                  <div class="mono">{{ short(conn.peerId) }}</div>
+                  <div class="state">{{ conn.state }} • {{ conn.ageSeconds }}s</div>
+                </div>
+              </div>
+
+              <div id="log"></div>
+
+              <div class="meta">
+                Tip: Manual controls remain available, but default behavior is automatic connect, discovery, and handshake.
+              </div>
+              <div style="margin-top:0.55rem">
+                <button class="ghost" @click="clearLog">Clear log</button>
+              </div>
+            </section>
+          </main>
+        </section>
+      `,
+    }).mount('#app');
+  </script>
+</body>
+</html>
