@@ -1,459 +1,405 @@
-// src/index.js — Main Cloudflare Worker entry point.
-//
-// Architecture overview:
-//   - HTTP GET /        → health check
-//   - HTTP GET /ws      → WebSocket upgrade
-//   - HTTP GET /debug   → non-authoritative stats (isolate-local only)
-//   - All WebSocket traffic is handled in handleWebSocket()
-//
-// IMPORTANT: Without Durable Objects, this Worker has NO shared memory
-// between isolates. `peers` is local to this isolate only. Relay attempts
-// same-isolate delivery only; if the target is absent a NOT_CONNECTED error
-// is returned. KV provides advisory bootstrap data across instances
-// (eventually consistent). The peer mesh — not this Worker — owns real
-// topology and state.
+const PSP_VERSION = "1.0";
 
-import { CONFIG } from './config.js';
-import { log } from './log.js';
-import {
-  ERROR_CODES,
-} from './errors.js';
-import {
-  MSG,
-  RELAY_TYPES,
-  buildAck,
-  buildPeerList,
-  buildPong,
-  buildError,
-} from './protocol.js';
-import {
-  validatePspEnvelope,
-  validateAnnounceMessage,
-  validateSignalingMessage,
-} from './validation.js';
-import { createRateLimiter } from './rate-limit.js';
-import {
-  warmupKv,
-  createKv,
-  getKvAsync,
-  getKvDiagnostics,
-  writePeerAdvertisement,
-  expirePeerAdvertisement,
-  getBootstrapCandidates,
-  enqueueRelayMessage,
-  dequeueRelayMessages,
-} from './kv.js';
-import { tryParseJSON } from './util.js';
-import { verifyAuth } from './auth.js';
+const DISCOVERY_TYPES = new Set(["announce", "withdraw", "discover", "peer_list", "redirect"]);
+const NEGOTIATION_TYPES = new Set(["connect_request", "connect_accept", "connect_reject", "offer", "answer", "ice_candidate", "ice_end", "renegotiate"]);
+const CONTROL_TYPES = new Set(["ping", "pong", "bye", "error", "ack"]);
+const EXTENSION_TYPES = new Set(["ext"]);
 
-// ── Isolate-local peer registry ───────────────────────────────────────────────
-// Map<peerId, { socket, networkId, capabilities, regionHint, registeredAt }>
-// This is best-effort only. It is NOT a global registry.
-const peers = new Map();
+const MESSAGE_TYPES = new Set([
+  ...DISCOVERY_TYPES, ...NEGOTIATION_TYPES, ...CONTROL_TYPES, ...EXTENSION_TYPES
+]);
 
-// ── Main fetch handler ────────────────────────────────────────────────────────
+const RELAY_TYPES = new Set([
+  "connect_request", "connect_accept", "connect_reject",
+  "offer", "answer", "ice_candidate", "ice_end", "renegotiate",
+  "bye", "error", "ack", "ext", "peer_list", "redirect"
+]);
+
+const DEFAULT_TTL_MS = 30_000;
+const MAX_TTL_MS = 120_000;
+const MAX_MESSAGE_SIZE = 64 * 1024;
+const MAX_BATCH = 50;
+
+const livePeers = new Map(); // key: "network:peerId" -> { peerId, network, socket, lastSeen }
+const networkSubscribers = new Map(); // key: network -> Set of sockets
 
 export default {
-  async fetch(request, env) {
-    // Start MongoDB connection eagerly so it's ready by the time register arrives.
-    warmupKv(env);
-
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    const upgrade = request.headers.get("Upgrade");
 
-    // Health check
-    if (url.pathname === '/' && request.method === 'GET') {
-      return new Response(
-        JSON.stringify({ status: 'ok', service: 'webrtc signaling edge', ts: Date.now() }),
-        { headers: { 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Non-authoritative debug endpoint — isolate-local stats only
-    if (url.pathname === '/debug' && request.method === 'GET') {
-      return new Response(
-        JSON.stringify({
-          note: 'Isolate-local stats only. Not global. Not authoritative.',
-          isolatePeerCount: peers.size,
-          mongo: getKvDiagnostics(),
-          ts: Date.now(),
-        }),
-        { headers: { 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // WebSocket upgrade
-    if (url.pathname === '/ws' && request.method === 'GET') {
-      const upgrade = request.headers.get('Upgrade');
-      if (!upgrade || upgrade.toLowerCase() !== 'websocket') {
-        return new Response('Expected WebSocket upgrade', { status: 426 });
+    if (upgrade && upgrade.toLowerCase() === "websocket") {
+      if (url.pathname !== "/ws") {
+        return jsonResponse({ ok: false, error: "WebSocket endpoint is /ws" }, 404);
       }
-      return handleWebSocket(request, env);
+      return handleWebSocket(request, env, ctx);
     }
 
-    return new Response('Not found', { status: 404 });
-  },
+    if (url.pathname === "/ws") {
+      return jsonResponse({ ok: false, error: "Expected WebSocket upgrade on /ws" }, 426);
+    }
+
+    if (url.pathname === "/health") {
+      return jsonResponse({ ok: true, version: PSP_VERSION, peers: livePeers.size }, 200);
+    }
+
+    return env.ASSETS?.fetch(request) ?? new Response("Not Found", { status: 404 });
+  }
 };
 
-// ── WebSocket handler ─────────────────────────────────────────────────────────
+function jsonResponse(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8" }
+  });
+}
 
-async function handleWebSocket(request, env) {
-  const { 0: client, 1: server } = new WebSocketPair();
-  server.accept();
+// Broadcast peer list to all connected peers in a network
+async function broadcastPeerList(db, network) {
+  const sockets = networkSubscribers.get(network);
+  if (!sockets || sockets.size === 0) return;
 
-  // Connection context — mutable, scoped to this socket's lifetime.
-  const ctx = {
-    peerId:       null,
-    networkId:    null,
-    registered:   false,
-    rateLimiter:  createRateLimiter(),
-    lastActivity: Date.now(),
+  const now = Date.now();
+  const result = await db.prepare(`
+    SELECT peer_id, session_id, updated_at_ms
+    FROM psp_announcements
+    WHERE network = ?1 AND expires_at_ms > ?2
+    ORDER BY peer_id ASC
+    LIMIT ?3
+  `).bind(network, now, MAX_BATCH).all();
+
+  const peers = (result.results || []).map(row => ({
+    peer_id: row.peer_id,
+    session_id: row.session_id,
+    timestamp: row.updated_at_ms
+  }));
+
+  const message = {
+    psp_version: PSP_VERSION,
+    type: "peer_list",
+    network,
+    from: "bootstrap-relay",
+    to: null,
+    message_id: crypto.randomUUID(),
+    timestamp: Date.now(),
+    ttl_ms: DEFAULT_TTL_MS,
+    body: { peers }
   };
 
-  // Registration must arrive within REGISTER_TIMEOUT_MS.
-  const registerTimer = setTimeout(() => {
-    if (!ctx.registered) {
-      log.warn('ws.register_timeout', {});
-      server.send(buildError('', ERROR_CODES.REGISTER_TIMEOUT, 'Registration timeout', true));
-      server.close(4008, 'register_timeout');
-    }
-  }, CONFIG.REGISTER_TIMEOUT_MS);
-
-  // Idle timeout (if configured).
-  let idleTimer = null;
-  function resetIdle() {
-    ctx.lastActivity = Date.now();
-    if (CONFIG.IDLE_TIMEOUT_MS > 0) {
-      clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        log.warn('ws.idle_timeout', { peerId: ctx.peerId, networkId: ctx.networkId });
-        server.close(4009, 'idle_timeout');
-      }, CONFIG.IDLE_TIMEOUT_MS);
+  const payload = JSON.stringify(message);
+  for (const socket of sockets) {
+    try {
+      socket.send(payload);
+    } catch (e) {
+      sockets.delete(socket);
     }
   }
-  resetIdle();
+}
 
-  server.addEventListener('message', async (event) => {
-    resetIdle();
+// ===================== D1 Database Functions =====================
 
-    // ── Size check ────────────────────────────────────────────────────────────
-    const raw = event.data;
-    const byteLen = typeof raw === 'string'
-      ? new TextEncoder().encode(raw).length
-      : raw.byteLength ?? 0;
+async function upsertAnnouncement(db, message) {
+  const now = Date.now();
+  const ttl = Math.min(message.ttl_ms || DEFAULT_TTL_MS, MAX_TTL_MS);
+  const expiresAt = now + ttl;
 
-    if (byteLen > CONFIG.MAX_MESSAGE_BYTES) {
-      log.warn('ws.message_too_large', { peerId: ctx.peerId, byteLen });
-      server.send(buildError(ctx.networkId, ERROR_CODES.MESSAGE_TOO_LARGE, 'Message exceeds size limit', true, ctx.peerId));
-      server.close(4007, 'message_too_large');
-      return;
+  await db.prepare(`
+    INSERT INTO psp_announcements (network, peer_id, session_id, expires_at_ms, updated_at_ms)
+    VALUES (?1, ?2, ?3, ?4, ?5)
+    ON CONFLICT(network, peer_id) DO UPDATE SET
+      session_id = excluded.session_id,
+      expires_at_ms = excluded.expires_at_ms,
+      updated_at_ms = excluded.updated_at_ms
+  `).bind(message.network, message.from, message.session_id || null, expiresAt, now).run();
+}
+
+async function deleteAnnouncement(db, network, peerId) {
+  await db.prepare(`DELETE FROM psp_announcements WHERE network = ?1 AND peer_id = ?2`)
+    .bind(network, peerId).run();
+}
+
+async function findPeers(db, network, requesterPeerId) {
+  const now = Date.now();
+  const result = await db.prepare(`
+    SELECT peer_id, session_id, updated_at_ms
+    FROM psp_announcements
+    WHERE network = ?1 AND peer_id != ?2 AND expires_at_ms > ?3
+    ORDER BY peer_id ASC
+    LIMIT ?4
+  `).bind(network, requesterPeerId, now, MAX_BATCH).all();
+
+  return (result.results || []).map(row => ({
+    peer_id: row.peer_id,
+    session_id: row.session_id,
+    timestamp: row.updated_at_ms
+  }));
+}
+
+async function insertRelayMessage(db, message) {
+  const now = Date.now();
+  const ttl = Math.min(message.ttl_ms || DEFAULT_TTL_MS, MAX_TTL_MS);
+  const expiresAt = now + ttl;
+
+  await db.prepare(`
+    INSERT INTO psp_relay (network, to_peer_id, type, session_id, message_json, expires_at_ms, created_at_ms)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+  `).bind(
+    message.network,
+    message.to,
+    message.type,
+    message.session_id || null,
+    JSON.stringify(message),
+    expiresAt,
+    now
+  ).run();
+}
+
+async function fetchRelayMessages(db, network, toPeerId) {
+  const now = Date.now();
+  const result = await db.prepare(`
+    SELECT id, message_json
+    FROM psp_relay
+    WHERE network = ?1 AND to_peer_id = ?2 AND expires_at_ms > ?3
+    ORDER BY created_at_ms ASC
+    LIMIT ?4
+  `).bind(network, toPeerId, now, MAX_BATCH).all();
+
+  return (result.results || []).map(row => ({
+    id: row.id,
+    message: JSON.parse(row.message_json)
+  }));
+}
+
+async function deleteRelayMessagesById(db, ids) {
+  if (!ids.length) return;
+  const placeholders = ids.map((_, i) => `?${i + 1}`).join(", ");
+  await db.prepare(`DELETE FROM psp_relay WHERE id IN (${placeholders})`)
+    .bind(...ids).run();
+}
+
+async function cleanupExpired(db) {
+  const now = Date.now();
+  await db.prepare(`DELETE FROM psp_announcements WHERE expires_at_ms <= ?1`).bind(now).run();
+  await db.prepare(`DELETE FROM psp_relay WHERE expires_at_ms <= ?1`).bind(now).run();
+}
+
+// ===================== WebSocket Handler =====================
+
+function handleWebSocket(request, env, ctx) {
+  const { 0: client, 1: server } = new WebSocketPair();
+
+  let peerKey = null;
+  let network = null;
+  let peerId = null;
+
+  function cleanupPeerState() {
+    const currentNetwork = network;
+
+    if (!network || !peerId) {
+      return currentNetwork;
     }
 
-    // ── Rate limit ────────────────────────────────────────────────────────────
-    if (!ctx.rateLimiter.check()) {
-      log.warn('ws.rate_limit', { peerId: ctx.peerId });
-      server.send(buildError(ctx.networkId, ERROR_CODES.RATE_LIMIT_EXCEEDED, 'Rate limit exceeded', true, ctx.peerId));
-      server.close(4029, 'rate_limit_exceeded');
-      return;
+    const currentPeerId = peerId;
+    const key = `${currentNetwork}:${currentPeerId}`;
+
+    livePeers.delete(key);
+    peerKey = null;
+    peerId = null;
+    network = null;
+
+    if (env.DB) {
+      ctx.waitUntil(
+        deleteAnnouncement(env.DB, currentNetwork, currentPeerId)
+          .then(() => broadcastPeerList(env.DB, currentNetwork))
+          .catch(() => {})
+      );
     }
 
-    // ── Parse JSON ────────────────────────────────────────────────────────────
-    const [msg, parseErr] = tryParseJSON(typeof raw === 'string' ? raw : '');
-    if (parseErr || typeof msg !== 'object' || msg === null) {
-      server.send(buildError('', ERROR_CODES.INVALID_JSON, 'Could not parse message as JSON', false, null));
-      return;
-    }
+    return currentNetwork;
+  }
 
-    // ── PSP envelope check ────────────────────────────────────────────────────
-    const envResult = validatePspEnvelope(msg);
-    if (!envResult.ok) {
-      server.send(buildError('', ERROR_CODES.INVALID_MESSAGE, envResult.error.reason, false, null));
-      return;
-    }
-
-    // ── Dispatch ──────────────────────────────────────────────────────────────
+  server.addEventListener("message", async (event) => {
     try {
-      await dispatch(msg, ctx, server, env, request);
+      const result = await handleClientMessage(server, event.data, env, ctx, peerKey, network);
+      if (result) {
+        peerKey = result.peerKey;
+        network = result.network;
+        peerId = result.peerId;
+      }
     } catch (err) {
-      log.error('ws.dispatch_error', { type: msg.type, err: String(err) });
-      server.send(buildError(ctx.networkId, ERROR_CODES.INTERNAL_ERROR, 'Internal server error', false, ctx.peerId, msg.message_id));
+      console.error("[WS] Error:", err?.message || String(err));
+      try {
+        server.send(JSON.stringify({
+          psp_version: PSP_VERSION, type: "error",
+          from: env.RELAY_PEER_ID || "relay", to: "client",
+          body: { error: err?.message || "Unknown error" }
+        }));
+      } catch {}
     }
   });
 
-  server.addEventListener('close', () => {
-    clearTimeout(registerTimer);
-    clearTimeout(idleTimer);
-    cleanup(ctx, env);
-    log.info('ws.closed', { peerId: ctx.peerId, networkId: ctx.networkId });
+  server.addEventListener("close", () => {
+    const subscriberNetwork = cleanupPeerState();
+    if (subscriberNetwork) {
+      const sockets = networkSubscribers.get(subscriberNetwork);
+      if (sockets) {
+        sockets.delete(server);
+      }
+    }
   });
 
-  server.addEventListener('error', (err) => {
-    clearTimeout(registerTimer);
-    clearTimeout(idleTimer);
-    cleanup(ctx, env);
-    log.error('ws.error', { peerId: ctx.peerId, err: String(err) });
+  server.addEventListener("error", () => {
+    const subscriberNetwork = cleanupPeerState();
+    if (subscriberNetwork) {
+      const sockets = networkSubscribers.get(subscriberNetwork);
+      if (sockets) {
+        sockets.delete(server);
+      }
+    }
   });
+
+  server.accept();
 
   return new Response(null, { status: 101, webSocket: client });
 }
 
-// ── Message dispatcher ────────────────────────────────────────────────────────
+async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null, prevNetwork = null) {
+  try {
+    if (!rawData) return null;
+    if (rawData.length > MAX_MESSAGE_SIZE) return null;
 
-async function dispatch(msg, ctx, server, env, request) {
-  const kv = createKv(env);
-
-  // ── Helper: PSP error to this socket ────────────────────────────────────────
-  function err(code, reason, fatal = false) {
-    return server.send(buildError(ctx.networkId, code, reason, fatal, ctx.peerId, msg.message_id));
-  }
-
-  switch (msg.type) {
-
-    // ── announce ──────────────────────────────────────────────────────────────
-    case MSG.ANNOUNCE: {
-      const validated = validateAnnounceMessage(msg);
-      if (!validated.ok) {
-        server.send(buildError('', validated.error.code, validated.error.reason, false, null, msg.message_id));
-        return;
-      }
-
-      const { peerId, networkId, capabilities, hints } = validated;
-
-      // Re-announce / heartbeat from an already-registered peer.
-      if (ctx.registered) {
-        if (ctx.peerId !== peerId || ctx.networkId !== networkId) {
-          err(ERROR_CODES.DUPLICATE_REGISTER, 'Cannot change identity on an established connection');
-          return;
-        }
-        // Update capabilities and refresh KV advertisement.
-        const entry = peers.get(ctx.peerId);
-        if (entry) {
-          entry.capabilities = capabilities;
-          entry.hints = hints;
-        }
-        getKvAsync(env).then((readyKv) => {
-          if (readyKv) writePeerAdvertisement(readyKv, networkId, peerId, capabilities, entry?.regionHint ?? null).catch(() => {});
-        }).catch(() => {});
-        server.send(buildAck(networkId, msg.message_id, peerId));
-        log.info('ws.reannounce', { peerId, networkId });
-        return;
-      }
-
-      // Optional auth hook.
-      const authResult = await verifyAuth(validated.auth, env);
-      if (!authResult.ok) {
-        err(ERROR_CODES.UNAUTHORIZED, authResult.reason, true);
-        server.close(4001, 'unauthorized');
-        return;
-      }
-
-      ctx.peerId    = peerId;
-      ctx.networkId = networkId;
-      ctx.registered = true;
-
-      peers.set(peerId, {
-        socket:       server,
-        networkId,
-        capabilities: capabilities ?? {},
-        hints:        hints ?? null,
-        regionHint:   null,
-        registeredAt: Date.now(),
-      });
-
-      // ── Push same-isolate peers to newcomer & notify them of newcomer ─────
-      const localCandidates = [];
-      for (const [existingId, existingEntry] of peers.entries()) {
-        if (existingId === peerId) continue;
-        if (existingEntry.networkId !== networkId) continue;
-        localCandidates.push({
-          peer_id:   existingId,
-          network:   networkId,
-          roles:     [],
-          last_seen: existingEntry.registeredAt ?? Date.now(),
-          hints:     existingEntry.hints ?? {},
-        });
-        // Notify the existing peer about the newcomer.
-        try {
-          existingEntry.socket.send(buildPeerList(networkId, [{
-            peer_id:   peerId,
-            network:   networkId,
-            roles:     [],
-            last_seen: Date.now(),
-            hints:     hints ?? {},
-          }], existingId));
-        } catch { /* socket may have closed */ }
-      }
-
-      // Write advisory advertisement to MongoDB.
-      getKvAsync(env).then((readyKv) => {
-        if (readyKv && peers.has(peerId)) {
-          writePeerAdvertisement(readyKv, networkId, peerId, capabilities, null).catch(() => {});
-        }
-      }).catch(() => {});
-
-      log.info('ws.registered', { peerId, networkId });
-      server.send(buildAck(networkId, msg.message_id, peerId));
-
-      if (localCandidates.length > 0) {
-        server.send(buildPeerList(networkId, localCandidates, peerId));
-      }
-
-      // Cross-isolate peers from MongoDB.
-      getKvAsync(env).then((readyKv) => {
-        if (!readyKv) return;
-        return getBootstrapCandidates(readyKv, networkId, peerId).then((crossCandidates) => {
-          if (crossCandidates.length > 0) {
-            const pspPeers = crossCandidates.map((c) => ({
-              peer_id:   c.peerId,
-              network:   networkId,
-              roles:     [],
-              last_seen: c.advertisedAt ?? Date.now(),
-              hints:     c.capabilities ?? {},
-            }));
-            try { server.send(buildPeerList(networkId, pspPeers, peerId)); } catch {}
-          }
-        });
-      }).catch(() => {});
-      return;
+    let message;
+    try { 
+      message = JSON.parse(rawData); 
+    } catch (e) {
+      socket.send(JSON.stringify({
+        psp_version: PSP_VERSION, type: "error",
+        from: env.RELAY_PEER_ID || "relay", to: "client",
+        body: { error: "Invalid JSON" }
+      }));
+      return null;
     }
 
-    // ── discover ──────────────────────────────────────────────────────────────
-    case MSG.DISCOVER: {
-      if (!ctx.registered) {
-        err(ERROR_CODES.NOT_REGISTERED, 'Must announce before discovering peers');
-        return;
+    if (!validEnvelope(message)) {
+      socket.send(JSON.stringify({
+        psp_version: PSP_VERSION, type: "error",
+        from: env.RELAY_PEER_ID || "relay", to: message?.from || "unknown",
+        body: { error: "Invalid PSP envelope" }
+      }));
+      return null;
+    }
+
+    const { network, from: peerId, type } = message;
+    const db = env.DB;
+    const peerKey = `${network}:${peerId}`;
+
+    // Subscribe to network on first message and whenever network changes on the same socket.
+    if (!prevPeerKey || prevNetwork !== network) {
+      if (prevNetwork && prevNetwork !== network) {
+        const oldSockets = networkSubscribers.get(prevNetwork);
+        if (oldSockets) {
+          oldSockets.delete(socket);
+        }
+      }
+      if (!networkSubscribers.has(network)) {
+        networkSubscribers.set(network, new Set());
+      }
+      networkSubscribers.get(network).add(socket);
+      console.log(`[NET] Peer ${peerId} subscribed to ${network}`);
+    }
+
+    // Track live peer
+    livePeers.set(peerKey, { peerId, network, socket, lastSeen: Date.now() });
+
+    if (type === "announce") {
+      await upsertAnnouncement(db, message);
+      
+      // Deliver any queued messages for this peer
+      const queued = await fetchRelayMessages(db, network, peerId);
+      if (queued.length > 0) {
+        console.log(`[OUT] Delivering ${queued.length} queued messages to ${peerId}`);
+        const deliveredIds = [];
+        for (const { id, message: queuedMsg } of queued) {
+          try { 
+            socket.send(JSON.stringify(queuedMsg));
+            deliveredIds.push(id);
+          } catch (err) {
+            console.error(`[OUT] Failed to deliver queued message:`, err?.message);
+          }
+        }
+        if (deliveredIds.length > 0) {
+          await deleteRelayMessagesById(db, deliveredIds);
+        }
+      }
+      
+      // Only broadcast peer_list when the peer is newly joining, not on heartbeat re-announces.
+      // prevPeerKey === peerKey means same peer on the same socket sending a periodic keep-alive;
+      // no topology change occurred, so no need to push a new list to everyone.
+      const isHeartbeat = prevPeerKey === peerKey;
+      if (!isHeartbeat) {
+        console.log(`[NET] Broadcasting peer_list for ${network} after new announce from ${peerId}`);
+        broadcastPeerList(db, network).catch((err) => console.error(`[Broadcast error]`, err?.message));
       }
 
-      let targetNet = ctx.networkId;
-      if (msg.network !== undefined && msg.network !== ctx.networkId) {
-        err(ERROR_CODES.NETWORK_MISMATCH, 'network does not match your registered network');
-        return;
-      }
+    } else if (type === "withdraw") {
+      await deleteAnnouncement(db, network, peerId);
+      livePeers.delete(peerKey);
+      broadcastPeerList(db, network).catch(() => {});
 
-      const excludePeerIds = new Set([ctx.peerId]);
-      if (Array.isArray(msg.body?.exclude_peers)) {
-        msg.body.exclude_peers.forEach((id) => excludePeerIds.add(id));
-      }
-      const limit = typeof msg.body?.limit === 'number' ? msg.body.limit : undefined;
+    } else if (type === "discover") {
+      broadcastPeerList(db, network).catch(() => {});
 
-      let candidates = [];
-      const readyKv = await getKvAsync(env);
-      if (readyKv) {
-        candidates = await getBootstrapCandidates(readyKv, targetNet, ctx.peerId, limit, excludePeerIds);
-      }
-
-      const pspPeers = candidates.map((c) => ({
-        peer_id:   c.peerId,
-        network:   targetNet,
-        roles:     [],
-        last_seen: c.advertisedAt ?? Date.now(),
-        hints:     c.capabilities ?? {},
+    } else if (type === "ping") {
+      socket.send(JSON.stringify({
+        psp_version: PSP_VERSION, type: "pong", network,
+        from: env.RELAY_PEER_ID || "relay", to: peerId,
+        message_id: crypto.randomUUID(), timestamp: Date.now(),
+        ttl_ms: DEFAULT_TTL_MS, body: {}
       }));
 
-      log.info('ws.discover', { peerId: ctx.peerId, count: pspPeers.length });
-      server.send(buildPeerList(targetNet, pspPeers, ctx.peerId));
-      return;
-    }
+    } else if (type === "bye") {
+      await deleteAnnouncement(db, network, peerId);
+      livePeers.delete(peerKey);
+      broadcastPeerList(db, network).catch(() => {});
 
-    // ── signaling relay (offer / answer / ice_candidate / ice_end / bye / renegotiate) ──
-    default: {
-      if (RELAY_TYPES.has(msg.type)) {
-        if (!ctx.registered) {
-          err(ERROR_CODES.NOT_REGISTERED, 'Must announce before sending signaling messages');
-          return;
+    } else if (RELAY_TYPES.has(type)) {
+      // RTC negotiation messages - relay immediately if online, queue if offline
+      if (!message.to) return { peerKey, network, peerId };
+      
+      // Always store in DB as backup
+      await insertRelayMessage(db, message);
+      
+      // Try immediate delivery to live peer
+      const liveKey = `${network}:${message.to}`;
+      const live = livePeers.get(liveKey);
+      if (live) {
+        try { 
+          live.socket.send(rawData);
+          console.log(`[RELAY] Delivered ${type} from ${peerId} to ${message.to} immediately`);
+        } catch (err) {
+          console.error(`[RELAY] Failed to deliver to ${message.to}:`, err?.message);
         }
-
-        const sigV = validateSignalingMessage(msg, ctx.peerId);
-        if (!sigV.ok) {
-          server.send(buildError(ctx.networkId, sigV.error.code, sigV.error.reason, false, ctx.peerId, msg.message_id));
-          return;
-        }
-
-        const { toPeerId } = sigV;
-
-        // Verify target is in the same network.
-        const target = peers.get(toPeerId);
-
-        if (!target) {
-          // Enqueue for cross-isolate delivery (picked up on target's next ping).
-          getKvAsync(env).then(async (readyKv) => {
-            if (!readyKv) return;
-            await enqueueRelayMessage(readyKv, toPeerId, ctx.networkId, msg);
-          }).catch(() => {});
-          return;
-        }
-
-        if (target.networkId !== ctx.networkId) {
-          err(ERROR_CODES.NETWORK_MISMATCH, 'Target peer is in a different network');
-          return;
-        }
-
-        // Forward the PSP message verbatim.
-        try {
-          target.socket.send(JSON.stringify(msg));
-        } catch (sendErr) {
-          log.warn('ws.relay_send_failed', { from: ctx.peerId, to: toPeerId, err: String(sendErr) });
-          err(ERROR_CODES.TARGET_NOT_CONNECTED, 'Relay delivery failed — target may have disconnected');
-          peers.delete(toPeerId);
-          return;
-        }
-
-        log.info('ws.relayed', { from: ctx.peerId, to: toPeerId, type: msg.type });
-        return;
+      } else {
+        console.log(`[RELAY] Peer ${message.to} offline, queued ${type} in DB`);
       }
-
-      // Unknown non-relay type.
-      err(ERROR_CODES.INVALID_MESSAGE, `Unknown PSP message type: ${msg.type}`);
     }
 
-    // ── ping ──────────────────────────────────────────────────────────────────
-    case MSG.PING: {
-      if (ctx.registered) {
-        const entry = peers.get(ctx.peerId);
-        getKvAsync(env).then(async (readyKv) => {
-          if (!readyKv) return;
-          // Refresh advertisement.
-          await writePeerAdvertisement(readyKv, ctx.networkId, ctx.peerId, entry?.capabilities ?? {}, entry?.regionHint ?? null);
-          // Deliver any queued cross-isolate signaling messages.
-          const pending = await dequeueRelayMessages(readyKv, ctx.peerId, ctx.networkId);
-          for (const item of pending) {
-            try {
-              server.send(JSON.stringify(item));
-              log.info('ws.relay_delivered', { to: ctx.peerId, from: item.from, type: item.type });
-            } catch { /* socket closed */ }
-          }
-        }).catch(() => {});
-      }
-      const nonce = msg.body?.nonce ?? null;
-      server.send(buildPong(ctx.networkId, nonce, msg.message_id, ctx.peerId));
-      return;
-    }
-
-    // ── withdraw ──────────────────────────────────────────────────────────────
-    case MSG.WITHDRAW: {
-      if (!ctx.registered) {
-        err(ERROR_CODES.NOT_REGISTERED, 'Not registered');
-        return;
-      }
-      cleanup(ctx, env);
-      log.info('ws.withdrawn', { peerId: ctx.peerId, networkId: ctx.networkId });
-      server.send(buildAck(ctx.networkId, msg.message_id, ctx.peerId));
-      server.close(1000, 'withdrawn');
-      return;
-    }
+    ctx.waitUntil(cleanupExpired(db).catch(() => {}));
+    return { peerKey, network, peerId };
+  } catch (err) {
+    console.error("[Handler] Error:", err?.message || String(err));
+    return null;
   }
 }
 
-// ── Cleanup helper ────────────────────────────────────────────────────────────
-
-function cleanup(ctx, env) {
-  if (ctx.peerId) {
-    peers.delete(ctx.peerId);
-    if (ctx.networkId) {
-      getKvAsync(env)
-        .then((kv) => expirePeerAdvertisement(kv, ctx.networkId, ctx.peerId))
-        .catch(() => {});
-    }
-  }
-  ctx.registered = false;
+function validEnvelope(msg) {
+  return (
+    typeof msg === "object" && msg !== null &&
+    msg.psp_version === PSP_VERSION &&
+    typeof msg.type === "string" && MESSAGE_TYPES.has(msg.type) &&
+    typeof msg.from === "string" && msg.from.trim() &&
+    typeof msg.network === "string" && msg.network.trim() &&
+    typeof msg.message_id === "string" &&
+    typeof msg.timestamp === "number"
+  );
 }
-

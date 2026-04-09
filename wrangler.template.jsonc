@@ -1,24 +1,32 @@
-// wrangler.template.jsonc — Copy to wrangler.jsonc for local/deploy use.
+// wrangler.template.jsonc — Copy to wrangler.jsonc and fill in your own values.
 {
   "name": "freertc",
   "main": "src/index.js",
   "compatibility_date": "2024-09-23",
-
-  // ESM modules format required for native Workers APIs
-  "compatibility_flags": ["nodejs_compat"],
 
   // Serve static files from the public directory.
   "assets": {
     "directory": "public"
   },
 
-  // MongoDB Atlas connection string — store as a Worker secret:
-  //   wrangler secret put MONGODB_URI
-  // then paste the mongodb+srv://... URI when prompted.
-  // No binding is needed in wrangler.jsonc; secrets are injected via env.
+  "vars": {
+    // Peer ID the relay server advertises as itself in PSP messages.
+    "RELAY_PEER_ID": "bootstrap-relay"
+  },
+
+  // Cloudflare D1 SQLite database (free tier available).
+  // Create with: wrangler d1 create freertc-signal
+  // Then paste the returned database_id below.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "freertc-signal",
+      "database_id": "YOUR_D1_DATABASE_ID"
+    }
+  ],
 
   // ── Custom domain (OPTIONAL) ──────────────────────────────────────────────
-  // If you have a domain on Cloudflare, add it here:
+  // If you have a domain on Cloudflare, uncomment and fill in:
   //
   // "routes": [
   //   {
@@ -27,14 +35,24 @@
   //   }
   // ]
   //
-  // Without routes, Cloudflare automatically assigns a free subdomain:
+  // Without routes, Cloudflare assigns a free subdomain:
   //   https://freertc.<your-account>.workers.dev
   // That URL works for WebSocket signaling too (wss://...).
 
   // Optional: environment-specific overrides
   "env": {
     "production": {
-      "name": "freertc"
+      "name": "freertc",
+      "vars": {
+        "RELAY_PEER_ID": "bootstrap-relay"
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "freertc-signal",
+          "database_id": "YOUR_D1_DATABASE_ID"
+        }
+      ]
     }
   }
 }
