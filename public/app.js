@@ -2151,8 +2151,6 @@ createApp({
           <div class="status-pill" :class="status">
             <strong>{{ status }}</strong>
           </div>
-          <div class="pill"><strong>mode</strong> {{ activeView === 'console' ? 'debug console' : 'auto webrtc' }}</div>
-          <div class="pill"><strong>WebRTC Role</strong> {{ iAmInitiator ? 'initiator' : 'responder' }}</div>
           <div class="pill" :class="{ 'pill-warn': specWarningCount > 0, 'pill-ok': specLinkFlash }">
             <strong><a class="pill-link" :href="pspSpecUrl" target="_blank" rel="noopener noreferrer" @click="handleSpecLinkClick">{{ specPillLabel }}</a></strong>
             {{ specWarningCount > 0 ? specWarningCount + ' warning' + (specWarningCount === 1 ? '' : 's') : 'ok' }}
