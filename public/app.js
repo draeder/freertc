@@ -2,7 +2,14 @@ import { createApp, computed, nextTick, onMounted, ref, watch } from "https://un
 
 const PSP_VERSION = "1.0";
 const PSP_SPEC_URL = "https://github.com/draeder/Peer-Signaling-Protocol-Specification";
-const RTC_CONFIG = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+const RTC_CONFIG = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:stun2.l.google.com:19302" },
+    { urls: "stun:global.stun.twilio.com:3478" }
+  ]
+};
 const SHARED_IDS_KEY = "freertc.shared.ids.v1";
 
 function newId(prefix = "msg") {
@@ -11,6 +18,40 @@ function newId(prefix = "msg") {
 
 function now() {
   return Date.now();
+}
+
+async function waitForIceGatheringComplete(pc, timeoutMs = 4000) {
+  if (!pc || pc.iceGatheringState === "complete") {
+    return;
+  }
+  await new Promise((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      try {
+        pc.removeEventListener("icegatheringstatechange", onChange);
+      } catch {
+        // no-op
+      }
+      resolve();
+    };
+    const onChange = () => {
+      if (pc.iceGatheringState === "complete") {
+        done();
+      }
+    };
+    const timer = setTimeout(done, timeoutMs);
+    try {
+      pc.addEventListener("icegatheringstatechange", onChange);
+      onChange();
+    } catch {
+      done();
+    }
+  });
 }
 
 function safeJsonParse(raw, fallback) {
@@ -144,6 +185,7 @@ createApp({
     const FAILED_PEER_COOLDOWN_MS = 5000;
     const BYE_COOLDOWN_MS = 30000;
     const LIVE_PEER_MAX_AGE_MS = 25000;
+    const LINK_GRACE_MS = 45000;
     const failedPeerCooldowns = new Map();
     const byeCooldowns = new Map();
     const meshLinks = new Map();
@@ -482,12 +524,51 @@ createApp({
           connectRequested: false,
           connectRequestTime: 0,
           offerWaitTime: 0,  // Tracks when responder started waiting for offer
-          answerWaitTime: 0  // Tracks when initiator started waiting for answer
+          answerWaitTime: 0,  // Tracks when initiator started waiting for answer
+          pendingCandidates: [],
+          lastSignalAt: now()
         };
         meshLinks.set(peerId, link);
         refreshMeshStats();
       }
       return link || null;
+    }
+
+    function isNegotiatingPhase(phase) {
+      return ["requesting", "waiting-offer", "accepted", "offering", "offered", "answering", "answered", "connected-pending", "ready"].includes(phase);
+    }
+
+    function shouldKeepLinkWithoutAnnouncement(link) {
+      if (!link) {
+        return false;
+      }
+      if (link.dc?.readyState === "open") {
+        return true;
+      }
+      if (isNegotiatingPhase(link.phase)) {
+        return true;
+      }
+      const lastSignalAt = Number(link.lastSignalAt || 0);
+      return lastSignalAt > 0 && now() - lastSignalAt <= LINK_GRACE_MS;
+    }
+
+    async function flushPendingIceCandidates(peerId, link) {
+      const target = link || getMeshLink(peerId, false);
+      if (!target?.pc || !target.pc.remoteDescription) {
+        return;
+      }
+      const queued = Array.isArray(target.pendingCandidates) ? target.pendingCandidates : [];
+      if (queued.length === 0) {
+        return;
+      }
+      target.pendingCandidates = [];
+      for (const candidate of queued) {
+        try {
+          await target.pc.addIceCandidate(candidate);
+        } catch (error) {
+          pushLog("rtc:ice-error", error?.message || `failed to apply queued candidate from ${peerId}`);
+        }
+      }
     }
 
     function refreshMeshStats() {
@@ -568,15 +649,22 @@ createApp({
     }
 
     function initSharedIds() {
-      const saved = safeJsonParse(localStorage.getItem(SHARED_IDS_KEY), null);
-      if (saved?.session_id && saved?.instance_id) {
-        sessionId.value = saved.session_id;
-        instanceId.value = saved.instance_id;
-        return;
+      const params = new URLSearchParams(window.location.search);
+      const sessionParam = normalizeText(params.get("session_id") || params.get("sessionId"));
+      const instanceParam = normalizeText(params.get("instance_id") || params.get("instanceId"));
+
+      const hasValidUrlSession = isSpecToken(sessionParam);
+      const hasValidUrlInstance = isSpecToken(instanceParam);
+
+      if (sessionParam && !hasValidUrlSession) {
+        pushLog("ids:error", "Ignoring invalid URL session_id");
+      }
+      if (instanceParam && !hasValidUrlInstance) {
+        pushLog("ids:error", "Ignoring invalid URL instance_id");
       }
 
-      sessionId.value = `sess-${Math.random().toString(36).slice(2, 10)}`;
-      instanceId.value = `inst-${Math.random().toString(36).slice(2, 10)}`;
+      sessionId.value = hasValidUrlSession ? sessionParam : `sess-${Math.random().toString(36).slice(2, 10)}`;
+      instanceId.value = hasValidUrlInstance ? instanceParam : `inst-${Math.random().toString(36).slice(2, 10)}`;
       persistSharedIds();
     }
 
@@ -588,6 +676,12 @@ createApp({
           instance_id: instanceId.value
         })
       );
+
+      const url = new URL(window.location.href);
+      url.searchParams.set("session_id", sessionId.value);
+      url.searchParams.set("instance_id", instanceId.value);
+      window.history.replaceState(null, "", url);
+
       pushLog("ids", {
         session_id: sessionId.value,
         instance_id: instanceId.value
@@ -859,7 +953,7 @@ createApp({
         network: network.value,
         from: fromPeer.value,
         to: null,
-        session_id: null,
+        session_id: sessionId.value,
         message_id: newId("announce"),
         timestamp: now(),
         ttl_ms: 30000,
@@ -921,6 +1015,10 @@ createApp({
         flashDiscoverButton();
       }
       return sent;
+    }
+
+    function isMatchingSessionId(value) {
+      return normalizeText(value) === normalizeText(sessionId.value);
     }
 
     function sendPing(peerId = toPeer.value || null) {
@@ -1110,7 +1208,8 @@ createApp({
             typeof peerId !== "string" ||
             peerId === fromPeer.value ||
             !isValidPeerId(peerId) ||
-            !isFreshPeerAnnouncement(peer)
+            !isFreshPeerAnnouncement(peer) ||
+            !isMatchingSessionId(peer?.session_id)
           ) {
             continue;
           }
@@ -1122,19 +1221,21 @@ createApp({
         for (const peerId of Array.from(meshLinks.keys())) {
           if (!peerId || peerId === fromPeer.value) continue;
           const link = getMeshLink(peerId, false);
-          // Always keep open data channels.
-          if (link?.dc?.readyState === "open") continue;
-          // If peer withdrew (no longer in announced list), close it immediately, even if negotiating.
+          // If peer is not currently announced, keep links that are active/recent.
           if (!announcedPeerIds.has(peerId)) {
+            if (shouldKeepLinkWithoutAnnouncement(link)) {
+              continue;
+            }
             closeMeshLink(peerId);
             meshLinks.delete(peerId);
             continue;
           }
-          // Always keep in-flight negotiations for announced peers.
-          if (
-            link?.connectRequested ||
-            ["requesting", "waiting-offer", "accepted", "offered", "answering", "answered", "connected-pending"].includes(link?.phase)
-          ) continue;
+          // Keep healthy or recently-active links for announced peers too.
+          // Otherwise the periodic loop can tear down valid channels and cause flap/reconnect churn.
+          if (shouldKeepLinkWithoutAnnouncement(link)) {
+            continue;
+          }
+
           // Prune idle/dead links for still-announced peers.
           closeMeshLink(peerId);
           meshLinks.delete(peerId);
@@ -1233,6 +1334,11 @@ createApp({
         return;
       }
 
+      // Deterministic initiator rule: only lexicographically smaller peer starts the offer flow.
+      if (fromPeer.value.localeCompare(peerId) >= 0) {
+        return;
+      }
+
       const isAnnounced = discoveredPeers.value.some((p) => p?.peer_id === peerId);
       if (!isAnnounced) {
         return;
@@ -1243,39 +1349,40 @@ createApp({
         return;
       }
 
-      // Keep one in-flight attempt state per peer until timeout/accept/reject.
-      if (["requesting", "waiting-offer"].includes(link.phase)) {
+      // Keep one in-flight attempt state per peer.
+      if (["offering", "offered", "answering", "answered", "connected-pending", "connected"].includes(link.phase)) {
         return;
       }
 
       link.connectRequested = true;
       link.connectRequestTime = now();
-      link.phase = "requesting";
+      link.phase = "offering";
       refreshSelectedPeerSnapshot();
 
-      const sent = sendRelayEnvelope("connect_request", {
-        intent: "webrtc-datachannel",
-        initiator_preference: "auto",
-        roles: {
-          from_role: "peer",
-          requested_role: "peer"
-        },
-        capabilities: {
-          trickle_ice: true,
-          restart_ice: true,
-          datachannel: true,
-          media: false
-        },
-        topology_hints: {
-          desired_link: "direct",
-          priority: 10
-        }
-      }, { to: peerId });
-
-      if (!sent) {
-        link.connectRequested = false;
-        link.phase = "idle";
-      }
+      // Hard fallback path: skip connect_request/connect_accept handshake and
+      // go straight to offer to avoid request/accept races in auto mode.
+      startOfferFlow(peerId)
+        .then(() => {
+          const current = getMeshLink(peerId, false);
+          if (!current) return;
+          current.connectRequested = false;
+          current.connectRequestTime = 0;
+          if (current.phase === "offering") {
+            current.phase = "offered";
+          }
+          refreshSelectedPeerSnapshot();
+        })
+        .catch((error) => {
+          const current = getMeshLink(peerId, false);
+          if (current) {
+            current.connectRequested = false;
+            current.connectRequestTime = 0;
+            current.phase = "idle";
+          }
+          pushLog("rtc:error", error?.message || `failed to start offer flow for ${peerId}`);
+          markPeerFailed(peerId, "direct-offer-failed");
+          refreshSelectedPeerSnapshot();
+        });
     }
 
     function maybeAutoConnectPeer(peerId) {
@@ -1287,6 +1394,11 @@ createApp({
         return;
       }
 
+      // Deterministic role split prevents dual-initiator glare loops.
+      if (fromPeer.value.localeCompare(peerId) >= 0) {
+        return;
+      }
+
       const isAnnounced = discoveredPeers.value.some((p) => p?.peer_id === peerId);
       if (!isAnnounced) {
         return;
@@ -1294,7 +1406,7 @@ createApp({
 
       const link = getMeshLink(peerId);
       if (
-        ["requesting", "waiting-offer", "offered", "answering", "answered", "connected-pending", "connected"].includes(link.phase) ||
+        ["requesting", "waiting-offer", "offering", "offered", "answering", "answered", "connected-pending", "connected"].includes(link.phase) ||
         (link.pc && ["connecting", "connected"].includes(link.pc.connectionState)) ||
         (link.dc && link.dc.readyState === "open")
       ) {
@@ -1390,6 +1502,12 @@ createApp({
       }
 
       const peerPc = new RTCPeerConnection(RTC_CONFIG);
+      // Firefox can gather candidates more reliably with at least one media transceiver.
+      try {
+        peerPc.addTransceiver("audio", { direction: "recvonly" });
+      } catch {
+        // Ignore browser support differences.
+      }
       link.pc = peerPc;
       link.rtcState = peerPc.connectionState;
       link.phase = "ready";
@@ -1421,6 +1539,12 @@ createApp({
           return;
         }
         sendRelayEnvelope("ice_end", {}, { to: peerId });
+      };
+
+      peerPc.onicecandidateerror = (event) => {
+        const code = event?.errorCode ?? "unknown";
+        const text = event?.errorText ?? "unknown";
+        pushLog("rtc:ice-error", `${peerId} ice candidate error code=${code} text=${text}`);
       };
 
       peerPc.ondatachannel = (event) => {
@@ -1469,13 +1593,14 @@ createApp({
 
         const offer = await peerPc.createOffer();
         await peerPc.setLocalDescription(offer);
+        await waitForIceGatheringComplete(peerPc);
         link.phase = "offered";
         link.answerWaitTime = now();
 
         sendRelayEnvelope(
           "offer",
           {
-            sdp: offer.sdp,
+            sdp: peerPc.localDescription?.sdp || offer.sdp,
             trickle_ice: true,
             restart_ice: false,
             setup_role: "actpass"
@@ -1582,6 +1707,24 @@ createApp({
         return;
       }
 
+      if (
+        ["connect_request", "connect_accept", "connect_reject", "offer", "answer", "ice_candidate", "ice_end", "bye"].includes(message.type) &&
+        !isMatchingSessionId(message.session_id)
+      ) {
+        if (message.type === "connect_request" && message.from) {
+          sendRelayEnvelope(
+            "connect_reject",
+            {
+              code: "session_mismatch",
+              reason: "session_id does not match"
+            },
+            { to: message.from, reply_to: message.message_id }
+          );
+        }
+        pushLog("rtc", `Ignored ${message.type} with mismatched session_id from ${message.from || "unknown"}`);
+        return;
+      }
+
       if (message.type === "peer_list") {
         const peers = Array.isArray(message.body?.peers) ? message.body.peers : [];
         const deduped = new Map();
@@ -1591,7 +1734,8 @@ createApp({
             typeof peerId !== "string" ||
             peerId === fromPeer.value ||
             !isValidPeerId(peerId) ||
-            !isFreshPeerAnnouncement(peer)
+            !isFreshPeerAnnouncement(peer) ||
+            !isMatchingSessionId(peer?.session_id)
           ) {
             continue;
           }
@@ -1603,6 +1747,10 @@ createApp({
 
         for (const peerId of Array.from(meshLinks.keys())) {
           if (!peerId || peerId === fromPeer.value || announcedPeerIds.has(peerId)) {
+            continue;
+          }
+          const link = getMeshLink(peerId, false);
+          if (shouldKeepLinkWithoutAnnouncement(link)) {
             continue;
           }
           pushLog("discovery", `Pruned stale peer not in latest peer_list: ${peerId}`);
@@ -1651,7 +1799,10 @@ createApp({
           pushLog("discovery", `Accepted inbound RTC peer before peer_list sync: ${message.from}`);
           refreshMeshStats();
         }
-        getMeshLink(message.from);
+        const link = getMeshLink(message.from);
+        if (link) {
+          link.lastSignalAt = now();
+        }
       }
 
       if (message.type === "connect_request" && message.from && message.from !== fromPeer.value) {
@@ -1768,9 +1919,6 @@ createApp({
         selectPeer(peerId);
       }
 
-      sessionId.value = message.session_id || sessionId.value;
-      persistSharedIds();
-
       const initiator = fromPeer.value.localeCompare(peerId) < 0 ? fromPeer.value : peerId;
       sendRelayEnvelope(
         "connect_accept",
@@ -1809,8 +1957,6 @@ createApp({
 
       link.connectRequested = false;
       link.connectRequestTime = 0;
-      sessionId.value = message.session_id || sessionId.value;
-      persistSharedIds();
 
       const initiator = message.body?.initiator_decision;
       link.phase = "accepted";
@@ -1868,9 +2014,6 @@ createApp({
         return;
       }
 
-      sessionId.value = message.session_id || sessionId.value;
-      persistSharedIds();
-
       // Responder received the offer, stop waiting timeout (PSP Section 11.2)
       link.offerWaitTime = 0;
 
@@ -1878,6 +2021,23 @@ createApp({
       if (!["stable", "have-local-offer"].includes(peerPc.signalingState)) {
         pushLog("rtc", `Ignored stale offer from ${peerId} while in ${peerPc.signalingState}`);
         return;
+      }
+
+      // Glare handling: if both sides offered concurrently, keep one deterministic winner.
+      if (peerPc.signalingState === "have-local-offer") {
+        const iAmInitiator = fromPeer.value.localeCompare(peerId) < 0;
+        if (iAmInitiator) {
+          // Initiator keeps its own offer and ignores collided remote offer.
+          pushLog("rtc", `Ignored collided offer from ${peerId} (keeping local offer)`);
+          return;
+        }
+        try {
+          await peerPc.setLocalDescription({ type: "rollback" });
+          pushLog("rtc", `Rolled back local offer to accept remote offer from ${peerId}`);
+        } catch (error) {
+          pushLog("rtc:error", error?.message || `failed rollback during glare with ${peerId}`);
+          return;
+        }
       }
 
       try {
@@ -1888,16 +2048,19 @@ createApp({
         closeMeshLink(peerId);
         return;
       }
+
+      await flushPendingIceCandidates(peerId, link);
       link.phase = "answering";
 
       const answer = await peerPc.createAnswer();
       await peerPc.setLocalDescription(answer);
+      await waitForIceGatheringComplete(peerPc);
       link.phase = "answered";
 
       sendRelayEnvelope(
         "answer",
         {
-          sdp: answer.sdp,
+          sdp: peerPc.localDescription?.sdp || answer.sdp,
           trickle_ice: true,
           restart_ice: false
         },
@@ -1941,6 +2104,8 @@ createApp({
         }
         return;
       }
+
+      await flushPendingIceCandidates(peerId, link);
       link.phase = "connected-pending";
       link.answerWaitTime = 0;  // Answer received, stop waiting
       pushLog("rtc", `answer applied from ${peerId}`);
@@ -1952,8 +2117,13 @@ createApp({
         return;
       }
 
-      const link = getMeshLink(message.from, false);
-      if (!link?.pc) {
+      const link = getMeshLink(message.from);
+      if (!Array.isArray(link.pendingCandidates)) {
+        link.pendingCandidates = [];
+      }
+
+      if (!link?.pc || !link.pc.remoteDescription) {
+        link.pendingCandidates.push(message.body.candidate);
         return;
       }
 
@@ -2197,7 +2367,7 @@ createApp({
             <button @click="connect" :disabled="!canConnect">Connect</button>
             <button class="secondary" @click="disconnect" :disabled="!canDisconnect">Disconnect</button>
             <button class="secondary" @click="regeneratePeerId">New Peer ID</button>
-            <button class="secondary" @click="regenerateSharedIds">New Shared IDs</button>
+            <button class="secondary" @click="regenerateSharedIds">Regenerate Session + Instance IDs</button>
           </div>
 
           <div class="metrics">
@@ -2253,6 +2423,9 @@ createApp({
               Instance ID
               <input v-model="instanceId" @change="persistSharedIds">
             </label>
+          </div>
+          <div class="row">
+            <button class="secondary" @click="regenerateSharedIds">Regenerate Session + Instance IDs</button>
           </div>
           <div class="row">
             <button :class="{ active: announceFlash }" @click="sendAnnounce" :disabled="!isConnected">{{ announceButtonLabel }}</button>

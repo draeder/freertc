@@ -26,5 +26,8 @@ CREATE TABLE IF NOT EXISTS psp_relay (
 CREATE INDEX IF NOT EXISTS idx_relay_lookup
   ON psp_relay (network, to_peer_id, created_at_ms);
 
+CREATE INDEX IF NOT EXISTS idx_relay_lookup_ordered
+  ON psp_relay (network, to_peer_id, created_at_ms, id);
+
 CREATE INDEX IF NOT EXISTS idx_relay_expires
   ON psp_relay (expires_at_ms);

@@ -595,6 +595,13 @@ export function createSignalingClient(options = {}) {
           pc.__offerRetryTimer = null
         }
         log(`[webrtc] applied queued answer from ${toPeerId}`)
+
+        // Flush queued ICE candidates that may have arrived before answer apply.
+        const queued = pendingCandidates.get(toPeerId) ?? []
+        pendingCandidates.delete(toPeerId)
+        for (const candidate of queued) {
+          await pc.addIceCandidate(candidate).catch(() => {})
+        }
       } catch (err) {
         log(`[webrtc] failed applying queued answer from ${toPeerId}: ${err}`)
       }
@@ -856,6 +863,11 @@ export function createSignalingClient(options = {}) {
       case 'ice_candidate': {
         const c = msg.body?.candidate
         if (!c) break
+        const expectedSessionId = sessionIds.get(fromPeerId)
+        if (expectedSessionId && msg.session_id && msg.session_id !== expectedSessionId) {
+          log(`[webrtc] ignoring candidate from ${fromPeerId} (stale session)`)
+          break
+        }
         log(`[webrtc] remote candidate from ${fromPeerId}`)
         if (conn?.connection) {
           if (conn.connection.signalingState === 'closed') break
