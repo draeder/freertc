@@ -104,6 +104,17 @@
         font-size: 1rem;
         line-height: 1.5;
       }
+      .inline-link,
+      .pill-link {
+        color: #9bc6ff;
+        text-decoration: underline;
+        text-decoration-thickness: 1.5px;
+        text-underline-offset: 2px;
+      }
+      .inline-link:hover,
+      .pill-link:hover {
+        color: #c8e0ff;
+      }
       .hero-status {
         min-width: 220px;
         display: grid;
@@ -132,6 +143,11 @@
         color: var(--warn);
         border-color: rgba(255, 179, 87, 0.35);
         background: rgba(92, 59, 18, 0.42);
+      }
+      .pill.pill-ok {
+        color: var(--success);
+        border-color: rgba(102, 209, 143, 0.35);
+        background: rgba(34, 71, 48, 0.48);
       }
       .status-pill.connected {
         color: var(--success);

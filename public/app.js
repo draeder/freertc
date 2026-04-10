@@ -1,6 +1,7 @@
 import { createApp, computed, nextTick, onMounted, ref, watch } from "https://unpkg.com/vue@3.5.13/dist/vue.esm-browser.prod.js";
 
 const PSP_VERSION = "1.0";
+const PSP_SPEC_URL = "https://github.com/draeder/Peer-Signaling-Protocol-Specification";
 const RTC_CONFIG = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
 const SHARED_IDS_KEY = "freertc.shared.ids.v1";
 
@@ -49,6 +50,26 @@ function isSpecToken(value) {
   return typeof value === "string" && /^[A-Za-z0-9._:/-]{1,128}$/.test(value);
 }
 
+function normalizePeerId(value) {
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (typeof value === "number" || typeof value === "bigint") {
+    return String(value);
+  }
+  return "";
+}
+
+function normalizeText(value) {
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (value === null || value === undefined) {
+    return "";
+  }
+  return String(value).trim();
+}
+
 createApp({
   setup() {
     const host = window.location.host;
@@ -61,12 +82,12 @@ createApp({
     const network = ref("room:test");
 
     function normalizedWsUrlValue() {
-      const trimmed = (wsUrl.value || "").trim();
+      const trimmed = normalizeText(wsUrl.value);
       return trimmed || `${wsScheme}://${host}/ws`;
     }
 
     function normalizedNetworkValue() {
-      const trimmed = (network.value || "").trim();
+      const trimmed = normalizeText(network.value);
       return trimmed || "room:test";
     }
 
@@ -101,9 +122,19 @@ createApp({
     const autoConnect = ref(true);
     const meshConnectedCount = ref(0);
     const meshTargetCount = ref(0);
+    const specLinkFlash = ref(false);
+    const pingFlash = ref(false);
+    const discoverFlash = ref(false);
+    const announceFlash = ref(false);
+    const pingButtonText = ref("ping");
 
     let discoveryTimer = null;
     let reconnectTimer = null;
+    let specLinkFlashTimer = null;
+    let pingFlashTimer = null;
+    let discoverFlashTimer = null;
+    let announceFlashTimer = null;
+    let pendingPingStartedAt = 0;
     let lastDiscoverSyncAt = 0;
     let manualDisconnect = false;
     let stoppingRtc = false;
@@ -163,7 +194,7 @@ createApp({
       return "DataChannel is open. Send a message to start chatting.";
     });
     const fromPeerDisplay = computed(() => {
-      const peer = (fromPeer.value || "").trim();
+      const peer = normalizePeerId(fromPeer.value);
       if (!peer) {
         return "none";
       }
@@ -173,7 +204,7 @@ createApp({
       return `${peer.slice(0, 12)}...${peer.slice(-12)}`;
     });
     const targetPeerDisplay = computed(() => {
-      const peer = (toPeer.value || "").trim();
+      const peer = normalizePeerId(toPeer.value);
       if (!peer) {
         return "waiting";
       }
@@ -197,7 +228,7 @@ createApp({
     });
     const specWarnings = computed(() => {
       const warnings = [];
-      const ws = (wsUrl.value || "").trim();
+      const ws = normalizeText(wsUrl.value);
       try {
         const parsed = new URL(ws);
         if (!["ws:", "wss:"].includes(parsed.protocol)) {
@@ -207,31 +238,31 @@ createApp({
         warnings.push("Signaling Server URL must be a valid absolute WebSocket URL");
       }
 
-      const topic = (network.value || "").trim();
+      const topic = normalizeText(network.value);
       if (!topic) {
         warnings.push("Room / Topic is required");
       } else if (!isSpecToken(topic)) {
         warnings.push("Room / Topic should be 1-128 chars using A-Z, a-z, 0-9, . _ : / -");
       }
 
-      const localPeer = (fromPeer.value || "").trim();
+      const localPeer = normalizePeerId(fromPeer.value);
       if (!isValidPeerId(localPeer)) {
         warnings.push("Your Peer ID should be a token-safe, fingerprint-like ID (no spaces, typically >=16 chars)");
       }
 
-      const target = (toPeer.value || "").trim();
+      const target = normalizePeerId(toPeer.value);
       if (target && !isValidPeerId(target)) {
         warnings.push("To Peer must be empty or a token-safe, fingerprint-like peer ID");
       }
 
-      const sess = (sessionId.value || "").trim();
+      const sess = normalizeText(sessionId.value);
       if (!sess) {
         warnings.push("Session ID is required");
       } else if (!isSpecToken(sess)) {
         warnings.push("Session ID should be 1-128 chars using A-Z, a-z, 0-9, . _ : / -");
       }
 
-      const inst = (instanceId.value || "").trim();
+      const inst = normalizeText(instanceId.value);
       if (!inst) {
         warnings.push("Instance ID is required");
       } else if (!isSpecToken(inst)) {
@@ -241,6 +272,10 @@ createApp({
       return warnings;
     });
     const specWarningCount = computed(() => specWarnings.value.length);
+    const specPillLabel = computed(() => (specLinkFlash.value ? "OK" : "PSP Spec"));
+    const pingButtonLabel = computed(() => pingButtonText.value);
+    const discoverButtonLabel = computed(() => (discoverFlash.value ? "OK" : "discover"));
+    const announceButtonLabel = computed(() => (announceFlash.value ? "OK" : "announce"));
     const iAmInitiator = computed(() => {
       if (!toPeer.value || !fromPeer.value) {
         return false;
@@ -347,6 +382,51 @@ createApp({
       }
     }
 
+    function handleSpecLinkClick() {
+      specLinkFlash.value = true;
+      if (specLinkFlashTimer) {
+        clearTimeout(specLinkFlashTimer);
+      }
+      specLinkFlashTimer = setTimeout(() => {
+        specLinkFlash.value = false;
+        specLinkFlashTimer = null;
+      }, 900);
+    }
+
+    function flashPingButton() {
+      if (pingFlashTimer) {
+        clearTimeout(pingFlashTimer);
+      }
+      pingFlash.value = true;
+      pingFlashTimer = setTimeout(() => {
+        pingFlash.value = false;
+        pingButtonText.value = "ping";
+        pingFlashTimer = null;
+      }, 1200);
+    }
+
+    function flashDiscoverButton() {
+      discoverFlash.value = true;
+      if (discoverFlashTimer) {
+        clearTimeout(discoverFlashTimer);
+      }
+      discoverFlashTimer = setTimeout(() => {
+        discoverFlash.value = false;
+        discoverFlashTimer = null;
+      }, 700);
+    }
+
+    function flashAnnounceButton() {
+      announceFlash.value = true;
+      if (announceFlashTimer) {
+        clearTimeout(announceFlashTimer);
+      }
+      announceFlashTimer = setTimeout(() => {
+        announceFlash.value = false;
+        announceFlashTimer = null;
+      }, 700);
+    }
+
     function pushChatMessage(text, kind = "system") {
       chatLog.value.push({
         id: newId("chat"),
@@ -377,7 +457,7 @@ createApp({
     );
 
     function shortPeer(peerId) {
-      const peer = (peerId || "").trim();
+      const peer = normalizePeerId(peerId);
       if (!peer) {
         return "none";
       }
@@ -529,13 +609,13 @@ createApp({
       pushLog("ids", { peer_id: fromPeer.value });
 
       if (isConnected.value) {
-        sendAnnounce();
-        sendDiscover();
+        sendAnnounce({ feedback: false });
+        sendDiscover({ feedback: false });
       }
     }
 
     function applyNetworkChange() {
-      const next = (network.value || "").trim() || "room:test";
+      const next = normalizeText(network.value) || "room:test";
       const changed = next !== appliedNetwork.value;
       network.value = next;
 
@@ -563,7 +643,7 @@ createApp({
     }
 
     function applyWsUrlChange() {
-      const next = (wsUrl.value || "").trim();
+      const next = normalizeText(wsUrl.value);
       const resolved = next || `${wsScheme}://${host}/ws`;
       const changed = resolved !== appliedWsUrl.value;
       wsUrl.value = resolved;
@@ -583,7 +663,7 @@ createApp({
 
     function applyFromPeerChange() {
       const previous = appliedFromPeer.value;
-      const next = (fromPeer.value || "").trim();
+      const next = normalizePeerId(fromPeer.value);
       if (!next) {
         fromPeer.value = previous;
         return;
@@ -729,6 +809,9 @@ createApp({
       ws.onclose = () => {
         status.value = "disconnected";
         socket.value = null;
+        pendingPingStartedAt = 0;
+        pingButtonText.value = "ping";
+        pingFlash.value = false;
         stopAutoLoop();
         stopRtc();
         pushLog("socket", "closed");
@@ -768,8 +851,9 @@ createApp({
       stopRtc();
     }
 
-    function sendAnnounce() {
-      sendEnvelope({
+    function sendAnnounce(options = {}) {
+      const { feedback = true } = options;
+      const sent = sendEnvelope({
         psp_version: PSP_VERSION,
         type: "announce",
         network: network.value,
@@ -793,6 +877,10 @@ createApp({
           }
         }
       });
+      if (sent && feedback) {
+        flashAnnounceButton();
+      }
+      return sent;
     }
 
     function sendWithdraw() {
@@ -812,8 +900,9 @@ createApp({
       });
     }
 
-    function sendDiscover() {
-      sendEnvelope({
+    function sendDiscover(options = {}) {
+      const { feedback = true } = options;
+      const sent = sendEnvelope({
         psp_version: PSP_VERSION,
         type: "discover",
         network: network.value,
@@ -828,13 +917,24 @@ createApp({
           exclude_peers: [fromPeer.value]
         }
       });
+      if (sent && feedback) {
+        flashDiscoverButton();
+      }
+      return sent;
     }
 
     function sendPing(peerId = toPeer.value || null) {
       if (!peerId) {
-        return;
+        return false;
       }
-      sendEnvelope({
+      pendingPingStartedAt = performance.now();
+      pingButtonText.value = "...";
+      pingFlash.value = true;
+      if (pingFlashTimer) {
+        clearTimeout(pingFlashTimer);
+        pingFlashTimer = null;
+      }
+      const sent = sendEnvelope({
         psp_version: PSP_VERSION,
         type: "ping",
         network: network.value,
@@ -848,6 +948,12 @@ createApp({
           nonce: Math.random().toString(36).slice(2)
         }
       });
+      if (!sent) {
+        pendingPingStartedAt = 0;
+        pingButtonText.value = "ping";
+        pingFlash.value = false;
+      }
+      return sent;
     }
 
     function sendRelay() {
@@ -987,7 +1093,7 @@ createApp({
 
       // Send announce immediately on join.
       if (isConnected.value) {
-        sendAnnounce();
+        sendAnnounce({ feedback: false });
       }
 
       // Periodic connection management: pings, auto-connect, stale pruning, and TTL keep-alive.
@@ -1036,11 +1142,11 @@ createApp({
 
         // Re-announce every 3s to keep D1 TTL alive. Server suppresses peer_list broadcasts
         // for heartbeat re-announces, so this is cheap and ensures continuous peer discovery.
-        sendAnnounce();
+        sendAnnounce({ feedback: false });
 
         // Low-frequency discover keeps peer_list timestamps fresh when heartbeat broadcasts are suppressed.
         if (autoDiscovery.value && now() - lastDiscoverSyncAt >= DISCOVER_SYNC_INTERVAL_MS) {
-          sendDiscover();
+          sendDiscover({ feedback: false });
           lastDiscoverSyncAt = now();
         }
 
@@ -1326,8 +1432,8 @@ createApp({
     }
 
     async function startOfferFlow(peerId) {
-      const peerPc = ensurePeerConnection(peerId);
-      const link = getMeshLink(peerId);
+      let peerPc = ensurePeerConnection(peerId);
+      let link = getMeshLink(peerId);
 
       if (link.dc && link.dc.readyState === "open") {
         link.phase = "connected";
@@ -1337,26 +1443,54 @@ createApp({
         return;
       }
 
-      if (!link.dc) {
-        const channel = peerPc.createDataChannel("freertc");
-        setupDataChannel(peerId, channel, "local-offer");
+      const needsFreshPeerConnection = Boolean(
+        link.pc && (
+          link.pc.signalingState !== "stable" ||
+          link.pc.currentLocalDescription ||
+          link.pc.currentRemoteDescription ||
+          link.pc.pendingLocalDescription ||
+          link.pc.pendingRemoteDescription ||
+          link.dc
+        )
+      );
+
+      if (needsFreshPeerConnection) {
+        pushLog("rtc", `Resetting stale offer state for ${peerId}`);
+        closeMeshLink(peerId);
+        peerPc = ensurePeerConnection(peerId);
+        link = getMeshLink(peerId);
       }
 
-      const offer = await peerPc.createOffer();
-      await peerPc.setLocalDescription(offer);
-      link.phase = "offered";
-      link.answerWaitTime = now();  // Start timeout waiting for answer (PSP Section 12.2)
+      try {
+        if (!link.dc) {
+          const channel = peerPc.createDataChannel("freertc");
+          setupDataChannel(peerId, channel, "local-offer");
+        }
 
-      sendRelayEnvelope(
-        "offer",
-        {
-          sdp: offer.sdp,
-          trickle_ice: true,
-          restart_ice: false,
-          setup_role: "actpass"
-        },
-        { to: peerId }
-      );
+        const offer = await peerPc.createOffer();
+        await peerPc.setLocalDescription(offer);
+        link.phase = "offered";
+        link.answerWaitTime = now();
+
+        sendRelayEnvelope(
+          "offer",
+          {
+            sdp: offer.sdp,
+            trickle_ice: true,
+            restart_ice: false,
+            setup_role: "actpass"
+          },
+          { to: peerId }
+        );
+      } catch (error) {
+        pushLog("rtc:error", error?.message || "failed to create local offer");
+        markPeerFailed(peerId, "offer-create-failed");
+        closeMeshLink(peerId);
+        if (toPeer.value === peerId) {
+          toPeer.value = "";
+        }
+      }
+
       refreshSelectedPeerSnapshot();
     }
 
@@ -1370,8 +1504,8 @@ createApp({
       autoDiscovery.value = true;
       autoConnect.value = true;
       persistSharedIds();
-      sendAnnounce();
-      sendDiscover();
+      sendAnnounce({ feedback: false });
+      sendDiscover({ feedback: false });
       lastDiscoverSyncAt = now();
       startAutoLoop();
 
@@ -1438,7 +1572,7 @@ createApp({
       }
 
       const isForMe = !message.to || message.to === fromPeer.value;
-      const sameNetwork = (message.network || "").trim() === normalizedNetworkValue();
+      const sameNetwork = normalizeText(message.network) === normalizedNetworkValue();
       if (!isForMe || !sameNetwork) {
         return;
       }
@@ -1595,7 +1729,14 @@ createApp({
           }
           break;
         case "ack":
+          break;
         case "pong":
+          if (pendingPingStartedAt > 0) {
+            const elapsedMs = Math.max(1, Math.round(performance.now() - pendingPingStartedAt));
+            pendingPingStartedAt = 0;
+            pingButtonText.value = `OK ${elapsedMs}ms`;
+            flashPingButton();
+          }
           break;
         default:
           break;
@@ -1734,7 +1875,19 @@ createApp({
       link.offerWaitTime = 0;
 
       const peerPc = ensurePeerConnection(peerId);
-      await peerPc.setRemoteDescription({ type: "offer", sdp: message.body.sdp });
+      if (!["stable", "have-local-offer"].includes(peerPc.signalingState)) {
+        pushLog("rtc", `Ignored stale offer from ${peerId} while in ${peerPc.signalingState}`);
+        return;
+      }
+
+      try {
+        await peerPc.setRemoteDescription({ type: "offer", sdp: message.body.sdp });
+      } catch (error) {
+        pushLog("rtc:error", error?.message || `failed to apply offer from ${peerId}`);
+        markPeerFailed(peerId, "offer-apply-failed");
+        closeMeshLink(peerId);
+        return;
+      }
       link.phase = "answering";
 
       const answer = await peerPc.createAnswer();
@@ -1772,7 +1925,22 @@ createApp({
         return;
       }
 
-      await link.pc.setRemoteDescription({ type: "answer", sdp: message.body.sdp });
+      if (link.pc.signalingState !== "have-local-offer") {
+        pushLog("rtc", `Ignored stale answer from ${peerId} while in ${link.pc.signalingState}`);
+        return;
+      }
+
+      try {
+        await link.pc.setRemoteDescription({ type: "answer", sdp: message.body.sdp });
+      } catch (error) {
+        pushLog("rtc:error", error?.message || `failed to apply answer from ${peerId}`);
+        markPeerFailed(peerId, "answer-apply-failed");
+        closeMeshLink(peerId);
+        if (toPeer.value === peerId) {
+          toPeer.value = "";
+        }
+        return;
+      }
       link.phase = "connected-pending";
       link.answerWaitTime = 0;  // Answer received, stop waiting
       pushLog("rtc", `answer applied from ${peerId}`);
@@ -1797,7 +1965,7 @@ createApp({
     }
 
     function sendChat() {
-      const text = chatInput.value.trim();
+      const text = normalizeText(chatInput.value);
       if (!text) {
         return;
       }
@@ -1888,6 +2056,14 @@ createApp({
     });
 
     return {
+      pspSpecUrl: PSP_SPEC_URL,
+      specPillLabel,
+      pingButtonLabel,
+      discoverButtonLabel,
+      announceButtonLabel,
+      pingFlash,
+      discoverFlash,
+      announceFlash,
       activeView,
       wsUrl,
       status,
@@ -1947,7 +2123,8 @@ createApp({
       regenerateSharedIds,
       persistSharedIds,
       selectPeer,
-      selectPeerFromUi
+      selectPeerFromUi,
+      handleSpecLinkClick
     };
   },
   template: `
@@ -1968,7 +2145,7 @@ createApp({
             </span>
             <h1 class="brand-wordmark"><span class="brand-free">free</span><span class="brand-rtc">rtc</span></h1>
           </div>
-          <div class="hero-copy">PSP signaling and WebRTC data-channel mesh primitives for real-time peer networking.</div>
+          <div class="hero-copy"><a class="inline-link" :href="pspSpecUrl" target="_blank" rel="noopener noreferrer" @click="handleSpecLinkClick">PSP</a> signaling and WebRTC data-channel mesh primitives for real-time peer networking.</div>
         </div>
         <div class="hero-status">
           <div class="status-pill" :class="status">
@@ -1976,8 +2153,8 @@ createApp({
           </div>
           <div class="pill"><strong>mode</strong> {{ activeView === 'console' ? 'debug console' : 'auto webrtc' }}</div>
           <div class="pill"><strong>WebRTC Role</strong> {{ iAmInitiator ? 'initiator' : 'responder' }}</div>
-          <div class="pill" :class="{ 'pill-warn': specWarningCount > 0 }">
-            <strong>PSP Spec</strong>
+          <div class="pill" :class="{ 'pill-warn': specWarningCount > 0, 'pill-ok': specLinkFlash }">
+            <strong><a class="pill-link" :href="pspSpecUrl" target="_blank" rel="noopener noreferrer" @click="handleSpecLinkClick">{{ specPillLabel }}</a></strong>
             {{ specWarningCount > 0 ? specWarningCount + ' warning' + (specWarningCount === 1 ? '' : 's') : 'ok' }}
           </div>
         </div>
@@ -1985,7 +2162,7 @@ createApp({
 
       <section v-if="specWarningCount > 0" class="card spec-warning-card stack">
         <div class="section-header">
-          <h2 class="panel-title">PSP Spec Warnings</h2>
+          <h2 class="panel-title"><a class="pill-link" :href="pspSpecUrl" target="_blank" rel="noopener noreferrer" @click="handleSpecLinkClick">PSP Spec</a> Warnings</h2>
           <span class="pill pill-warn"><strong>count</strong> {{ specWarningCount }}</span>
         </div>
         <ul class="spec-warning-list">
@@ -2080,9 +2257,9 @@ createApp({
             </label>
           </div>
           <div class="row">
-            <button @click="sendAnnounce" :disabled="!isConnected">announce</button>
-            <button class="secondary" @click="sendDiscover" :disabled="!isConnected">discover</button>
-            <button class="secondary" @click="sendPing" :disabled="!isConnected">ping</button>
+            <button :class="{ active: announceFlash }" @click="sendAnnounce" :disabled="!isConnected">{{ announceButtonLabel }}</button>
+            <button class="secondary" :class="{ active: discoverFlash }" @click="sendDiscover" :disabled="!isConnected">{{ discoverButtonLabel }}</button>
+            <button class="secondary" :class="{ active: pingFlash }" @click="sendPing" :disabled="!isConnected">{{ pingButtonLabel }}</button>
           </div>
         </article>
       </section>
@@ -2091,7 +2268,7 @@ createApp({
         <article v-if="activeView === 'console'" class="card console-card stack">
           <div class="section-header">
             <h2 class="panel-title">Raw Relay Console</h2>
-            <span class="pill"><strong>psp</strong> manual envelope mode</span>
+            <span class="pill"><strong><a class="pill-link" :href="pspSpecUrl" target="_blank" rel="noopener noreferrer" @click="handleSpecLinkClick">psp</a></strong> manual envelope mode</span>
             <span class="pill"><strong>to</strong> {{ relayTargetDisplay }}</span>
           </div>
           <label>

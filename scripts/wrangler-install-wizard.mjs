@@ -19,6 +19,14 @@ function run(command, args, { allowFailure = false } = {}) {
   return result.status === 0;
 }
 
+function isWranglerAuthenticated() {
+  const result = spawnSync('npx', ['wrangler', 'whoami'], {
+    stdio: 'pipe',
+    encoding: 'utf8'
+  });
+  return result.status === 0;
+}
+
 function parseFirstDatabaseName(filePath) {
   if (!fs.existsSync(filePath)) return null;
   const jsonc = fs.readFileSync(filePath, 'utf8');
@@ -96,11 +104,15 @@ async function main() {
 
     if (needsDeploy) {
       console.log('\nStep 3: Cloudflare authentication');
-      const doLogin = await rl.question('Run "wrangler login" now? [Y/n]: ');
-      if (yes(doLogin, true)) {
-        run('npx', ['wrangler', 'login']);
+      if (isWranglerAuthenticated()) {
+        console.log('Wrangler is already authenticated. Skipping login.');
       } else {
-        console.log('Skipping login. Ensure you are already authenticated before deploy.');
+        const doLogin = await rl.question('Not logged in. Run "wrangler login" now? [Y/n]: ');
+        if (yes(doLogin, true)) {
+          run('npx', ['wrangler', 'login']);
+        } else {
+          console.log('Skipping login. Deploy steps may fail until you authenticate.');
+        }
       }
     }
 

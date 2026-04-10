@@ -1,13 +1,11 @@
 # freertc Cloudflare Worker (WebSocket + D1)
 
-This project provides a Cloudflare Worker signaling relay for WebRTC peers using the Peer Signaling Protocol (PSP) envelope shape from:
-
-- https://github.com/draeder/Peer-Signaling-Protocol-Specification
+This project provides a Cloudflare Worker signaling relay for WebRTC peers using the [Peer Signaling Protocol (PSP)](https://github.com/draeder/Peer-Signaling-Protocol-Specification) envelope shape.
 
 ## What this worker does
 
 - Accepts WebSocket client connections at `/ws`.
-- Validates PSP message envelopes (`psp_version`, `type`, `network`, `from`, `message_id`, `timestamp`).
+- Validates [PSP](https://github.com/draeder/Peer-Signaling-Protocol-Specification) message envelopes (`psp_version`, `type`, `network`, `from`, `message_id`, `timestamp`).
 - Supports discovery, negotiation, control, and extension message types.
 - Stores peer announcements in Cloudflare D1 (`psp_announcements`).
 - Stores directed signaling messages in Cloudflare D1 (`psp_relay`).
@@ -36,7 +34,8 @@ The wizard can:
 - Create `wrangler.jsonc` from `wrangler.template.jsonc` if needed.
 - Initialize local D1 schema for `wrangler dev`.
 - Initialize remote D1 schema for deploy.
-- Optionally run `wrangler login`, `npm run dev`, and `npm run deploy`.
+- Check existing Wrangler auth and only run `wrangler login` when needed.
+- Optionally run `npm run dev` and `npm run deploy`.
 
 ## Manual setup
 
@@ -114,5 +113,5 @@ The demo defaults to Auto WebRTC and performs real offer/answer + ICE exchange o
 ## Notes
 
 - TTL is enforced using `timestamp + ttl_ms` (default 30 seconds, max 120 seconds).
-- Malformed envelopes produce PSP `error` responses.
+- Malformed envelopes produce [PSP](https://github.com/draeder/Peer-Signaling-Protocol-Specification) `error` responses.
 
