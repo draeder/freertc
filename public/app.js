@@ -11,6 +11,7 @@ const RTC_CONFIG = {
   ]
 };
 const SHARED_IDS_KEY = "freertc.shared.ids.v1";
+const UI_PREFS_KEY = "freertc.ui.prefs.v1";
 
 function newId(prefix = "msg") {
   return `${prefix}-${crypto.randomUUID()}`;
@@ -708,6 +709,73 @@ createApp({
       });
     }
 
+    function normalizeMeshLimit(value) {
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        return 4;
+      }
+      return Math.max(1, Math.min(99, Math.floor(parsed)));
+    }
+
+    function persistUiPrefs() {
+      try {
+        sessionStorage.setItem(
+          UI_PREFS_KEY,
+          JSON.stringify({
+            ws_url: normalizedWsUrlValue(),
+            network: normalizedNetworkValue(),
+            partial_mesh: Boolean(partialMesh.value),
+            partial_mesh_max_peers: normalizeMeshLimit(partialMeshMaxPeers.value),
+            chat_send_mode: chatSendMode.value === "target" ? "target" : "broadcast",
+            active_view: activeView.value === "console" ? "console" : "webrtc"
+          })
+        );
+      } catch {
+        // Ignore storage write errors (private mode/quota).
+      }
+    }
+
+    function loadUiPrefs() {
+      try {
+        const raw = sessionStorage.getItem(UI_PREFS_KEY);
+        if (!raw) {
+          return;
+        }
+        const saved = safeJsonParse(raw, null);
+        if (!saved || typeof saved !== "object") {
+          return;
+        }
+
+        const savedWs = normalizeText(saved.ws_url);
+        if (savedWs) {
+          wsUrl.value = savedWs;
+          appliedWsUrl.value = savedWs;
+        }
+
+        const savedNetwork = normalizeText(saved.network);
+        if (savedNetwork) {
+          network.value = savedNetwork;
+          appliedNetwork.value = savedNetwork;
+        }
+
+        if (typeof saved.partial_mesh === "boolean") {
+          partialMesh.value = saved.partial_mesh;
+        }
+
+        partialMeshMaxPeers.value = normalizeMeshLimit(saved.partial_mesh_max_peers);
+
+        if (saved.chat_send_mode === "target" || saved.chat_send_mode === "broadcast") {
+          chatSendMode.value = saved.chat_send_mode;
+        }
+
+        if (saved.active_view === "console" || saved.active_view === "webrtc") {
+          activeView.value = saved.active_view;
+        }
+      } catch {
+        // Ignore storage read/parse errors.
+      }
+    }
+
     function regenerateSharedIds() {
       sessionId.value = `sess-${Math.random().toString(36).slice(2, 10)}`;
       instanceId.value = `inst-${Math.random().toString(36).slice(2, 10)}`;
@@ -987,7 +1055,7 @@ createApp({
           },
           hints: {
             wants_peers: true,
-            max_peers: 8
+            max_peers: partialMesh.value ? effectivePartialMeshLimit() : null
           }
         }
       });
@@ -1440,12 +1508,33 @@ createApp({
       return count;
     }
 
+    function effectivePartialMeshLimit() {
+      const rawLimit = Number(partialMeshMaxPeers.value);
+      if (!Number.isFinite(rawLimit) || rawLimit <= 0) {
+        return 1;
+      }
+      return Math.max(1, Math.floor(rawLimit));
+    }
+
+    function hasMeshCapacityForPeer(peerId) {
+      if (!partialMesh.value) {
+        return true;
+      }
+
+      const existing = getMeshLink(peerId, false);
+      if (existing && (existing?.dc?.readyState === "open" || isNegotiatingPhase(existing?.phase))) {
+        return true;
+      }
+
+      return activeMeshPeerCount() < effectivePartialMeshLimit();
+    }
+
     function maybeAutoConnectPeer(peerId) {
       if (reconnectLockedByBye || !autoConnect.value || !isConnected.value) {
         return;
       }
 
-      if (partialMesh.value && activeMeshPeerCount() >= partialMeshMaxPeers.value) {
+      if (!hasMeshCapacityForPeer(peerId)) {
         return;
       }
 
@@ -1971,6 +2060,19 @@ createApp({
       const peerId = message.from;
       const link = getMeshLink(peerId);
 
+      if (!hasMeshCapacityForPeer(peerId)) {
+        sendRelayEnvelope(
+          "connect_reject",
+          {
+            code: "mesh_full",
+            reason: "local partial mesh limit reached"
+          },
+          { to: peerId, reply_to: message.message_id }
+        );
+        pushLog("rtc", `Rejected connect_request from ${peerId}: local mesh full`);
+        return;
+      }
+
        if (link.dc && link.dc.readyState === "open") {
         sendRelayEnvelope(
           "connect_reject",
@@ -2074,6 +2176,20 @@ createApp({
         return;
       }
       const peerId = message.from;
+
+      if (!hasMeshCapacityForPeer(peerId)) {
+        sendRelayEnvelope(
+          "connect_reject",
+          {
+            code: "mesh_full",
+            reason: "local partial mesh limit reached"
+          },
+          { to: peerId, reply_to: message.message_id }
+        );
+        pushLog("rtc", `Rejected offer from ${peerId}: local mesh full`);
+        return;
+      }
+
       const link = getMeshLink(peerId);
       if (!message.body?.sdp) {
         return;
@@ -2276,6 +2392,15 @@ createApp({
       pushLog("rtc", "sent bye and disconnected peer session");
     }
 
+    watch(
+      [wsUrl, network, partialMesh, partialMeshMaxPeers, chatSendMode, activeView],
+      () => {
+        persistUiPrefs();
+      },
+      { flush: "sync" }
+    );
+
+    loadUiPrefs();
     initSharedIds();
 
     onMounted(() => {
