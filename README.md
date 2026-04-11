@@ -12,6 +12,12 @@ This project provides a Cloudflare Worker signaling relay for WebRTC peers using
 - Delivers queued relay messages when peers reconnect.
 - Serves the browser demo from `public/`.
 
+## Runtime scope
+
+- Production Worker runtime is `src/index.js` with Cloudflare D1 (`DB` binding).
+- The built-in browser demo served by the Worker is `public/index.html` + `public/app.js`.
+- `src/kv.js` and `demo/src/*` are legacy/experimental code paths and are not used by `wrangler dev` or `wrangler deploy` in the current setup.
+
 ## Supported message types
 
 - Discovery: `announce`, `withdraw`, `discover`, `peer_list`, `redirect`
@@ -90,6 +96,11 @@ Endpoints:
 npm run deploy
 ```
 
+Additional scripts:
+
+- `npm run deploy:raw` deploys without `--env production`.
+- `npm run check` runs syntax validation (`node --check src/index.js`).
+
 ## Auto WebRTC two-tab test
 
 The demo defaults to Auto WebRTC and performs real offer/answer + ICE exchange over this Worker.
@@ -108,7 +119,8 @@ The demo defaults to Auto WebRTC and performs real offer/answer + ICE exchange o
 - Send `announce` first to bind socket identity (`from`, `network`).
 - Include `session_id` for negotiation messages.
 - Include `to` for directed messages.
-- Use `ping` periodically for liveness and queued message delivery.
+- Use periodic `announce` to refresh presence TTL and receive queued relay messages.
+- Use `ping` for liveness (`pong`) and keepalive.
 
 ## Notes
 
