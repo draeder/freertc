@@ -18,12 +18,16 @@ export function useP2p({
   peerId,        // ref<string>   – this peer's unique ID
   sharedMagnet,  // ref<string>   – unused, kept for API compat
   onShare,       // fn(key, value) – called when this peer has data to share
+  partialMesh,         // ref<boolean>  – limit connections to partialMeshMaxPeers (default: true)
+  partialMeshMaxPeers, // ref<number>   – max peers when partial mesh is on (default: 4)
 }) {
   // ── public reactive state ────────────────────────────────────────────────
   const status     = ref('disconnected') // disconnected | connecting | connected | error
   const logs       = ref([])
   const messages   = ref([])  // { id, from: 'me'|'them', text, ts }
   const peerCount  = ref(0)
+  const _partialMeshRef = partialMesh ?? ref(true)  // shared ref used in _connectPeerOoo and returned
+  const _partialMeshMaxRef = partialMeshMaxPeers ?? ref(4)  // shared ref for the peer cap
 
   // ── internal handles ─────────────────────────────────────────────────────
   let _ws         = null   // WebSocket
@@ -159,6 +163,17 @@ export function useP2p({
       // Auto-negotiate: the peer with the lexicographically smaller ID sends the offer.
       if (localPeerId >= remotePeerId) return false
       if (activeDialPeerIds.has(remotePeerId)) return false
+
+      // Partial mesh: skip new dials if we already have enough connected/active peers.
+      if (toValue(_partialMeshRef)) {
+        let activePeerCount = 0
+        for (const entry of _signalingClient?.mesh.connections.values() ?? []) {
+          if (entry?.state === 'connected' || entry?.state === 'connecting' || entry?.channel?.readyState === 'open') {
+            activePeerCount++
+          }
+        }
+        if (activePeerCount >= toValue(_partialMeshMaxRef)) return false
+      }
 
       const existing = _signalingClient?.mesh.connections.get(remotePeerId)
 
@@ -415,5 +430,5 @@ export function useP2p({
 
   onUnmounted(disconnect)
 
-  return { status, logs, messages, peerCount, connect, disconnect, send, clearLogs, clearMessages }
+  return { status, logs, messages, peerCount, partialMesh: _partialMeshRef, partialMeshMaxPeers: _partialMeshMaxRef, connect, disconnect, send, clearLogs, clearMessages }
 }

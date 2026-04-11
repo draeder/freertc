@@ -154,6 +154,7 @@ createApp({
     const dataState = ref("closed");
     const chatInput = ref("");
     const chatSendMode = ref("broadcast");
+    const selectedTargetPeers = ref([]);
     const chatLog = ref([]);
     const chatThreadRef = ref(null);
     const debugExpanded = ref(false);
@@ -161,6 +162,8 @@ createApp({
     const discoveredPeers = ref([]);
     const autoDiscovery = ref(true);
     const autoConnect = ref(true);
+    const partialMesh = ref(true);
+    const partialMeshMaxPeers = ref(4);
     const meshConnectedCount = ref(0);
     const meshTargetCount = ref(0);
     const specLinkFlash = ref(false);
@@ -266,7 +269,23 @@ createApp({
         const count = meshConnectedCount.value;
         return count > 0 ? `broadcast (${count} peers)` : "broadcast (0 peers)";
       }
+      const selected = selectedTargetPeers.value;
+      if (selected.length > 1) {
+        return "target (multiple)";
+      }
+      if (selected.length === 1) {
+        return `target (${shortPeer(selected[0])})`;
+      }
       return toPeer.value ? `target (${targetPeerDisplay.value})` : "target (none)";
+    });
+    const sendRouteTooltip = computed(() => {
+      if (chatSendMode.value !== "target") {
+        return "";
+      }
+      if (selectedTargetPeers.value.length > 0) {
+        return selectedTargetPeers.value.join("\n");
+      }
+      return toPeer.value || "";
     });
     const specWarnings = computed(() => {
       const warnings = [];
@@ -318,12 +337,6 @@ createApp({
     const pingButtonLabel = computed(() => pingButtonText.value);
     const discoverButtonLabel = computed(() => (discoverFlash.value ? "OK" : "discover"));
     const announceButtonLabel = computed(() => (announceFlash.value ? "OK" : "announce"));
-    const iAmInitiator = computed(() => {
-      if (!toPeer.value || !fromPeer.value) {
-        return false;
-      }
-      return fromPeer.value.localeCompare(toPeer.value) < 0;
-    });
     const meshPeers = computed(() => {
       // Depend on mesh counters so this recomputes when link map state changes.
       void meshTargetCount.value;
@@ -343,7 +356,7 @@ createApp({
           return {
             peerId,
             display: shortPeer(peerId),
-            selected: chatSendMode.value === "target" && toPeer.value === peerId,
+            selected: selectedTargetPeers.value.includes(peerId),
             phase: link?.phase ?? "idle",
             rtcState: link?.rtcState ?? "new",
             dataState: dataStateValue,
@@ -542,6 +555,10 @@ createApp({
       if (!link) {
         return false;
       }
+      // Guard against stale browser state where DC reports open after PC failed.
+      if (["failed", "closed"].includes(link.rtcState) && link.dc?.readyState === "open") {
+        return false;
+      }
       if (link.dc?.readyState === "open") {
         return true;
       }
@@ -584,7 +601,10 @@ createApp({
         if (!peerId || peerId === fromPeer.value) {
           continue;
         }
-        if (link?.dc?.readyState === "open") {
+        if (
+          link?.dc?.readyState === "open" &&
+          !["failed", "closed", "disconnected"].includes(link?.rtcState)
+        ) {
           visible.add(peerId);
         }
       }
@@ -1183,7 +1203,24 @@ createApp({
     }
 
     function selectPeerFromUi(peerId) {
-      selectPeer(peerId, { manual: true });
+      // Clicking mesh rows toggles multi-target chat routing.
+      chatSendMode.value = "target";
+
+      const idx = selectedTargetPeers.value.indexOf(peerId);
+      if (idx >= 0) {
+        const next = [...selectedTargetPeers.value];
+        next.splice(idx, 1);
+        selectedTargetPeers.value = next;
+        if (toPeer.value === peerId) {
+          toPeer.value = next[0] || "";
+          refreshSelectedPeerSnapshot();
+        }
+        pushLog("discovery", `Unselected target peer: ${peerId}`);
+        return;
+      }
+
+      selectedTargetPeers.value = [...selectedTargetPeers.value, peerId];
+      selectPeer(peerId, { manual: true, allowUnannounced: true });
     }
 
     function startAutoLoop() {
@@ -1385,8 +1422,22 @@ createApp({
         });
     }
 
+    function activeMeshPeerCount() {
+      const activePhases = new Set(["requesting", "waiting-offer", "offering", "offered", "answering", "answered", "connected-pending", "ready"]);
+      let count = 0;
+      for (const [pid, link] of meshLinks.entries()) {
+        if (!pid || pid === fromPeer.value) continue;
+        if (link?.dc?.readyState === "open" || activePhases.has(link?.phase)) count++;
+      }
+      return count;
+    }
+
     function maybeAutoConnectPeer(peerId) {
       if (reconnectLockedByBye || !autoConnect.value || !isConnected.value) {
+        return;
+      }
+
+      if (partialMesh.value && activeMeshPeerCount() >= partialMeshMaxPeers.value) {
         return;
       }
 
@@ -1519,6 +1570,16 @@ createApp({
           link.phase = "connected";
           link.connectRequested = false;
           link.connectRequestTime = 0;
+        }
+
+        if (["failed", "closed"].includes(peerPc.connectionState) && link.dc) {
+          try {
+            link.dc.close();
+          } catch {
+            // no-op
+          }
+          link.dataState = "closed";
+          link.dc = null;
         }
 
         pushLog("rtc:state", `${peerId} ${peerPc.connectionState}`);
@@ -2147,16 +2208,36 @@ createApp({
       }
 
       if (chatSendMode.value === "target") {
-        if (!toPeer.value) {
+        const targetPeerIds = selectedTargetPeers.value.length > 0
+          ? [...selectedTargetPeers.value]
+          : (toPeer.value ? [toPeer.value] : []);
+
+        if (targetPeerIds.length === 0) {
           pushLog("chat:error", "Target mode requires selected peer");
           return;
         }
-        const selected = getMeshLink(toPeer.value, false);
-        if (!selected?.dc || selected.dc.readyState !== "open") {
+
+        let sentCount = 0;
+        const unavailable = [];
+        for (const peerId of targetPeerIds) {
+          const selected = getMeshLink(peerId, false);
+          if (!selected?.dc || selected.dc.readyState !== "open") {
+            unavailable.push(peerId);
+            continue;
+          }
+          selected.dc.send(text);
+          sentCount += 1;
+        }
+
+        if (sentCount === 0) {
           pushLog("chat:error", "Selected peer DataChannel is not open");
           return;
         }
-        selected.dc.send(text);
+
+        if (unavailable.length > 0) {
+          pushLog("chat:warn", `Some selected peers are unavailable: ${unavailable.join(", ")}`);
+        }
+
         pushChatMessage(text, "outgoing");
         chatInput.value = "";
         return;
@@ -2247,6 +2328,8 @@ createApp({
       discoveredPeers,
       autoDiscovery,
       autoConnect,
+      partialMesh,
+      partialMeshMaxPeers,
       debugExpanded,
       logsText,
       logCount,
@@ -2262,17 +2345,18 @@ createApp({
       targetPeerDisplay,
       relayTargetDisplay,
       sendRouteDisplay,
+      sendRouteTooltip,
       specWarnings,
       specWarningCount,
       meshPeers,
       meshConnectedCount,
       meshTargetCount,
-      iAmInitiator,
       rtcPhase,
       rtcState,
       dataState,
       chatInput,
       chatSendMode,
+      selectedTargetPeers,
       chatThreadRef,
       connect,
       disconnect,
@@ -2504,13 +2588,16 @@ createApp({
               <div class="runtime-label">Auto Connect</div>
               <div class="runtime-value">{{ autoConnect ? 'On' : 'Off' }}</div>
             </article>
-            <article class="runtime-chip" :class="iAmInitiator ? 'warn' : 'idle'">
-              <div class="runtime-label">WebRTC Role</div>
-              <div class="runtime-value">{{ iAmInitiator ? 'Initiator' : 'Responder' }}</div>
+            <article class="runtime-chip" :class="partialMesh ? 'ok' : 'idle'" style="cursor:pointer" @click="partialMesh = !partialMesh" :title="'Partial mesh limits connections to ' + partialMeshMaxPeers + ' peers (full mesh connects to all)'">
+              <div class="runtime-label">Partial Mesh</div>
+              <div class="runtime-value" style="display:flex;align-items:center;gap:4px">
+                <span>{{ partialMesh ? 'On' : 'Off' }}</span>
+                <input v-if="partialMesh" type="number" min="1" max="99" :value="partialMeshMaxPeers" @input.stop="partialMeshMaxPeers = Math.max(1, parseInt($event.target.value) || 1)" @click.stop style="width:3em;font-size:0.85em;background:transparent;border:1px solid currentColor;border-radius:4px;padding:0 3px;color:inherit;text-align:center" title="Max peers" />
+              </div>
             </article>
             <article class="runtime-chip selected">
               <div class="runtime-label">Send Route</div>
-              <div class="runtime-value mono runtime-route-value" :title="chatSendMode === 'target' ? (toPeer || '') : ''">{{ sendRouteDisplay }}</div>
+              <div class="runtime-value mono runtime-route-value" :title="sendRouteTooltip">{{ sendRouteDisplay }}</div>
             </article>
           </div>
 
@@ -2560,7 +2647,9 @@ createApp({
             <p class="mode-indicator">
               {{ chatSendMode === 'broadcast'
                 ? 'Broadcast to ' + meshConnectedCount + ' connected peer' + (meshConnectedCount === 1 ? '' : 's')
-                : 'Selected route: ' + targetPeerDisplay }}
+                : (selectedTargetPeers.length > 1
+                  ? 'Selected route: ' + selectedTargetPeers.length + ' peers'
+                  : 'Selected route: ' + targetPeerDisplay) }}
             </p>
           </section>
         </article>
