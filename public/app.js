@@ -1084,7 +1084,9 @@ createApp({
       }
 
       // Manual relay defaults to broadcast when no target peer is selected.
-      sendRelayEnvelope(relayType.value, body, { to: toPeer.value || null });
+      const relayTargetPeerId = normalizePeerId(toPeer.value);
+      toPeer.value = relayTargetPeerId;
+      sendRelayEnvelope(relayType.value, body, { to: relayTargetPeerId || null });
     }
 
     function isPeerCoolingDown(peerId) {
@@ -1203,6 +1205,12 @@ createApp({
     }
 
     function selectPeerFromUi(peerId) {
+      if (activeView.value === "console") {
+        // In console mode, clicking a peer should always update relay target.
+        selectPeer(peerId, { manual: true, allowUnannounced: true });
+        return;
+      }
+
       // Clicking mesh rows toggles multi-target chat routing.
       chatSendMode.value = "target";
 
@@ -2457,7 +2465,7 @@ createApp({
           <div class="metrics">
             <dl class="metric">
               <dt>Target Peer</dt>
-              <dd class="mono peer-value" :title="toPeer || ''">{{ targetPeerDisplay }}</dd>
+              <dd class="mono peer-value">{{ targetPeerDisplay }}</dd>
             </dl>
             <dl class="metric">
               <dt>RTC Phase</dt>
@@ -2485,17 +2493,8 @@ createApp({
               Network
               <input v-model="network" placeholder="room:abc" @change="applyNetworkChange">
             </label>
-            <label>
-              From Peer
-              <input v-model="fromPeer" @change="applyFromPeerChange">
-            </label>
-            <label>
-              To Peer (empty = broadcast default)
-              <input v-model="toPeer" placeholder="auto from peer_list if empty">
-            </label>
           </div>
           <div class="row">
-            <span class="pill"><strong>manual relay</strong> {{ relayTargetDisplay }}</span>
             <span class="pill"><strong>mesh</strong> {{ meshConnectedCount }}/{{ meshTargetCount }} connected</span>
           </div>
           <div class="field-grid">
@@ -2524,7 +2523,15 @@ createApp({
           <div class="section-header">
             <h2 class="panel-title">Raw Relay Console</h2>
             <span class="pill"><strong><a class="pill-link" :href="pspSpecUrl" target="_blank" rel="noopener noreferrer" @click="handleSpecLinkClick">psp</a></strong> manual envelope mode</span>
-            <span class="pill"><strong>to</strong> {{ relayTargetDisplay }}</span>
+            <label class="pill" :title="toPeer || 'broadcast'" style="gap:6px; text-transform:none; letter-spacing:0.04em; padding:6px 10px; min-width:260px; justify-content:flex-start;">
+              <strong style="text-transform:uppercase; letter-spacing:0.08em;">to</strong>
+              <input
+                v-model="toPeer"
+                placeholder="broadcast"
+                :title="toPeer || 'broadcast'"
+                style="background:transparent; border:0; outline:none; color:inherit; width:100%; padding:0; font-size:0.84rem;"
+              >
+            </label>
           </div>
           <label>
             Relay Type
@@ -2551,7 +2558,7 @@ createApp({
           </label>
 
           <div class="row">
-            <button @click="sendRelay" :disabled="!isConnected">Send Relay Message</button>
+            <button class="console-action-btn" @click="sendRelay" :disabled="!isConnected">Send Relay</button>
           </div>
 
           <p class="muted">Send protocol frames directly when you need to inspect or force specific signaling behavior.</p>

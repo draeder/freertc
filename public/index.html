@@ -309,6 +309,7 @@
         background: #9bc6ff;
         border-color: #9bc6ff;
         color: #101722;
+        box-shadow: none;
       }
       button:disabled {
         opacity: 0.5;
@@ -326,6 +327,7 @@
       .tab {
         cursor: pointer;
         min-width: 140px;
+        color: var(--ink);
       }
       .tab.active {
         background: var(--accent);
@@ -564,6 +566,16 @@
       }
       .chat-send-btn {
         min-width: 88px;
+      }
+      .console-action-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 132px;
+        height: 42px;
+        padding: 0 16px;
+        line-height: 1;
+        white-space: nowrap;
       }
       .mode-indicator {
         margin: 0;
