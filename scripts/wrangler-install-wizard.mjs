@@ -137,6 +137,40 @@ function copyTemplateIfNeeded() {
   return { created: true, source: 'template' };
 }
 
+function sanitizeDomain(domain) {
+  return domain
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/\/.*$/, '')
+    .replace(/[^a-z0-9-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+function dbNameForDomain(domain) {
+  const sanitized = sanitizeDomain(domain);
+  return sanitized ? `freertc-signal-${sanitized}` : 'freertc-signal';
+}
+
+// Extract the domain slug from an existing freertc-signal-<domain> DB name.
+// Returns null for placeholder values or plain 'freertc-signal'.
+function domainFromDbName(dbName) {
+  if (!dbName) return null;
+  const PLACEHOLDERS = ['freertc-signal', 'freertc-signal-your-domain', 'freertc-signal-your_domain'];
+  if (PLACEHOLDERS.includes(dbName.toLowerCase())) return null;
+  const match = dbName.match(/^freertc-signal-(.+)$/);
+  return match ? match[1] : null;
+}
+
+// Replace all occurrences of a database_name value in wrangler.jsonc text.
+function patchDbName(text, newDbName) {
+  return text.replace(
+    /("database_name"\s*:\s*)"[^"]*"/g,
+    `$1"${newDbName}"`
+  );
+}
+
 function modeFromAnswer(answer) {
   const normalized = (answer || '').trim().toLowerCase();
   if (normalized === '1' || normalized === 'dev') return 'dev';
@@ -212,15 +246,40 @@ async function main() {
     runWrangler(['--version']);
     console.log(`Using ${WRANGLER.source} wrangler.`);
 
+    // Create wrangler.jsonc first so we can read existing DB name from it.
     const wranglerInit = copyTemplateIfNeeded();
     if (wranglerInit.created && wranglerInit.source === 'template') {
       console.log('\nCreated wrangler.jsonc from wrangler.template.jsonc.');
-      console.log('Edit wrangler.jsonc and replace placeholder values before production deploy.');
+      console.log('Edit wrangler.jsonc and replace YOUR_D1_DATABASE_ID before production deploy.');
     }
     if (wranglerInit.created && wranglerInit.source === 'fallback') {
       console.log('\nCreated wrangler.jsonc from fallback defaults (template not found).');
       console.log('Update name/main/compatibility_date and add bindings before deploy.');
     }
+
+    // Derive D1 database name from domain — auto-detect if already configured.
+    console.log('\nStep 3: Configure D1 database name');
+    const existingDbName = parseFirstDatabaseName(WRANGLER_CONFIG);
+    const existingDomain = domainFromDbName(existingDbName);
+    let derivedDbName;
+    if (existingDomain) {
+      console.log(`Domain already configured: ${existingDomain}  (database: ${existingDbName})`);
+      const change = (await rl.question('Change it? [y/N]: ')).trim().toLowerCase();
+      if (change === 'y' || change === 'yes') {
+        const domainInput = (await rl.question('Enter your domain (example: example.com): ')).trim();
+        derivedDbName = dbNameForDomain(domainInput);
+      } else {
+        derivedDbName = existingDbName;
+      }
+    } else {
+      const domainInput = (await rl.question('Enter your domain (example: example.com): ')).trim();
+      derivedDbName = dbNameForDomain(domainInput);
+    }
+    console.log(`D1 database name: ${derivedDbName}`);
+
+    // Always patch the DB name into wrangler.jsonc.
+    const wranglerText = fs.readFileSync(WRANGLER_CONFIG, 'utf8');
+    fs.writeFileSync(WRANGLER_CONFIG, patchDbName(wranglerText, derivedDbName), 'utf8');
 
     const dbName = parseFirstDatabaseName(WRANGLER_CONFIG);
     if (!dbName) {
@@ -234,7 +293,7 @@ async function main() {
     }
 
     if (needsDeploy) {
-      console.log('\nStep 3: Cloudflare authentication');
+      console.log('\nStep 4: Cloudflare authentication');
       if (isWranglerAuthenticated()) {
         console.log('Wrangler is already authenticated. Skipping login.');
       } else {
@@ -248,7 +307,7 @@ async function main() {
     }
 
     if (needsDev) {
-      console.log('\nStep 4: Initialize local D1 schema');
+      console.log('\nStep 5: Initialize local D1 schema');
       runWrangler(['d1', 'execute', dbName, '--local', '--file', 'scripts/d1-schema.sql']);
 
       const startDev = await rl.question('Start local dev server now (npm run dev)? [Y/n]: ');
@@ -258,14 +317,14 @@ async function main() {
     }
 
     if (needsDeploy) {
-      console.log('\nStep 5: Initialize remote D1 schema');
+      console.log('\nStep 6: Initialize remote D1 schema');
       runWrangler(['d1', 'execute', dbName, '--remote', '--file', 'scripts/d1-schema.sql']);
 
       const doDeploy = await rl.question('Deploy now (npm run deploy)? [Y/n]: ');
       if (yes(doDeploy, true)) {
         run('npm', ['run', 'deploy']);
 
-        console.log('\nStep 6: Verify deployment endpoint (recommended)');
+        console.log('\nStep 7: Verify deployment endpoint (recommended)');
         console.log('Tip: test /health on your workers.dev URL or custom domain.');
         console.log('Expected response includes JSON with { "ok": true, ... }');
 

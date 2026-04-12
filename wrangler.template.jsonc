@@ -15,12 +15,13 @@
   },
 
   // Cloudflare D1 SQLite database (free tier available).
-  // Create with: wrangler d1 create freertc-signal
+  // The wizard sets database_name to freertc-signal-<your-domain> automatically.
+  // To create manually: wrangler d1 create freertc-signal-your-domain
   // Then paste the returned database_id below.
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "freertc-signal",
+      "database_name": "freertc-signal-YOUR_DOMAIN",
       "database_id": "YOUR_D1_DATABASE_ID"
     }
   ],
@@ -49,7 +50,7 @@
       "d1_databases": [
         {
           "binding": "DB",
-          "database_name": "freertc-signal",
+          "database_name": "freertc-signal-YOUR_DOMAIN",
           "database_id": "YOUR_D1_DATABASE_ID"
         }
       ]
