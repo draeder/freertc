@@ -120,6 +120,24 @@ function parseFirstDatabaseName(filePath) {
   return match ? match[1] : null;
 }
 
+function parseFirstDatabaseId(filePath) {
+  if (!fs.existsSync(filePath)) return null;
+  const jsonc = fs.readFileSync(filePath, 'utf8');
+  const match = jsonc.match(/"database_id"\s*:\s*"([^"]+)"/);
+  return match ? match[1] : null;
+}
+
+function isValidUuid(value) {
+  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function patchDbId(text, newDbId) {
+  return text.replace(
+    /("database_id"\s*:\s*)"[^"]*"/g,
+    `$1"${newDbId}"`
+  );
+}
+
 function copyTemplateIfNeeded() {
   if (fs.existsSync(WRANGLER_CONFIG)) {
     return { created: false, source: 'existing' };
@@ -305,12 +323,31 @@ async function main() {
       return;
     }
 
+    // For remote operations, database_id must be a real UUID (not placeholder).
+    if (needsDeploy) {
+      let dbId = parseFirstDatabaseId(WRANGLER_CONFIG);
+      if (!isValidUuid(dbId)) {
+        console.log('\nStep 4: Configure D1 database ID');
+        console.log(`Current database_id is invalid or placeholder: ${dbId || '(missing)'}`);
+        console.log(`Create the remote DB first if needed: ${WRANGLER.command} ${[...WRANGLER.baseArgs, 'd1', 'create', dbName].join(' ')}`);
+        const enteredDbId = (await rl.question('Enter the real D1 database_id UUID: ')).trim();
+        if (!isValidUuid(enteredDbId)) {
+          throw new Error('Invalid database_id format. Expected a UUID like 52acefe2-e810-4b81-8225-1ca87d0205cc');
+        }
+
+        const current = fs.readFileSync(WRANGLER_CONFIG, 'utf8');
+        fs.writeFileSync(WRANGLER_CONFIG, patchDbId(current, enteredDbId), 'utf8');
+        dbId = enteredDbId;
+        console.log(`✓ Updated wrangler.jsonc with database_id: ${dbId}`);
+      }
+    }
+
     if (!fs.existsSync(D1_SCHEMA_FILE)) {
       throw new Error('Missing scripts/d1-schema.sql');
     }
 
     if (needsDeploy) {
-      console.log('\nStep 4: Cloudflare authentication');
+      console.log('\nStep 5: Cloudflare authentication');
       if (isWranglerAuthenticated()) {
         console.log('Wrangler is already authenticated. Skipping login.');
       } else {
@@ -324,7 +361,7 @@ async function main() {
     }
 
     if (needsDev) {
-      console.log('\nStep 5: Initialize local D1 schema');
+      console.log('\nStep 6: Initialize local D1 schema');
       runWrangler(['d1', 'execute', dbName, '--local', '--file', 'scripts/d1-schema.sql']);
 
       const startDev = await rl.question('Start local dev server now (npm run dev)? [Y/n]: ');
@@ -334,14 +371,14 @@ async function main() {
     }
 
     if (needsDeploy) {
-      console.log('\nStep 6: Initialize remote D1 schema');
+      console.log('\nStep 7: Initialize remote D1 schema');
       runWrangler(['d1', 'execute', dbName, '--remote', '--file', 'scripts/d1-schema.sql']);
 
       const doDeploy = await rl.question('Deploy now (npm run deploy)? [Y/n]: ');
       if (yes(doDeploy, true)) {
         run('npm', ['run', 'deploy']);
 
-        console.log('\nStep 7: Verify deployment endpoint (recommended)');
+        console.log('\nStep 8: Verify deployment endpoint (recommended)');
         console.log('Tip: test /health on your workers.dev URL or custom domain.');
         console.log('Expected response includes JSON with { "ok": true, ... }');
 
