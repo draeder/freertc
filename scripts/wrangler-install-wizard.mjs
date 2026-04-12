@@ -5,14 +5,39 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
+import { fileURLToPath } from 'node:url';
 
-const ROOT = process.cwd();
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+function looksLikeProjectRoot(dir) {
+  return (
+    fs.existsSync(path.join(dir, 'package.json')) &&
+    fs.existsSync(path.join(dir, 'wrangler.template.jsonc')) &&
+    fs.existsSync(path.join(dir, 'scripts', 'wrangler-install-wizard.mjs'))
+  );
+}
+
+function findProjectRoot(startDir) {
+  let dir = path.resolve(startDir);
+  while (true) {
+    if (looksLikeProjectRoot(dir)) {
+      return dir;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) {
+      return null;
+    }
+    dir = parent;
+  }
+}
+
+const ROOT = findProjectRoot(process.cwd()) || findProjectRoot(SCRIPT_DIR) || process.cwd();
 const WRANGLER_CONFIG = path.join(ROOT, 'wrangler.jsonc');
 const WRANGLER_TEMPLATE = path.join(ROOT, 'wrangler.template.jsonc');
 const D1_SCHEMA_FILE = path.join(ROOT, 'scripts', 'd1-schema.sql');
 
 function run(command, args, { allowFailure = false } = {}) {
-  const result = spawnSync(command, args, { stdio: 'inherit' });
+  const result = spawnSync(command, args, { stdio: 'inherit', cwd: ROOT });
   if (result.status !== 0 && !allowFailure) {
     throw new Error(`Command failed: ${command} ${args.join(' ')}`);
   }
@@ -22,7 +47,8 @@ function run(command, args, { allowFailure = false } = {}) {
 function isWranglerAuthenticated() {
   const result = spawnSync('npx', ['wrangler', 'whoami'], {
     stdio: 'pipe',
-    encoding: 'utf8'
+    encoding: 'utf8',
+    cwd: ROOT
   });
   return result.status === 0;
 }
@@ -82,7 +108,15 @@ async function main() {
   const rl = createInterface({ input, output });
 
   try {
+    if (!looksLikeProjectRoot(ROOT)) {
+      throw new Error(`Could not find project root from ${process.cwd()}`);
+    }
+
     console.log('\nfreertc Wrangler Install Wizard\n');
+    if (path.resolve(process.cwd()) !== ROOT) {
+      console.log(`Detected project root: ${ROOT}`);
+      console.log(`Running commands from project root instead of current directory: ${process.cwd()}\n`);
+    }
 
     console.log('Choose setup mode:');
     console.log('  1) dev     (local wrangler dev + local D1 schema)');
