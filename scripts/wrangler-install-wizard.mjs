@@ -59,6 +59,25 @@ function yes(answer, defaultYes = true) {
   return normalized === 'y' || normalized === 'yes';
 }
 
+function checkHealthUrl(url) {
+  const result = spawnSync('curl', ['-fsS', url], {
+    stdio: 'pipe',
+    encoding: 'utf8'
+  });
+
+  if (result.status === 0) {
+    return { ok: true, output: result.stdout || '' };
+  }
+
+  const output = [result.stdout, result.stderr].filter(Boolean).join('\n');
+  return { ok: false, output };
+}
+
+function includesApiKeyMissing(text) {
+  if (!text) return false;
+  return /api key is missing/i.test(text);
+}
+
 async function main() {
   const rl = createInterface({ input, output });
 
@@ -133,6 +152,40 @@ async function main() {
       const doDeploy = await rl.question('Deploy now (npm run deploy)? [Y/n]: ');
       if (yes(doDeploy, true)) {
         run('npm', ['run', 'deploy']);
+
+        console.log('\nStep 6: Verify deployment endpoint (recommended)');
+        console.log('Tip: test /health on your workers.dev URL or custom domain.');
+        console.log('Expected response includes JSON with { "ok": true, ... }');
+
+        const doHealthCheck = await rl.question('Run a /health check URL now? [Y/n]: ');
+        if (yes(doHealthCheck, true)) {
+          const healthUrl = (await rl.question('Enter full health URL (example: https://your-domain/health): ')).trim();
+          if (healthUrl) {
+            const health = checkHealthUrl(healthUrl);
+            if (health.ok) {
+              console.log('\n/health response:');
+              console.log(health.output.trim() || '(empty body)');
+            } else {
+              console.log('\nHealth check failed. Raw output:');
+              console.log(health.output || '(no output)');
+            }
+
+            if (includesApiKeyMissing(health.output)) {
+              console.log('\nDetected "API key is missing" in response.');
+              console.log('This Worker does not require an API key for /health or /ws.');
+              console.log('Most likely causes:');
+              console.log('  1) The domain route points to a different service/worker.');
+              console.log('  2) Cloudflare Access/API Shield/WAF on that hostname requires auth headers.');
+              console.log('  3) You deployed a different environment than expected.');
+              console.log('Next checks:');
+              console.log('  - Confirm route/custom domain is attached to this Worker.');
+              console.log('  - Compare workers.dev /health vs custom-domain /health responses.');
+              console.log('  - If using --env production, ensure that env is the one attached to routes.');
+            }
+          } else {
+            console.log('Skipped /health check (no URL entered).');
+          }
+        }
       }
     }
 

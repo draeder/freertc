@@ -101,6 +101,29 @@ Additional scripts:
 - `npm run deploy:raw` deploys without `--env production`.
 - `npm run check` runs syntax validation (`node --check src/index.js`).
 
+## Troubleshooting custom domain deploys
+
+If your custom domain returns:
+
+```json
+{"error":"API key is missing"}
+```
+
+that error is usually from Cloudflare routing/auth config, not from this Worker runtime.
+
+Quick checks:
+
+1. Compare `https://<workers-subdomain>/health` and `https://<custom-domain>/health`.
+2. Confirm your route/custom domain points to this Worker.
+3. Review Cloudflare Access/API Shield/WAF rules on the custom hostname.
+4. If deploying with `--env production`, verify that environment is the one bound to the route.
+
+Expected `/health` response includes JSON like:
+
+```json
+{"ok":true,"version":"1.0","peers":0}
+```
+
 ## Auto WebRTC two-tab test
 
 The demo defaults to Auto WebRTC and performs real offer/answer + ICE exchange over this Worker.
