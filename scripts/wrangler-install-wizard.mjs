@@ -257,40 +257,46 @@ async function main() {
       console.log('Update name/main/compatibility_date and add bindings before deploy.');
     }
 
+    console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     // Derive D1 database name from domain or existing config.
     console.log('\nStep 3: Configure D1 database name');
-    const existingDbName = parseFirstDatabaseName(WRANGLER_CONFIG);
-    const existingDomain = domainFromDbName(existingDbName);
-    
-    let derivedDbName;
-    
-    if (existingDomain) {
-      // Offer the existing domain-derived name as default
-      const dbNamePrompt = `Database name [press Enter for ${existingDbName}]: `;
-      const customDbName = (await rl.question(dbNamePrompt)).trim();
-      derivedDbName = customDbName || existingDbName;
-      console.log(`Using database name: ${derivedDbName}`);
-    } else {
-      // Existing DB is placeholder or missing domain flavor — always offer to upgrade
-      if (existingDbName === 'freertc-signal') {
-        console.log(`Current database: ${existingDbName} (placeholder, no domain)`);
+    try {
+      const existingDbName = parseFirstDatabaseName(WRANGLER_CONFIG);
+      const existingDomain = domainFromDbName(existingDbName);
+      
+      let derivedDbName;
+      
+      if (existingDomain) {
+        // Offer the existing domain-derived name as default
+        const dbNamePrompt = `Database name [press Enter for ${existingDbName}]: `;
+        const customDbName = (await rl.question(dbNamePrompt)).trim();
+        derivedDbName = customDbName || existingDbName;
+        console.log(`Using database name: ${derivedDbName}`);
+      } else {
+        // Existing DB is placeholder or missing domain flavor — always offer to upgrade
+        if (existingDbName === 'freertc-signal') {
+          console.log(`Current database: ${existingDbName} (placeholder, no domain)`);
+        }
+        console.log('Database names should follow: freertc-signal-<your-domain>');
+        const domainInput = (await rl.question('Enter your domain (example: example.com): ')).trim();
+        if (!domainInput) {
+          console.log('No domain entered. Please run the wizard again.');
+          return;
+        }
+        derivedDbName = dbNameForDomain(domainInput);
+        console.log(`✓ Domain-specific database name: ${derivedDbName}`);
+        const customDbName = (await rl.question(`Confirm [press Enter for ${derivedDbName}]: `)).trim();
+        derivedDbName = customDbName || derivedDbName;
       }
-      console.log('Database names should follow: freertc-signal-<your-domain>');
-      const domainInput = (await rl.question('Enter your domain (example: example.com): ')).trim();
-      if (!domainInput) {
-        console.log('No domain entered. Please run the wizard again.');
-        return;
-      }
-      derivedDbName = dbNameForDomain(domainInput);
-      console.log(`✓ Domain-specific database name: ${derivedDbName}`);
-      const customDbName = (await rl.question(`Confirm [press Enter for ${derivedDbName}]: `)).trim();
-      derivedDbName = customDbName || derivedDbName;
-    }
 
-    // Always patch the DB name into wrangler.jsonc.
-    const wranglerText = fs.readFileSync(WRANGLER_CONFIG, 'utf8');
-    fs.writeFileSync(WRANGLER_CONFIG, patchDbName(wranglerText, derivedDbName), 'utf8');
-    console.log(`✓ Updated wrangler.jsonc with database name: ${derivedDbName}`);
+      // Always patch the DB name into wrangler.jsonc.
+      const wranglerText = fs.readFileSync(WRANGLER_CONFIG, 'utf8');
+      fs.writeFileSync(WRANGLER_CONFIG, patchDbName(wranglerText, derivedDbName), 'utf8');
+      console.log(`✓ Updated wrangler.jsonc with database name: ${derivedDbName}`);
+    } catch (err) {
+      console.error('Step 3 error:', err.message);
+      throw err;
+    }
 
     const dbName = parseFirstDatabaseName(WRANGLER_CONFIG);
     if (!dbName) {
