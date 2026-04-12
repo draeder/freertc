@@ -222,6 +222,26 @@ function sanitizeDomain(domain) {
     .replace(/^-|-$/g, '');
 }
 
+function normalizeHost(value) {
+  if (!value || typeof value !== 'string') return null;
+  let host = value.trim().toLowerCase();
+  if (!host) return null;
+  host = host.replace(/^https?:\/\//, '');
+  host = host.replace(/\/.*$/, '');
+  host = host.replace(/:\d+$/, '');
+  return host || null;
+}
+
+function firstRouteHostFromWranglerConfig(filePath) {
+  if (!fs.existsSync(filePath)) return null;
+  const jsonc = fs.readFileSync(filePath, 'utf8');
+  const routePatternMatch = jsonc.match(/"pattern"\s*:\s*"([^"]+)"/);
+  if (!routePatternMatch) return null;
+  const pattern = routePatternMatch[1];
+  const host = pattern.split('/')[0];
+  return normalizeHost(host);
+}
+
 function dbNameForDomain(domain) {
   const sanitized = sanitizeDomain(domain);
   return sanitized ? `freertc-signal-${sanitized}` : 'freertc-signal';
@@ -334,13 +354,28 @@ async function main() {
     console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     // Derive D1 database name from domain or existing config.
     console.log('\nStep 3: Configure D1 database name');
+    let preferredHealthHost = null;
+    const isFirstRun = wranglerInit.created;
     try {
       const existingDbName = parseFirstDatabaseName(WRANGLER_CONFIG);
       const existingDomain = domainFromDbName(existingDbName);
       
       let derivedDbName;
       
-      if (existingDomain) {
+      if (isFirstRun) {
+        console.log('First run detected: domain is required.');
+        const domainInput = (await rl.question('Enter your domain (example: example.com): ')).trim();
+        if (!domainInput) {
+          console.log('No domain entered. Please run the wizard again.');
+          return;
+        }
+        derivedDbName = dbNameForDomain(domainInput);
+        preferredHealthHost = normalizeHost(domainInput);
+        console.log(`✓ Domain-specific database name: ${derivedDbName}`);
+        const customDbName = (await rl.question(`Database name [press Enter for ${derivedDbName}]: `)).trim();
+        derivedDbName = customDbName || derivedDbName;
+        console.log(`Using database name: ${derivedDbName}`);
+      } else if (existingDomain) {
         // Offer the existing domain-derived name as default
         const dbNamePrompt = `Database name [press Enter for ${existingDbName}]: `;
         const customDbName = (await rl.question(dbNamePrompt)).trim();
@@ -358,6 +393,7 @@ async function main() {
           return;
         }
         derivedDbName = dbNameForDomain(domainInput);
+        preferredHealthHost = normalizeHost(domainInput);
         console.log(`✓ Domain-specific database name: ${derivedDbName}`);
         const customDbName = (await rl.question(`Confirm [press Enter for ${derivedDbName}]: `)).trim();
         derivedDbName = customDbName || derivedDbName;
@@ -434,36 +470,40 @@ async function main() {
         run('npm', ['run', 'deploy']);
 
         console.log('\nStep 8: Verify deployment endpoint (recommended)');
-        console.log('Tip: test /health on your workers.dev URL or custom domain.');
-        console.log('Expected response includes JSON with { "ok": true, ... }');
+        console.log('Auto-checking /health on detected domain(s)...');
 
-        const doHealthCheck = await rl.question('Run a /health check URL now? [Y/n]: ');
-        if (yes(doHealthCheck, true)) {
-          const healthUrl = (await rl.question('Enter full health URL (example: https://your-domain/health): ')).trim();
-          if (healthUrl) {
-            const health = checkHealthUrl(healthUrl);
-            if (health.ok) {
-              console.log('\n/health response:');
-              console.log(health.output.trim() || '(empty body)');
-            } else {
-              console.log('\nHealth check failed. Raw output:');
-              console.log(health.output || '(no output)');
-            }
+        const routeHost = firstRouteHostFromWranglerConfig(WRANGLER_CONFIG);
+        const hosts = [preferredHealthHost, routeHost].filter(Boolean);
+        const uniqueHosts = [...new Set(hosts)];
 
-            if (includesApiKeyMissing(health.output)) {
-              console.log('\nDetected "API key is missing" in response.');
-              console.log('This Worker does not require an API key for /health or /ws.');
-              console.log('Most likely causes:');
-              console.log('  1) The domain route points to a different service/worker.');
-              console.log('  2) Cloudflare Access/API Shield/WAF on that hostname requires auth headers.');
-              console.log('  3) You deployed a different environment than expected.');
-              console.log('Next checks:');
-              console.log('  - Confirm route/custom domain is attached to this Worker.');
-              console.log('  - Compare workers.dev /health vs custom-domain /health responses.');
-              console.log('  - If using --env production, ensure that env is the one attached to routes.');
-            }
+        if (uniqueHosts.length === 0) {
+          console.log('No custom domain detected in wizard input or wrangler routes.');
+          console.log('Set routes in wrangler.jsonc or run manual check: curl -fsS https://<your-domain>/health');
+        }
+
+        for (const host of uniqueHosts) {
+          const healthUrl = `https://${host}/health`;
+          console.log(`\nChecking ${healthUrl}`);
+          const health = checkHealthUrl(healthUrl);
+          if (health.ok) {
+            console.log('/health response:');
+            console.log(health.output.trim() || '(empty body)');
           } else {
-            console.log('Skipped /health check (no URL entered).');
+            console.log('Health check failed. Raw output:');
+            console.log(health.output || '(no output)');
+          }
+
+          if (includesApiKeyMissing(health.output)) {
+            console.log('\nDetected "API key is missing" in response.');
+            console.log('This Worker does not require an API key for /health or /ws.');
+            console.log('Most likely causes:');
+            console.log('  1) The domain route points to a different service/worker.');
+            console.log('  2) Cloudflare Access/API Shield/WAF on that hostname requires auth headers.');
+            console.log('  3) You deployed a different environment than expected.');
+            console.log('Next checks:');
+            console.log('  - Confirm route/custom domain is attached to this Worker.');
+            console.log('  - Compare workers.dev /health vs custom-domain /health responses.');
+            console.log('  - If using --env production, ensure that env is the one attached to routes.');
           }
         }
       }
