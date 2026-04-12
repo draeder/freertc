@@ -77,8 +77,26 @@ function run(command, args, { allowFailure = false } = {}) {
   return result.status === 0;
 }
 
+function getWranglerCommand() {
+  const globalCheck = spawnSync('wrangler', ['--version'], {
+    stdio: 'pipe',
+    encoding: 'utf8',
+    cwd: ROOT
+  });
+  if (globalCheck.status === 0) {
+    return { command: 'wrangler', baseArgs: [], source: 'global' };
+  }
+  return { command: 'npx', baseArgs: ['wrangler'], source: 'npx' };
+}
+
+const WRANGLER = getWranglerCommand();
+
+function runWrangler(args, options = {}) {
+  return run(WRANGLER.command, [...WRANGLER.baseArgs, ...args], options);
+}
+
 function isWranglerAuthenticated() {
-  const result = spawnSync('npx', ['wrangler', 'whoami'], {
+  const result = spawnSync(WRANGLER.command, [...WRANGLER.baseArgs, 'whoami'], {
     stdio: 'pipe',
     encoding: 'utf8',
     cwd: ROOT
@@ -179,7 +197,8 @@ async function main() {
     run('npm', ['install']);
 
     console.log('\nStep 2: Verify Wrangler CLI is available');
-    run('npx', ['wrangler', '--version']);
+    runWrangler(['--version']);
+    console.log(`Using ${WRANGLER.source} Wrangler command.`);
 
     const wranglerInit = copyTemplateIfNeeded();
     if (wranglerInit.created && wranglerInit.source === 'template') {
@@ -209,7 +228,7 @@ async function main() {
       } else {
         const doLogin = await rl.question('Not logged in. Run "wrangler login" now? [Y/n]: ');
         if (yes(doLogin, true)) {
-          run('npx', ['wrangler', 'login']);
+          runWrangler(['login']);
         } else {
           console.log('Skipping login. Deploy steps may fail until you authenticate.');
         }
@@ -218,7 +237,7 @@ async function main() {
 
     if (needsDev) {
       console.log('\nStep 4: Initialize local D1 schema');
-      run('npx', ['wrangler', 'd1', 'execute', dbName, '--local', '--file', 'scripts/d1-schema.sql']);
+      runWrangler(['d1', 'execute', dbName, '--local', '--file', 'scripts/d1-schema.sql']);
 
       const startDev = await rl.question('Start local dev server now (npm run dev)? [Y/n]: ');
       if (yes(startDev, true)) {
@@ -228,7 +247,7 @@ async function main() {
 
     if (needsDeploy) {
       console.log('\nStep 5: Initialize remote D1 schema');
-      run('npx', ['wrangler', 'd1', 'execute', dbName, '--remote', '--file', 'scripts/d1-schema.sql']);
+      runWrangler(['d1', 'execute', dbName, '--remote', '--file', 'scripts/d1-schema.sql']);
 
       const doDeploy = await rl.question('Deploy now (npm run deploy)? [Y/n]: ');
       if (yes(doDeploy, true)) {
