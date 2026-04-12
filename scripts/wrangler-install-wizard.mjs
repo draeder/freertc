@@ -89,7 +89,12 @@ function getWranglerCommand() {
   return { command: 'npx', baseArgs: ['wrangler'], source: 'npx' };
 }
 
-const WRANGLER = getWranglerCommand();
+// Resolved lazily after npm install — do not call before resolveWrangler().
+let WRANGLER = null;
+
+function resolveWrangler() {
+  WRANGLER = getWranglerCommand();
+}
 
 function runWrangler(args, options = {}) {
   return run(WRANGLER.command, [...WRANGLER.baseArgs, ...args], options);
