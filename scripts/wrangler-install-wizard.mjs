@@ -257,25 +257,31 @@ async function main() {
       console.log('Update name/main/compatibility_date and add bindings before deploy.');
     }
 
-    // Derive D1 database name from domain — auto-detect if already configured.
+    // Derive D1 database name from domain or existing config.
     console.log('\nStep 3: Configure D1 database name');
     const existingDbName = parseFirstDatabaseName(WRANGLER_CONFIG);
     const existingDomain = domainFromDbName(existingDbName);
+    
     let derivedDbName;
+    
     if (existingDomain) {
-      console.log(`Domain already configured: ${existingDomain}  (database: ${existingDbName})`);
-      const change = (await rl.question('Change it? [y/N]: ')).trim().toLowerCase();
-      if (change === 'y' || change === 'yes') {
-        const domainInput = (await rl.question('Enter your domain (example: example.com): ')).trim();
-        derivedDbName = dbNameForDomain(domainInput);
-      } else {
-        derivedDbName = existingDbName;
-      }
+      // Offer the existing domain-derived name as default
+      const dbNamePrompt = `Database name [press Enter for ${existingDbName}]: `;
+      const customDbName = (await rl.question(dbNamePrompt)).trim();
+      derivedDbName = customDbName || existingDbName;
+      console.log(`Using database name: ${derivedDbName}`);
     } else {
+      // No existing domain — ask for domain and derive the name
       const domainInput = (await rl.question('Enter your domain (example: example.com): ')).trim();
+      if (!domainInput) {
+        console.log('No domain entered. Please run the wizard again.');
+        return;
+      }
       derivedDbName = dbNameForDomain(domainInput);
+      const customDbName = (await rl.question(`Database name [press Enter for ${derivedDbName}]: `)).trim();
+      derivedDbName = customDbName || derivedDbName;
+      console.log(`Using database name: ${derivedDbName}`);
     }
-    console.log(`D1 database name: ${derivedDbName}`);
 
     // Always patch the DB name into wrangler.jsonc.
     const wranglerText = fs.readFileSync(WRANGLER_CONFIG, 'utf8');
