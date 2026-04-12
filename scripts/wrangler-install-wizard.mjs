@@ -46,11 +46,15 @@ function findNearestPackageRoot(startDir) {
   }
 }
 
+// Prefer an explicit wrangler-config root found by walking up from either the
+// script file location or cwd. Only fall back to "nearest package.json" when
+// neither walk finds a wrangler config, to avoid accidentally binding to an
+// outer project that has this package installed as a dependency.
 const ROOT =
-  findProjectRoot(process.cwd()) ||
-  findNearestPackageRoot(process.cwd()) ||
   findProjectRoot(SCRIPT_DIR) ||
+  findProjectRoot(process.cwd()) ||
   findNearestPackageRoot(SCRIPT_DIR) ||
+  findNearestPackageRoot(process.cwd()) ||
   process.cwd();
 const WRANGLER_CONFIG = path.join(ROOT, 'wrangler.jsonc');
 const WRANGLER_TEMPLATE = path.join(ROOT, 'wrangler.template.jsonc');
@@ -201,9 +205,12 @@ async function main() {
     console.log('\nStep 1: Ensure dependencies are installed');
     run('npm', ['install']);
 
+    // Detect wrangler after npm install so local node_modules/.bin is available.
+    resolveWrangler();
+
     console.log('\nStep 2: Verify Wrangler CLI is available');
     runWrangler(['--version']);
-    console.log(`Using ${WRANGLER.source} Wrangler command.`);
+    console.log(`Using ${WRANGLER.source} wrangler.`);
 
     const wranglerInit = copyTemplateIfNeeded();
     if (wranglerInit.created && wranglerInit.source === 'template') {
