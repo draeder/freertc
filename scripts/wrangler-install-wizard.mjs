@@ -10,10 +10,11 @@ import { fileURLToPath } from 'node:url';
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 function looksLikeProjectRoot(dir) {
+  const hasPackage = fs.existsSync(path.join(dir, 'package.json'));
+  const hasWranglerConfig = fs.existsSync(path.join(dir, 'wrangler.jsonc'));
+  const hasWranglerTemplate = fs.existsSync(path.join(dir, 'wrangler.template.jsonc'));
   return (
-    fs.existsSync(path.join(dir, 'package.json')) &&
-    fs.existsSync(path.join(dir, 'wrangler.template.jsonc')) &&
-    fs.existsSync(path.join(dir, 'scripts', 'wrangler-install-wizard.mjs'))
+    hasPackage && (hasWranglerConfig || hasWranglerTemplate)
   );
 }
 
@@ -31,10 +32,42 @@ function findProjectRoot(startDir) {
   }
 }
 
-const ROOT = findProjectRoot(process.cwd()) || findProjectRoot(SCRIPT_DIR) || process.cwd();
+function findNearestPackageRoot(startDir) {
+  let dir = path.resolve(startDir);
+  while (true) {
+    if (fs.existsSync(path.join(dir, 'package.json'))) {
+      return dir;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) {
+      return null;
+    }
+    dir = parent;
+  }
+}
+
+const ROOT =
+  findProjectRoot(process.cwd()) ||
+  findNearestPackageRoot(process.cwd()) ||
+  findProjectRoot(SCRIPT_DIR) ||
+  findNearestPackageRoot(SCRIPT_DIR) ||
+  process.cwd();
 const WRANGLER_CONFIG = path.join(ROOT, 'wrangler.jsonc');
 const WRANGLER_TEMPLATE = path.join(ROOT, 'wrangler.template.jsonc');
 const D1_SCHEMA_FILE = path.join(ROOT, 'scripts', 'd1-schema.sql');
+
+function readProjectName(dir) {
+  const pkgPath = path.join(dir, 'package.json');
+  if (!fs.existsSync(pkgPath)) return 'worker-app';
+  try {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    return (pkg?.name && String(pkg.name).trim()) || 'worker-app';
+  } catch {
+    return 'worker-app';
+  }
+}
+
+const PROJECT_NAME = readProjectName(ROOT);
 
 function run(command, args, { allowFailure = false } = {}) {
   const result = spawnSync(command, args, { stdio: 'inherit', cwd: ROOT });
@@ -62,13 +95,19 @@ function parseFirstDatabaseName(filePath) {
 
 function copyTemplateIfNeeded() {
   if (fs.existsSync(WRANGLER_CONFIG)) {
-    return false;
+    return { created: false, source: 'existing' };
   }
   if (!fs.existsSync(WRANGLER_TEMPLATE)) {
-    throw new Error('Missing wrangler.template.jsonc; cannot bootstrap wrangler.jsonc');
+    const fallback = `{
+  "name": "${PROJECT_NAME}",
+  "main": "src/index.js",
+  "compatibility_date": "2024-09-23"
+}\n`;
+    fs.writeFileSync(WRANGLER_CONFIG, fallback, 'utf8');
+    return { created: true, source: 'fallback' };
   }
   fs.copyFileSync(WRANGLER_TEMPLATE, WRANGLER_CONFIG);
-  return true;
+  return { created: true, source: 'template' };
 }
 
 function modeFromAnswer(answer) {
@@ -108,11 +147,15 @@ async function main() {
   const rl = createInterface({ input, output });
 
   try {
-    if (!looksLikeProjectRoot(ROOT)) {
-      throw new Error(`Could not find project root from ${process.cwd()}`);
+    if (!fs.existsSync(path.join(ROOT, 'package.json'))) {
+      throw new Error(`Could not find a project with package.json from ${process.cwd()}`);
     }
 
-    console.log('\nfreertc Wrangler Install Wizard\n');
+    console.log(`\n${PROJECT_NAME} Wrangler Install Wizard\n`);
+    console.log(`Using project root: ${ROOT}`);
+    console.log(`Wrangler config path: ${WRANGLER_CONFIG}`);
+    console.log(`Wrangler template path: ${WRANGLER_TEMPLATE}\n`);
+
     if (path.resolve(process.cwd()) !== ROOT) {
       console.log(`Detected project root: ${ROOT}`);
       console.log(`Running commands from project root instead of current directory: ${process.cwd()}\n`);
@@ -138,10 +181,14 @@ async function main() {
     console.log('\nStep 2: Verify Wrangler CLI is available');
     run('npx', ['wrangler', '--version']);
 
-    const createdFromTemplate = copyTemplateIfNeeded();
-    if (createdFromTemplate) {
+    const wranglerInit = copyTemplateIfNeeded();
+    if (wranglerInit.created && wranglerInit.source === 'template') {
       console.log('\nCreated wrangler.jsonc from wrangler.template.jsonc.');
       console.log('Edit wrangler.jsonc and replace placeholder values before production deploy.');
+    }
+    if (wranglerInit.created && wranglerInit.source === 'fallback') {
+      console.log('\nCreated wrangler.jsonc from fallback defaults (template not found).');
+      console.log('Update name/main/compatibility_date and add bindings before deploy.');
     }
 
     const dbName = parseFirstDatabaseName(WRANGLER_CONFIG);
