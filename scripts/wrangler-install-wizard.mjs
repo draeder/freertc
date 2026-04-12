@@ -81,6 +81,20 @@ function run(command, args, { allowFailure = false } = {}) {
   return result.status === 0;
 }
 
+function runCapture(command, args, { allowFailure = false } = {}) {
+  const result = spawnSync(command, args, { stdio: 'pipe', encoding: 'utf8', cwd: ROOT });
+  if (result.status !== 0 && !allowFailure) {
+    const stderr = (result.stderr || '').trim();
+    throw new Error(`Command failed: ${command} ${args.join(' ')}${stderr ? `\n${stderr}` : ''}`);
+  }
+  return {
+    ok: result.status === 0,
+    status: result.status,
+    stdout: result.stdout || '',
+    stderr: result.stderr || ''
+  };
+}
+
 function getWranglerCommand() {
   const globalCheck = spawnSync('wrangler', ['--version'], {
     stdio: 'pipe',
@@ -102,6 +116,10 @@ function resolveWrangler() {
 
 function runWrangler(args, options = {}) {
   return run(WRANGLER.command, [...WRANGLER.baseArgs, ...args], options);
+}
+
+function runWranglerCapture(args, options = {}) {
+  return runCapture(WRANGLER.command, [...WRANGLER.baseArgs, ...args], options);
 }
 
 function isWranglerAuthenticated() {
@@ -136,6 +154,44 @@ function patchDbId(text, newDbId) {
     /("database_id"\s*:\s*)"[^"]*"/g,
     `$1"${newDbId}"`
   );
+}
+
+function firstUuidFromText(text) {
+  if (!text) return null;
+  const match = text.match(/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i);
+  return match ? match[0] : null;
+}
+
+function resolveRemoteDbId(dbName) {
+  // Try create first. If DB already exists, wrangler typically returns non-zero
+  // and we fall back to list lookup.
+  const createResult = runWranglerCapture(['d1', 'create', dbName], { allowFailure: true });
+  const createOutput = `${createResult.stdout}\n${createResult.stderr}`;
+  const createdId = firstUuidFromText(createOutput);
+  if (createdId) {
+    return createdId;
+  }
+
+  const listJson = runWranglerCapture(['d1', 'list', '--json'], { allowFailure: true });
+  if (listJson.ok) {
+    try {
+      const parsed = JSON.parse(listJson.stdout);
+      if (Array.isArray(parsed)) {
+        const found = parsed.find((entry) => entry?.name === dbName || entry?.database_name === dbName);
+        const id = found?.uuid || found?.id || found?.database_id;
+        if (isValidUuid(id)) return id;
+      }
+    } catch {
+      // fall through to text parsing below
+    }
+  }
+
+  const listText = runWranglerCapture(['d1', 'list'], { allowFailure: true });
+  const line = `${listText.stdout}\n${listText.stderr}`
+    .split('\n')
+    .find((l) => l.includes(dbName));
+  const listedId = firstUuidFromText(line || `${listText.stdout}\n${listText.stderr}`);
+  return listedId;
 }
 
 function copyTemplateIfNeeded() {
@@ -329,15 +385,14 @@ async function main() {
       if (!isValidUuid(dbId)) {
         console.log('\nStep 4: Configure D1 database ID');
         console.log(`Current database_id is invalid or placeholder: ${dbId || '(missing)'}`);
-        console.log(`Create the remote DB first if needed: ${WRANGLER.command} ${[...WRANGLER.baseArgs, 'd1', 'create', dbName].join(' ')}`);
-        const enteredDbId = (await rl.question('Enter the real D1 database_id UUID: ')).trim();
-        if (!isValidUuid(enteredDbId)) {
-          throw new Error('Invalid database_id format. Expected a UUID like 52acefe2-e810-4b81-8225-1ca87d0205cc');
+        console.log(`Creating or resolving remote D1 database: ${dbName}`);
+        const resolvedDbId = resolveRemoteDbId(dbName);
+        if (!isValidUuid(resolvedDbId)) {
+          throw new Error(`Could not resolve database_id for ${dbName}. Run: ${WRANGLER.command} ${[...WRANGLER.baseArgs, 'd1', 'create', dbName].join(' ')} and update wrangler.jsonc.`);
         }
-
         const current = fs.readFileSync(WRANGLER_CONFIG, 'utf8');
-        fs.writeFileSync(WRANGLER_CONFIG, patchDbId(current, enteredDbId), 'utf8');
-        dbId = enteredDbId;
+        fs.writeFileSync(WRANGLER_CONFIG, patchDbId(current, resolvedDbId), 'utf8');
+        dbId = resolvedDbId;
         console.log(`✓ Updated wrangler.jsonc with database_id: ${dbId}`);
       }
     }
