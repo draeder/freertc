@@ -273,6 +273,7 @@ export function useP2p({
       peerId: localPeerId,
       networkId,
       signalUrl: rawUrl,
+      iceServers: defaultIceServers,
       capabilities: { role: 'browser', mode: modeLabel.toLowerCase() },
       onLog: (message) => {
         const type = message.includes('error') ? 'error' : message.includes('incoming') ? 'recv' : 'info'
@@ -320,6 +321,12 @@ export function useP2p({
         maybeDialCandidates(remoteCandidates)
       },
       onIncomingRelay: () => {},
+      onNegotiationFailure: ({ peerId: remotePeerId, retryCount, signalingState, connectionState }) => {
+        addLog(
+          'error',
+          `Negotiation failed for ${remotePeerId.slice(0, 12)} after ${retryCount} offer retries (signaling=${signalingState}, connection=${connectionState})`,
+        )
+      },
       onConnectionStateChange: ({ peerId: remotePeerId, state }) => {
         _rtcPeer = _signalingClient?.mesh.connections.get(remotePeerId)?.connection ?? _rtcPeer
         _rtcChannel = _signalingClient?.mesh.connections.get(remotePeerId)?.channel ?? _rtcChannel

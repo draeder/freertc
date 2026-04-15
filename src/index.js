@@ -170,6 +170,30 @@ async function fetchRelayMessages(db, network, toPeerId) {
   }));
 }
 
+async function deliverQueuedRelayMessages(db, socket, network, peerId) {
+  if (!db) return 0;
+
+  const queued = await fetchRelayMessages(db, network, peerId);
+  if (queued.length === 0) return 0;
+
+  console.log(`[OUT] Delivering ${queued.length} queued messages to ${peerId}`);
+  const deliveredIds = [];
+  for (const { id, message: queuedMsg } of queued) {
+    try {
+      socket.send(JSON.stringify(queuedMsg));
+      deliveredIds.push(id);
+    } catch (err) {
+      console.error(`[OUT] Failed to deliver queued message:`, err?.message);
+    }
+  }
+
+  if (deliveredIds.length > 0) {
+    await deleteRelayMessagesById(db, deliveredIds);
+  }
+
+  return deliveredIds.length;
+}
+
 async function deleteRelayMessagesById(db, ids) {
   if (!ids.length) return;
   const placeholders = ids.map((_, i) => `?${i + 1}`).join(", ");
@@ -312,42 +336,33 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
     livePeers.set(peerKey, { peerId, network, socket, lastSeen: Date.now() });
 
     if (type === "announce") {
-      await upsertAnnouncement(db, message);
-      
-      // Deliver any queued messages for this peer
-      const queued = await fetchRelayMessages(db, network, peerId);
-      if (queued.length > 0) {
-        console.log(`[OUT] Delivering ${queued.length} queued messages to ${peerId}`);
-        const deliveredIds = [];
-        for (const { id, message: queuedMsg } of queued) {
-          try { 
-            socket.send(JSON.stringify(queuedMsg));
-            deliveredIds.push(id);
-          } catch (err) {
-            console.error(`[OUT] Failed to deliver queued message:`, err?.message);
-          }
-        }
-        if (deliveredIds.length > 0) {
-          await deleteRelayMessagesById(db, deliveredIds);
-        }
+      if (db) {
+        await upsertAnnouncement(db, message);
+        await deliverQueuedRelayMessages(db, socket, network, peerId);
       }
       
       // Only broadcast peer_list when the peer is newly joining, not on heartbeat re-announces.
       // prevPeerKey === peerKey means same peer on the same socket sending a periodic keep-alive;
       // no topology change occurred, so no need to push a new list to everyone.
       const isHeartbeat = prevPeerKey === peerKey;
-      if (!isHeartbeat) {
+      if (!isHeartbeat && db) {
         console.log(`[NET] Broadcasting peer_list for ${network} after new announce from ${peerId}`);
         broadcastPeerList(db, network).catch((err) => console.error(`[Broadcast error]`, err?.message));
       }
 
     } else if (type === "withdraw") {
-      await deleteAnnouncement(db, network, peerId);
+      if (db) {
+        await deleteAnnouncement(db, network, peerId);
+      }
       livePeers.delete(peerKey);
-      broadcastPeerList(db, network).catch(() => {});
+      if (db) {
+        broadcastPeerList(db, network).catch(() => {});
+      }
 
     } else if (type === "discover") {
-      broadcastPeerList(db, network).catch(() => {});
+      if (db) {
+        broadcastPeerList(db, network).catch(() => {});
+      }
 
     } else if (type === "ping") {
       socket.send(JSON.stringify({
@@ -356,31 +371,46 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
         message_id: crypto.randomUUID(), timestamp: Date.now(),
         ttl_ms: DEFAULT_TTL_MS, body: {}
       }));
+      if (db) {
+        await deliverQueuedRelayMessages(db, socket, network, peerId);
+      }
 
     } else if (type === "bye") {
-      await deleteAnnouncement(db, network, peerId);
+      if (db) {
+        await deleteAnnouncement(db, network, peerId);
+      }
       livePeers.delete(peerKey);
-      broadcastPeerList(db, network).catch(() => {});
+      if (db) {
+        broadcastPeerList(db, network).catch(() => {});
+      }
 
     } else if (RELAY_TYPES.has(type)) {
       // RTC negotiation messages - relay immediately if online, queue if offline
       if (!message.to) return { peerKey, network, peerId };
-      
-      // Always store in DB as backup
-      await insertRelayMessage(db, message);
-      
+
       // Try immediate delivery to live peer
       const liveKey = `${network}:${message.to}`;
       const live = livePeers.get(liveKey);
+      let deliveredLive = false;
       if (live) {
-        try { 
+        try {
           live.socket.send(rawData);
+          deliveredLive = true;
           console.log(`[RELAY] Delivered ${type} from ${peerId} to ${message.to} immediately`);
         } catch (err) {
           console.error(`[RELAY] Failed to deliver to ${message.to}:`, err?.message);
         }
-      } else {
-        console.log(`[RELAY] Peer ${message.to} offline, queued ${type} in DB`);
+      }
+
+      if (!deliveredLive && db) {
+        await insertRelayMessage(db, message);
+        if (!live) {
+          console.log(`[RELAY] Peer ${message.to} offline, queued ${type} in DB`);
+        } else {
+          console.log(`[RELAY] Queued ${type} for ${message.to} after live delivery failure`);
+        }
+      } else if (!deliveredLive) {
+        console.warn(`[RELAY] Could not deliver ${type} to ${message.to}; persistence unavailable`);
       }
     }
 

@@ -37,7 +37,7 @@ const DATA_PONG_TIMEOUT_MS = 12000
 const SIGNAL_PING_MS = 1000
 const RELAY_RETRY_INTERVAL_MS = 2000
 const ANSWER_BURST_COOLDOWN_MS = 3000
-const ANSWER_BURST_DELAYS_MS = []
+const ANSWER_BURST_DELAYS_MS = [200, 800, 2000]
 const SDP_DEDUP_WINDOW_MS = 15000
 
 const DEFAULT_ICE_SERVERS = [
@@ -60,6 +60,7 @@ export function createSignalingClient(options = {}) {
     peerId: initialPeerId,
     networkId,
     signalUrl,
+    iceServers: configuredIceServers,
     capabilities = {},
     auth,
     autoConnect = true,
@@ -67,6 +68,7 @@ export function createSignalingClient(options = {}) {
     onRegistered,
     onBootstrap,
     onIncomingRelay,
+    onNegotiationFailure,
     onConnectionStateChange,
     onStatusChange,
     onDataMessage,
@@ -143,6 +145,21 @@ export function createSignalingClient(options = {}) {
   // Remote pub keys learned from peer_list hints and incoming relay messages.
   // peerId → { pub: string, epub: string }
   const remotePubKeys = new Map()
+  const preferredIceServers = Array.isArray(configuredIceServers) && configuredIceServers.length > 0
+    ? configuredIceServers
+    : DEFAULT_ICE_SERVERS
+
+  function resolveIceServers(overrideIceServers = null) {
+    return Array.isArray(overrideIceServers) && overrideIceServers.length > 0
+      ? overrideIceServers
+      : preferredIceServers
+  }
+
+  function notifyNegotiationFailure(details) {
+    try {
+      onNegotiationFailure?.({ ...details, ts: Date.now() })
+    } catch {}
+  }
 
   function getOrCreateSessionId(remotePeerId) {
     if (!sessionIds.has(remotePeerId)) {
@@ -474,6 +491,7 @@ export function createSignalingClient(options = {}) {
       lastAnswerSentAt: 0,
       lastAnswerBurstAt: 0,
       localCandidateCount: 0,
+      iceServers,
     })
 
     onConnectionStateChangeCb?.({ peerId: remotePeerId, state: 'connecting', ts: Date.now() })
@@ -563,7 +581,7 @@ export function createSignalingClient(options = {}) {
       mesh.connections.delete(toPeerId)
     }
 
-    const effectiveIceServers = Array.isArray(iceServers) ? iceServers : DEFAULT_ICE_SERVERS
+    const effectiveIceServers = resolveIceServers(iceServers)
     const pc = createPeerConnection(toPeerId, effectiveIceServers, (type, body) => {
       relaySignal(toPeerId, type, body)
     })
@@ -644,6 +662,13 @@ export function createSignalingClient(options = {}) {
         clearInterval(retryTimer)
         clearTimeout(candidateHealthTimer)
         log(`[webrtc] offer to ${toPeerId} timed out after ${MAX_OFFER_RETRIES} retries; giving up`)
+        notifyNegotiationFailure({
+          peerId: toPeerId,
+          reason: 'offer_retries_exhausted',
+          retryCount: retries,
+          signalingState: pc.signalingState,
+          connectionState: pc.connectionState,
+        })
         try { pc.close() } catch {}
         mesh.markDead(toPeerId)
         return
@@ -699,7 +724,7 @@ export function createSignalingClient(options = {}) {
         const pc =
           freshEntry?.connection && freshEntry.connection.signalingState !== 'closed'
             ? freshEntry.connection
-            : createPeerConnection(fromPeerId, DEFAULT_ICE_SERVERS, sendRelay)
+            : createPeerConnection(fromPeerId, freshEntry?.iceServers ?? resolveIceServers(), sendRelay)
 
         const entry = mesh.connections.get(fromPeerId)
         const incomingOfferSdp = offer?.sdp ?? null

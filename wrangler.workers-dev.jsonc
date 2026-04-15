@@ -1,0 +1,19 @@
+{
+  "name": "peer-ooo-worker-devtest",
+  "main": "src/index.js",
+  "compatibility_date": "2024-09-23",
+  "workers_dev": true,
+  "assets": {
+    "directory": "public"
+  },
+  "vars": {
+    "RELAY_PEER_ID": "bootstrap-relay"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "freertc-signal",
+      "database_id": "52acefe2-e810-4b81-8225-1ca87d0205cc"
+    }
+  ]
+}
