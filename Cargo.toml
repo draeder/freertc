@@ -1,0 +1,24 @@
+[package]
+name = "freertc"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+worker          = { version = "0.8", features = ["d1"] }
+serde           = { version = "1",   features = ["derive"] }
+serde_json      = "1"
+futures         = { version = "0.3", default-features = false, features = ["async-await", "alloc"] }
+uuid            = { version = "1",   features = ["v4", "js"] }
+getrandom       = { version = "0.2", features = ["js"] }
+wasm-bindgen    = "0.2"
+js-sys          = "0.3"
+
+[profile.release]
+# Minimise WASM binary size (reduces Worker boot time and cold-start CPU).
+opt-level     = "s"
+lto           = true
+codegen-units = 1
+strip         = true
