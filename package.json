@@ -4,10 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build": "worker-build --release",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy --env production",
     "deploy:raw": "wrangler deploy",
-    "check": "node --check src/index.js",
+    "check": "cargo check --target wasm32-unknown-unknown",
     "d1:init:local": "wrangler d1 execute freertc-signal --local --file scripts/d1-schema.sql",
     "d1:init:remote": "wrangler d1 execute freertc-signal --remote --file scripts/d1-schema.sql",
     "wizard": "node scripts/wrangler-install-wizard.mjs"

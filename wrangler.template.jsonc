@@ -1,8 +1,15 @@
 // wrangler.template.jsonc — Copy to wrangler.jsonc and fill in your own values.
 {
   "name": "freertc",
-  "main": "src/index.js",
+  // Output of `worker-build --release` (Rust → WASM + JS shim).
+  "main": "build/worker/shim.mjs",
   "compatibility_date": "2024-09-23",
+
+  // Build the Rust worker before wrangler dev / deploy.
+  // worker-build is installed once via `cargo install worker-build`.
+  "build": {
+    "command": "worker-build --release"
+  },
 
   // Serve static files from the public directory.
   "assets": {
