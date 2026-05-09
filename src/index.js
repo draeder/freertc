@@ -92,6 +92,9 @@ async function handleRegisterRelay(request, env) {
   if (!body?.url || typeof body.url !== "string") {
     return jsonResponse({ ok: false, error: "Missing url" }, 400);
   }
+  if (!/^wss?:\/\//.test(body.url)) {
+    return jsonResponse({ ok: false, error: "url must be a WebSocket URL (wss:// or ws://)" }, 400);
+  }
   await upsertRelay(env.DB, body.url, body.name || null);
   const relays = await listRelays(env.DB);
   return jsonResponse({ ok: true, relays });
