@@ -19,14 +19,26 @@ const DEFAULT_TTL_MS = 30_000;
 const MAX_TTL_MS = 120_000;
 const MAX_MESSAGE_SIZE = 64 * 1024;
 const MAX_BATCH = 50;
+const RELAY_EXPIRY_MS = 5 * 60_000; // relays expire after 5 min without heartbeat
 
 const livePeers = new Map(); // key: "network:peerId" -> { peerId, network, socket, lastSeen }
 const networkSubscribers = new Map(); // key: network -> Set of sockets
+
+let federationRegistered = false; // guard: only register once per isolate lifetime
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const upgrade = request.headers.get("Upgrade");
+
+    // Self-register into own D1 and optionally register with global hub, once per isolate
+    if (env.RELAY_URL && !federationRegistered) {
+      federationRegistered = true;
+      ctx.waitUntil((async () => {
+        if (env.DB) await upsertRelay(env.DB, env.RELAY_URL, env.RELAY_NAME || null).catch(() => {});
+        if (env.GLOBAL_RELAY_URL) await registerWithHub(env).catch(() => {});
+      })());
+    }
 
     if (upgrade && upgrade.toLowerCase() === "websocket") {
       if (url.pathname !== "/ws") {
@@ -43,6 +55,17 @@ export default {
       return jsonResponse({ ok: true, version: PSP_VERSION, peers: livePeers.size }, 200);
     }
 
+    // Federation: relay registry endpoints (any worker can serve these from its own D1)
+    if (url.pathname === "/api/v1/relays") {
+      if (request.method === "GET") {
+        return handleListRelays(env);
+      }
+      if (request.method === "POST") {
+        return handleRegisterRelay(request, env);
+      }
+      return jsonResponse({ ok: false, error: "Method not allowed" }, 405);
+    }
+
     return env.ASSETS?.fetch(request) ?? new Response("Not Found", { status: 404 });
   }
 };
@@ -50,8 +73,138 @@ export default {
 function jsonResponse(body, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json; charset=utf-8" }
+    headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" }
   });
+}
+
+// ===================== Federation =====================
+
+async function handleListRelays(env) {
+  if (!env.DB) return jsonResponse({ ok: false, error: "No database" }, 503);
+  const relays = await listRelays(env.DB);
+  return jsonResponse({ ok: true, relays });
+}
+
+async function handleRegisterRelay(request, env) {
+  if (!env.DB) return jsonResponse({ ok: false, error: "No database" }, 503);
+  let body;
+  try { body = await request.json(); } catch { return jsonResponse({ ok: false, error: "Invalid JSON" }, 400); }
+  if (!body?.url || typeof body.url !== "string") {
+    return jsonResponse({ ok: false, error: "Missing url" }, 400);
+  }
+  await upsertRelay(env.DB, body.url, body.name || null);
+  const relays = await listRelays(env.DB);
+  return jsonResponse({ ok: true, relays });
+}
+
+// POST to the global hub to register this relay; returns the full relay list
+async function registerWithHub(env) {
+  const resp = await fetch(`${env.GLOBAL_RELAY_URL}/api/v1/relays`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url: env.RELAY_URL, name: env.RELAY_NAME || null })
+  });
+  if (!resp.ok) return [];
+  const data = await resp.json();
+  return data.relays || [];
+}
+
+// Fetch relay list from hub (used at discover time for up-to-date list)
+async function fetchRelayList(globalRelayUrl) {
+  try {
+    const resp = await fetch(`${globalRelayUrl}/api/v1/relays`, { cf: { cacheTtl: 30 } });
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    return (data.relays || []).map(r => r.url).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+// Open a short-lived WebSocket to a remote relay, send one message, collect one peer_list response
+async function queryRelayForPeers(relayUrl, network, selfRelayId) {
+  try {
+    const wsUrl = relayUrl.replace(/^http/, "ws") + "/ws";
+    const resp = await fetch(wsUrl, { headers: { Upgrade: "websocket" } });
+    if (resp.status !== 101) return [];
+    const ws = resp.webSocket;
+    ws.accept();
+
+    return await new Promise((resolve) => {
+      const timer = setTimeout(() => { try { ws.close(); } catch {} resolve([]); }, 3000);
+
+      ws.addEventListener("message", (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === "peer_list" && msg.network === network) {
+            clearTimeout(timer);
+            ws.close();
+            resolve((msg.body?.peers || []).map(p => ({ ...p, relay_url: relayUrl })));
+          }
+        } catch {}
+      });
+
+      ws.addEventListener("error", () => { clearTimeout(timer); resolve([]); });
+      ws.addEventListener("close", () => { clearTimeout(timer); resolve([]); });
+
+      // Announce as a relay bridge peer, then discover
+      const relayPeerId = selfRelayId || "relay-bridge";
+      ws.send(JSON.stringify({
+        psp_version: PSP_VERSION, type: "announce", network,
+        from: relayPeerId, message_id: crypto.randomUUID(),
+        timestamp: Date.now(), ttl_ms: 10_000, body: { capabilities: { relay: true } }
+      }));
+      ws.send(JSON.stringify({
+        psp_version: PSP_VERSION, type: "discover", network,
+        from: relayPeerId, message_id: crypto.randomUUID(),
+        timestamp: Date.now(), ttl_ms: 10_000, body: {}
+      }));
+    });
+  } catch {
+    return [];
+  }
+}
+
+// Open a short-lived WebSocket to a remote relay and forward a PSP message through it
+async function forwardToRelay(relayUrl, message, selfRelayId) {
+  try {
+    const wsUrl = relayUrl.replace(/^http/, "ws") + "/ws";
+    const resp = await fetch(wsUrl, { headers: { Upgrade: "websocket" } });
+    if (resp.status !== 101) return;
+    const ws = resp.webSocket;
+    ws.accept();
+
+    // Outbound Worker WebSocket: send immediately after accept(), no open event needed
+    const relayPeerId = selfRelayId || "relay-bridge";
+    ws.send(JSON.stringify({
+      psp_version: PSP_VERSION, type: "announce", network: message.network,
+      from: relayPeerId, message_id: crypto.randomUUID(),
+      timestamp: Date.now(), ttl_ms: 10_000, body: { capabilities: { relay: true } }
+    }));
+    ws.send(JSON.stringify(message));
+    ws.close();
+  } catch {}
+}
+
+// ===================== D1 Relay Registry =====================
+
+async function upsertRelay(db, url, name) {
+  const now = Date.now();
+  await db.prepare(`
+    INSERT INTO psp_relays (url, name, registered_at_ms, last_seen_ms)
+    VALUES (?1, ?2, ?3, ?3)
+    ON CONFLICT(url) DO UPDATE SET name = excluded.name, last_seen_ms = excluded.last_seen_ms
+  `).bind(url, name, now).run();
+}
+
+async function listRelays(db) {
+  const cutoff = Date.now() - RELAY_EXPIRY_MS;
+  const result = await db.prepare(`
+    SELECT url, name, last_seen_ms FROM psp_relays
+    WHERE last_seen_ms > ?1
+    ORDER BY last_seen_ms DESC
+  `).bind(cutoff).all();
+  return (result.results || []).map(r => ({ url: r.url, name: r.name }));
 }
 
 // Broadcast peer list to all connected peers in a network
@@ -360,8 +513,33 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
       }
 
     } else if (type === "discover") {
+      // Local peers first
       if (db) {
         broadcastPeerList(db, network).catch(() => {});
+      }
+      // If opted into federation, fan out to all known relays in parallel
+      if (env.GLOBAL_RELAY_URL && env.RELAY_URL) {
+        ctx.waitUntil((async () => {
+          const selfRelayId = env.RELAY_PEER_ID || "relay-bridge";
+          const urls = await fetchRelayList(env.GLOBAL_RELAY_URL);
+          const remoteUrls = urls.filter(u => u !== env.RELAY_URL);
+          if (!remoteUrls.length) return;
+
+          const results = await Promise.all(
+            remoteUrls.map(u => queryRelayForPeers(u, network, selfRelayId))
+          );
+          const remotePeers = results.flat();
+          if (!remotePeers.length) return;
+
+          const message = {
+            psp_version: PSP_VERSION, type: "peer_list", network,
+            from: selfRelayId, to: peerId,
+            message_id: crypto.randomUUID(), timestamp: Date.now(),
+            ttl_ms: DEFAULT_TTL_MS,
+            body: { peers: remotePeers }
+          };
+          try { socket.send(JSON.stringify(message)); } catch {}
+        })());
       }
 
     } else if (type === "ping") {
@@ -411,6 +589,18 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
         }
       } else if (!deliveredLive) {
         console.warn(`[RELAY] Could not deliver ${type} to ${message.to}; persistence unavailable`);
+      }
+
+      // If still not delivered locally and federation is enabled, fan out to peer relays via WebSocket
+      if (!deliveredLive && env.GLOBAL_RELAY_URL && env.RELAY_URL) {
+        ctx.waitUntil((async () => {
+          const selfRelayId = env.RELAY_PEER_ID || "relay-bridge";
+          const urls = await fetchRelayList(env.GLOBAL_RELAY_URL);
+          const remoteUrls = urls.filter(u => u !== env.RELAY_URL);
+          if (!remoteUrls.length) return;
+          console.log(`[FED] Forwarding ${type} to ${remoteUrls.length} peer relay(s) for ${message.to}`);
+          await Promise.all(remoteUrls.map(u => forwardToRelay(u, message, selfRelayId)));
+        })());
       }
     }
 
