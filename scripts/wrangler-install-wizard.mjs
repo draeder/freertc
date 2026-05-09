@@ -265,6 +265,28 @@ function patchDbName(text, newDbName) {
   );
 }
 
+function patchVar(text, varName, value) {
+  // Replace existing quoted value for the var in any vars block
+  const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`("${escaped}"\\s*:\\s*)"[^"]*"`, 'g');
+  if (re.test(text)) {
+    return text.replace(re, `$1"${value}"`);
+  }
+  // If not found, inject after RELAY_PEER_ID line (best-effort)
+  return text.replace(
+    /("RELAY_PEER_ID"\s*:\s*"[^"]*")/g,
+    `$1,\n    "${varName}": "${value}"`
+  );
+}
+
+function removeVar(text, varName) {
+  const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Remove the line (and trailing comma or leading comma)
+  return text
+    .replace(new RegExp(`\\s*"${escaped}"\\s*:\\s*"[^"]*",?`, 'g'), '')
+    .replace(/,(\s*})/g, '$1'); // clean up trailing commas before closing braces
+}
+
 function modeFromAnswer(answer) {
   const normalized = (answer || '').trim().toLowerCase();
   if (normalized === '1' || normalized === 'dev') return 'dev';
@@ -399,10 +421,38 @@ async function main() {
         derivedDbName = customDbName || derivedDbName;
       }
 
-      // Always patch the DB name into wrangler.jsonc.
-      const wranglerText = fs.readFileSync(WRANGLER_CONFIG, 'utf8');
-      fs.writeFileSync(WRANGLER_CONFIG, patchDbName(wranglerText, derivedDbName), 'utf8');
+      // Patch DB name and auto-set RELAY_URL from domain.
+      const host = preferredHealthHost || normalizeHost(derivedDbName.replace(/^freertc-signal-/, ''));
+      const relayWsUrl = host ? `wss://${host}/ws` : null;
+
+      let wranglerText = fs.readFileSync(WRANGLER_CONFIG, 'utf8');
+      wranglerText = patchDbName(wranglerText, derivedDbName);
+      if (relayWsUrl) {
+        wranglerText = patchVar(wranglerText, 'RELAY_URL', relayWsUrl);
+        console.log(`✓ Set RELAY_URL: ${relayWsUrl}`);
+      }
+      fs.writeFileSync(WRANGLER_CONFIG, wranglerText, 'utf8');
       console.log(`✓ Updated wrangler.jsonc with database name: ${derivedDbName}`);
+
+      // Federation opt-in
+      console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      console.log('\nGlobal peer network: contribute your relay to peer.ooo federation?');
+      console.log('When enabled, peers across all federated relays can discover each other.');
+      const joinGlobal = await rl.question('Join global network at peer.ooo? [Y/n]: ');
+      let updatedText = fs.readFileSync(WRANGLER_CONFIG, 'utf8');
+      if (yes(joinGlobal, true)) {
+        const relayNameAnswer = (await rl.question('Relay display name [press Enter to skip]: ')).trim();
+        updatedText = patchVar(updatedText, 'GLOBAL_RELAY_URL', 'wss://peer.ooo/ws');
+        if (relayNameAnswer) {
+          updatedText = patchVar(updatedText, 'RELAY_NAME', relayNameAnswer);
+        }
+        console.log('✓ GLOBAL_RELAY_URL set to wss://peer.ooo/ws');
+      } else {
+        updatedText = removeVar(updatedText, 'GLOBAL_RELAY_URL');
+        updatedText = removeVar(updatedText, 'RELAY_NAME');
+        console.log('✓ Skipped global network — relay will operate standalone.');
+      }
+      fs.writeFileSync(WRANGLER_CONFIG, updatedText, 'utf8');
     } catch (err) {
       console.error('Step 3 error:', err.message);
       throw err;

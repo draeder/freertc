@@ -18,7 +18,15 @@
 
   "vars": {
     // Peer ID the relay server advertises as itself in PSP messages.
-    "RELAY_PEER_ID": "bootstrap-relay"
+    "RELAY_PEER_ID": "bootstrap-relay",
+
+    // Set automatically by the wizard from your domain (wss://<domain>/ws).
+    "RELAY_URL": "wss://YOUR_DOMAIN/ws",
+
+    // Set automatically by the wizard if you opt into the global network.
+    // Remove this line to run standalone (no cross-relay peer discovery).
+    "GLOBAL_RELAY_URL": "wss://peer.ooo/ws",
+    "RELAY_NAME": "Your App Relay"
   },
 
   // Cloudflare D1 SQLite database (free tier available).
@@ -52,7 +60,10 @@
     "production": {
       "name": "freertc",
       "vars": {
-        "RELAY_PEER_ID": "bootstrap-relay"
+        "RELAY_PEER_ID": "bootstrap-relay",
+        "RELAY_URL": "wss://YOUR_DOMAIN/ws",
+        "GLOBAL_RELAY_URL": "wss://peer.ooo/ws",
+        "RELAY_NAME": "Your App Relay"
       },
       "d1_databases": [
         {
