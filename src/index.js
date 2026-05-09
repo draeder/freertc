@@ -35,8 +35,9 @@ export default {
     if (env.RELAY_URL && !federationRegistered) {
       federationRegistered = true;
       ctx.waitUntil((async () => {
-        if (env.DB) await upsertRelay(env.DB, env.RELAY_URL, env.RELAY_NAME || null).catch(() => {});
-        if (env.GLOBAL_RELAY_URL) await registerWithHub(env).catch(() => {});
+        const selfUrl = normalizeRelayUrl(env.RELAY_URL);
+        if (env.DB && selfUrl) await upsertRelay(env.DB, selfUrl, env.RELAY_NAME || null).catch(() => {});
+        if (env.GLOBAL_RELAY_URL && selfUrl) await registerWithHub(env, selfUrl).catch(() => {});
       })());
     }
 
@@ -92,24 +93,36 @@ async function handleRegisterRelay(request, env) {
   if (!body?.url || typeof body.url !== "string") {
     return jsonResponse({ ok: false, error: "Missing url" }, 400);
   }
-  if (!/^wss?:\/\//.test(body.url)) {
-    return jsonResponse({ ok: false, error: "url must be a WebSocket URL (wss:// or ws://)" }, 400);
+  const normalizedUrl = normalizeRelayUrl(body.url);
+  if (!normalizedUrl) {
+    return jsonResponse({ ok: false, error: "Invalid relay url" }, 400);
   }
-  await upsertRelay(env.DB, body.url, body.name || null);
+  await upsertRelay(env.DB, normalizedUrl, body.name || null);
   const relays = await listRelays(env.DB);
   return jsonResponse({ ok: true, relays });
 }
 
 // POST to the global hub to register this relay; returns the full relay list
-async function registerWithHub(env) {
-  const resp = await fetch(`${relayHttpBase(env.GLOBAL_RELAY_URL)}/api/v1/relays`, {
+async function registerWithHub(env, selfUrl) {
+  const resp = await fetch(`${relayHttpBase(normalizeRelayUrl(env.GLOBAL_RELAY_URL))}/api/v1/relays`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url: env.RELAY_URL, name: env.RELAY_NAME || null })
+    body: JSON.stringify({ url: selfUrl, name: env.RELAY_NAME || null })
   });
   if (!resp.ok) return [];
   const data = await resp.json();
   return data.relays || [];
+}
+
+// Normalize any relay URL to a canonical wss:// WebSocket URL
+function normalizeRelayUrl(url) {
+  if (!url) return null;
+  let u = url.trim();
+  // Convert http(s):// to ws(s)://
+  u = u.replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://");
+  // Ensure it ends with /ws
+  if (!u.endsWith("/ws")) u = u.replace(/\/$/, "") + "/ws";
+  return u;
 }
 
 // Derive HTTP base URL from a wss:// relay URL (wss://peer.ooo/ws → https://peer.ooo)
