@@ -99,7 +99,7 @@ async function handleRegisterRelay(request, env) {
 
 // POST to the global hub to register this relay; returns the full relay list
 async function registerWithHub(env) {
-  const resp = await fetch(`${env.GLOBAL_RELAY_URL}/api/v1/relays`, {
+  const resp = await fetch(`${relayHttpBase(env.GLOBAL_RELAY_URL)}/api/v1/relays`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ url: env.RELAY_URL, name: env.RELAY_NAME || null })
@@ -109,10 +109,15 @@ async function registerWithHub(env) {
   return data.relays || [];
 }
 
+// Derive HTTP base URL from a wss:// relay URL (wss://peer.ooo/ws → https://peer.ooo)
+function relayHttpBase(wsUrl) {
+  return wsUrl.replace(/^wss?:\/\//, (m) => m === "wss://" ? "https://" : "http://").replace(/\/ws$/, "");
+}
+
 // Fetch relay list from hub (used at discover time for up-to-date list)
 async function fetchRelayList(globalRelayUrl) {
   try {
-    const resp = await fetch(`${globalRelayUrl}/api/v1/relays`, { cf: { cacheTtl: 30 } });
+    const resp = await fetch(`${relayHttpBase(globalRelayUrl)}/api/v1/relays`, { cf: { cacheTtl: 30 } });
     if (!resp.ok) return [];
     const data = await resp.json();
     return (data.relays || []).map(r => r.url).filter(Boolean);
@@ -124,7 +129,7 @@ async function fetchRelayList(globalRelayUrl) {
 // Open a short-lived WebSocket to a remote relay, send one message, collect one peer_list response
 async function queryRelayForPeers(relayUrl, network, selfRelayId) {
   try {
-    const wsUrl = relayUrl.replace(/^http/, "ws") + "/ws";
+    const wsUrl = relayUrl;
     const resp = await fetch(wsUrl, { headers: { Upgrade: "websocket" } });
     if (resp.status !== 101) return [];
     const ws = resp.webSocket;
@@ -168,7 +173,7 @@ async function queryRelayForPeers(relayUrl, network, selfRelayId) {
 // Open a short-lived WebSocket to a remote relay and forward a PSP message through it
 async function forwardToRelay(relayUrl, message, selfRelayId) {
   try {
-    const wsUrl = relayUrl.replace(/^http/, "ws") + "/ws";
+    const wsUrl = relayUrl;
     const resp = await fetch(wsUrl, { headers: { Upgrade: "websocket" } });
     if (resp.status !== 101) return;
     const ws = resp.webSocket;
