@@ -102,7 +102,7 @@ async function handleRegisterRelay(request, env) {
   return jsonResponse({ ok: true, relays });
 }
 
-// POST to the global hub to register this relay; returns the full relay list
+// POST to the global hub; cache returned relay list into own D1 so both sides know each other
 async function registerWithHub(env, selfUrl) {
   const resp = await fetch(`${relayHttpBase(normalizeRelayUrl(env.GLOBAL_RELAY_URL))}/api/v1/relays`, {
     method: "POST",
@@ -111,7 +111,23 @@ async function registerWithHub(env, selfUrl) {
   });
   if (!resp.ok) return [];
   const data = await resp.json();
-  return data.relays || [];
+  const relays = data.relays || [];
+  // Cache peer relays locally so discover/forward works without hitting hub each time
+  if (env.DB) {
+    await Promise.all(
+      relays
+        .filter(r => r.url && r.url !== selfUrl)
+        .map(r => upsertRelay(env.DB, r.url, r.name || null).catch(() => {}))
+    );
+  }
+  return relays;
+}
+
+// Get peer relay URLs from own D1 (excludes self); works for both hub and contributors
+async function getPeerRelayUrls(db, selfUrl) {
+  if (!db) return [];
+  const relays = await listRelays(db);
+  return relays.map(r => r.url).filter(u => u !== selfUrl);
 }
 
 // Normalize any relay URL to a canonical wss:// WebSocket URL
@@ -128,18 +144,6 @@ function normalizeRelayUrl(url) {
 // Derive HTTP base URL from a wss:// relay URL (wss://peer.ooo/ws → https://peer.ooo)
 function relayHttpBase(wsUrl) {
   return wsUrl.replace(/^wss?:\/\//, (m) => m === "wss://" ? "https://" : "http://").replace(/\/ws$/, "");
-}
-
-// Fetch relay list from hub (used at discover time for up-to-date list)
-async function fetchRelayList(globalRelayUrl) {
-  try {
-    const resp = await fetch(`${relayHttpBase(globalRelayUrl)}/api/v1/relays`, { cf: { cacheTtl: 30 } });
-    if (!resp.ok) return [];
-    const data = await resp.json();
-    return (data.relays || []).map(r => r.url).filter(Boolean);
-  } catch {
-    return [];
-  }
 }
 
 // Open a short-lived WebSocket to a remote relay, send one message, collect one peer_list response
@@ -539,11 +543,11 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
         broadcastPeerList(db, network).catch(() => {});
       }
       // If opted into federation, fan out to all known relays in parallel
-      if (env.GLOBAL_RELAY_URL && env.RELAY_URL) {
+      if (env.RELAY_URL && env.DB) {
         ctx.waitUntil((async () => {
           const selfRelayId = env.RELAY_PEER_ID || "relay-bridge";
-          const urls = await fetchRelayList(env.GLOBAL_RELAY_URL);
-          const remoteUrls = urls.filter(u => u !== env.RELAY_URL);
+          const selfUrl = normalizeRelayUrl(env.RELAY_URL);
+          const remoteUrls = await getPeerRelayUrls(env.DB, selfUrl);
           if (!remoteUrls.length) return;
 
           const results = await Promise.all(
@@ -613,11 +617,11 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
       }
 
       // If still not delivered locally and federation is enabled, fan out to peer relays via WebSocket
-      if (!deliveredLive && env.GLOBAL_RELAY_URL && env.RELAY_URL) {
+      if (!deliveredLive && env.RELAY_URL && env.DB) {
         ctx.waitUntil((async () => {
           const selfRelayId = env.RELAY_PEER_ID || "relay-bridge";
-          const urls = await fetchRelayList(env.GLOBAL_RELAY_URL);
-          const remoteUrls = urls.filter(u => u !== env.RELAY_URL);
+          const selfUrl = normalizeRelayUrl(env.RELAY_URL);
+          const remoteUrls = await getPeerRelayUrls(env.DB, selfUrl);
           if (!remoteUrls.length) return;
           console.log(`[FED] Forwarding ${type} to ${remoteUrls.length} peer relay(s) for ${message.to}`);
           await Promise.all(remoteUrls.map(u => forwardToRelay(u, message, selfRelayId)));
