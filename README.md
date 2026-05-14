@@ -41,7 +41,7 @@ The wizard can:
 - Initialize local D1 schema for `wrangler dev`.
 - Initialize remote D1 schema for deploy.
 - Check existing Wrangler auth and only run `wrangler login` when needed.
-- Optionally run `npm run dev` and `npm run deploy`.
+- Optionally run `npm run dev:cf` and `npm run deploy`.
 
 ## Manual setup
 
@@ -84,7 +84,27 @@ wrangler d1 execute <your-db-name> --remote --file scripts/d1-schema.sql
 npm run dev
 ```
 
-`npm run dev` now checks local Rust Worker prerequisites automatically:
+`npm run dev` now runs the non-Cloudflare local runtime (plain Node.js + WebSocket).
+
+Cloudflare/Wrangler runtime:
+
+```bash
+npm run dev:cf
+```
+
+Shortcut alias (same behavior):
+
+```bash
+npm run dev:local
+```
+
+You can also choose host/port:
+
+```bash
+HOST=127.0.0.1 PORT=8788 npm run dev:node
+```
+
+`npm run dev:cf` checks local Rust Worker prerequisites automatically:
 
 - Uses `wrangler.workers-dev.jsonc` automatically when `wrangler.jsonc` is not present.
 - Only installs `worker-build` and the WebAssembly Rust target when the selected Wrangler config uses a `worker-build` command.
@@ -92,9 +112,15 @@ npm run dev
 
 Endpoints:
 
-- WebSocket: `ws://127.0.0.1:8787/ws`
-- Health: `http://127.0.0.1:8787/health`
-- Demo UI: `http://127.0.0.1:8787/`
+- WebSocket: `ws://127.0.0.1:8788/ws` (`npm run dev`)
+- Health: `http://127.0.0.1:8788/health` (`npm run dev`)
+- Demo UI: `http://127.0.0.1:8788/` (`npm run dev`)
+
+Cloudflare/Wrangler endpoints (default):
+
+- WebSocket: `ws://127.0.0.1:8787/ws` (`npm run dev:cf`)
+- Health: `http://127.0.0.1:8787/health` (`npm run dev:cf`)
+- Demo UI: `http://127.0.0.1:8787/` (`npm run dev:cf`)
 
 ## Deploy
 
@@ -106,6 +132,10 @@ Additional scripts:
 
 - `npm run deploy:raw` deploys without `--env production`.
 - `npm run check` runs syntax validation (`node --check src/index.js`).
+- `npm run dev` runs the standalone local relay (non-Cloudflare).
+- `npm run dev:cf` runs Wrangler/Cloudflare local dev.
+- `npm run dev:node` runs a standalone local relay without Cloudflare/Wrangler.
+- `npm run dev:local` is a no-env shortcut for the standalone local relay.
 
 ## Troubleshooting custom domain deploys
 
