@@ -1,11 +1,7 @@
 {
   "name": "peer-ooo-worker-devtest",
-  "main": "build/worker/shim.mjs",
+  "main": "src/index.js",
   "compatibility_date": "2024-09-23",
-
-  "build": {
-    "command": "worker-build --release"
-  },
   "workers_dev": true,
   "assets": {
     "directory": "public"

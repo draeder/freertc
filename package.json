@@ -10,7 +10,7 @@
   "license": "MIT",
   "scripts": {
     "build": "worker-build --release",
-    "dev": "wrangler dev",
+    "dev": "node scripts/dev-server.mjs",
     "deploy": "wrangler deploy --env production",
     "deploy:raw": "wrangler deploy",
     "check": "cargo check --target wasm32-unknown-unknown",
@@ -20,8 +20,5 @@
   },
   "devDependencies": {
     "wrangler": "^3.114.0"
-  },
-  "dependencies": {
-    "mongodb": "^7.1.1"
   }
 }

@@ -84,6 +84,12 @@ wrangler d1 execute <your-db-name> --remote --file scripts/d1-schema.sql
 npm run dev
 ```
 
+`npm run dev` now checks local Rust Worker prerequisites automatically:
+
+- Uses `wrangler.workers-dev.jsonc` automatically when `wrangler.jsonc` is not present.
+- Only installs `worker-build` and the WebAssembly Rust target when the selected Wrangler config uses a `worker-build` command.
+- The checked-in `wrangler.workers-dev.jsonc` now points to `src/index.js`, so standard demo runs do not require Rust/WASM setup.
+
 Endpoints:
 
 - WebSocket: `ws://127.0.0.1:8787/ws`
