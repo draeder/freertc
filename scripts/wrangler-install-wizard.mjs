@@ -287,6 +287,15 @@ function removeVar(text, varName) {
     .replace(/,(\s*})/g, '$1'); // clean up trailing commas before closing braces
 }
 
+function randomSuffix(length = 6) {
+  return Math.random().toString(36).slice(2, 2 + length).padEnd(length, '0');
+}
+
+function patchWorkerName(text, newName) {
+  // Patch every "name": "..." line (top-level and env.production)
+  return text.replace(/^(\s*"name"\s*:\s*)"[^"]*"/gm, `$1"${newName}"`);
+}
+
 function modeFromAnswer(answer) {
   const normalized = (answer || '').trim().toLowerCase();
   if (normalized === '1' || normalized === 'dev') return 'dev';
@@ -385,18 +394,26 @@ async function main() {
       let derivedDbName;
       
       if (isFirstRun) {
-        console.log('First run detected: domain is required.');
-        const domainInput = (await rl.question('Enter your domain (example: example.com): ')).trim();
+        console.log('Enter your custom domain, or press Enter to use a free workers.dev subdomain.');
+        const domainInput = (await rl.question('Domain (example: example.com) [Enter to skip]: ')).trim();
         if (!domainInput) {
-          console.log('No domain entered. Please run the wizard again.');
-          return;
+          const suffix = randomSuffix();
+          const workerName = `${PROJECT_NAME}-${suffix}`;
+          derivedDbName = `freertc-signal-${suffix}`;
+          console.log(`✓ No domain — using free workers.dev subdomain.`);
+          console.log(`  Worker name : ${workerName}`);
+          console.log(`  Database    : ${derivedDbName}`);
+          let wText = fs.readFileSync(WRANGLER_CONFIG, 'utf8');
+          wText = patchWorkerName(wText, workerName);
+          fs.writeFileSync(WRANGLER_CONFIG, wText, 'utf8');
+        } else {
+          derivedDbName = dbNameForDomain(domainInput);
+          preferredHealthHost = normalizeHost(domainInput);
+          console.log(`✓ Domain-specific database name: ${derivedDbName}`);
+          const customDbName = (await rl.question(`Database name [press Enter for ${derivedDbName}]: `)).trim();
+          derivedDbName = customDbName || derivedDbName;
+          console.log(`Using database name: ${derivedDbName}`);
         }
-        derivedDbName = dbNameForDomain(domainInput);
-        preferredHealthHost = normalizeHost(domainInput);
-        console.log(`✓ Domain-specific database name: ${derivedDbName}`);
-        const customDbName = (await rl.question(`Database name [press Enter for ${derivedDbName}]: `)).trim();
-        derivedDbName = customDbName || derivedDbName;
-        console.log(`Using database name: ${derivedDbName}`);
       } else if (existingDomain) {
         // Offer the existing domain-derived name as default
         const dbNamePrompt = `Database name [press Enter for ${existingDbName}]: `;
@@ -409,16 +426,24 @@ async function main() {
           console.log(`Current database: ${existingDbName} (placeholder, no domain)`);
         }
         console.log('Database names should follow: freertc-signal-<your-domain>');
-        const domainInput = (await rl.question('Enter your domain (example: example.com): ')).trim();
+        const domainInput = (await rl.question('Domain (example: example.com) [Enter to use free workers.dev]: ')).trim();
         if (!domainInput) {
-          console.log('No domain entered. Please run the wizard again.');
-          return;
+          const suffix = randomSuffix();
+          const workerName = `${PROJECT_NAME}-${suffix}`;
+          derivedDbName = `freertc-signal-${suffix}`;
+          console.log(`✓ No domain — using free workers.dev subdomain.`);
+          console.log(`  Worker name : ${workerName}`);
+          console.log(`  Database    : ${derivedDbName}`);
+          let wText = fs.readFileSync(WRANGLER_CONFIG, 'utf8');
+          wText = patchWorkerName(wText, workerName);
+          fs.writeFileSync(WRANGLER_CONFIG, wText, 'utf8');
+        } else {
+          derivedDbName = dbNameForDomain(domainInput);
+          preferredHealthHost = normalizeHost(domainInput);
+          console.log(`✓ Domain-specific database name: ${derivedDbName}`);
+          const customDbName = (await rl.question(`Confirm [press Enter for ${derivedDbName}]: `)).trim();
+          derivedDbName = customDbName || derivedDbName;
         }
-        derivedDbName = dbNameForDomain(domainInput);
-        preferredHealthHost = normalizeHost(domainInput);
-        console.log(`✓ Domain-specific database name: ${derivedDbName}`);
-        const customDbName = (await rl.question(`Confirm [press Enter for ${derivedDbName}]: `)).trim();
-        derivedDbName = customDbName || derivedDbName;
       }
 
       // Patch DB name and auto-set RELAY_URL from domain.
