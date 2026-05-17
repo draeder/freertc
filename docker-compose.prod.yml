@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  freertc-prod:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    container_name: freertc-production
+    ports:
+      - "${PROD_PORT:-8443}:8443"
+    environment:
+      - PROD_DOMAIN=${PROD_DOMAIN:-localhost:8443}
+      - RELAY_PEER_ID=${RELAY_PEER_ID:-local-prod-relay}
+      - RELAY_NAME=${RELAY_NAME:-Local Production Relay}
+      - RELAY_URL=${RELAY_URL:-}
+      - GLOBAL_RELAY_URL=${GLOBAL_RELAY_URL:-wss://peer.ooo/ws}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    volumes:
+      - ./certs:/app/certs:ro
+      - freertc-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('https').get({hostname:'localhost',port:8443,path:'/health',rejectUnauthorized:false},(r)=>process.exit(r.statusCode===200?0:1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  freertc-data:
+    driver: local

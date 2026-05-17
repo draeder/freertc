@@ -1,0 +1,48 @@
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install Rust build dependencies
+RUN apk add --no-cache \
+    curl \
+    build-base \
+    openssl-dev \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable \
+    && . $HOME/.cargo/env \
+    && rustup target add wasm32-unknown-unknown
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Copy project files
+COPY package*.json ./
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+COPY public/ public/
+COPY scripts/ scripts/
+
+# Install dependencies
+RUN npm ci
+
+# Install worker-build
+RUN cargo install worker-build
+
+# Build WASM
+RUN npm run build
+
+# Create data directory
+RUN mkdir -p /data/db
+
+# Generate default config if needed
+RUN cp .env.local.prod.example .env.local.prod || true
+
+# Create certs directory
+RUN mkdir -p certs
+
+EXPOSE 8443
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD node -e "require('https').get({hostname:'localhost',port:8443,path:'/health',rejectUnauthorized:false},(r)=>process.exit(r.statusCode===200?0:1))"
+
+# Run production server
+CMD ["node", "scripts/prod-server.mjs"]

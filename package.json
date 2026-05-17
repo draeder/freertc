@@ -19,7 +19,13 @@
     "check": "cargo check --target wasm32-unknown-unknown",
     "d1:init:local": "wrangler d1 execute freertc-signal --local --file scripts/d1-schema.sql",
     "d1:init:remote": "wrangler d1 execute freertc-signal --remote --file scripts/d1-schema.sql",
-    "wizard": "node scripts/wrangler-install-wizard.mjs"
+    "wizard": "node scripts/wrangler-install-wizard.mjs",
+    "config:validate": "node scripts/validate-config.mjs",
+    "config:gen": "node scripts/generate-prod-config.mjs",
+    "dev:prod": "npm run config:validate && npm run config:gen && node scripts/prod-server.mjs",
+    "deploy:local-prod": "npm run config:validate && npm run config:gen && docker-compose -f docker-compose.prod.yml up -d",
+    "deploy:local-prod:logs": "docker-compose -f docker-compose.prod.yml logs -f",
+    "deploy:local-prod:stop": "docker-compose -f docker-compose.prod.yml down"
   },
   "dependencies": {
     "ws": "^8.18.0"

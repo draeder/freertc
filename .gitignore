@@ -16,3 +16,12 @@ build/
 *.swo
 *~
 wrangler.jsonc
+
+# Production deployment
+.env.local.prod
+config.local-prod.json
+certs/
+data/
+
+# Docker
+.dockerignore
