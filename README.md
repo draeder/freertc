@@ -9,12 +9,14 @@ This project provides a Cloudflare Worker signaling relay for WebRTC peers using
 - Supports discovery, negotiation, control, and extension message types.
 - Stores peer announcements in Cloudflare D1 (`psp_announcements`).
 - Stores directed signaling messages in Cloudflare D1 (`psp_relay`).
+- Exposes a simple relay registry at `/api/v1/relays` when D1 is configured.
 - Delivers queued relay messages when peers reconnect.
 - Serves the browser demo from `public/`.
 
 ## Runtime scope
 
-- Production Worker runtime is `src/index.js` with Cloudflare D1 (`DB` binding).
+- The checked-in Cloudflare Worker runtime is `src/index.js` with Cloudflare D1 (`DB` binding).
+- The Rust/WASM worker lives in `src/lib.rs` and is wired through `wrangler.template.jsonc` / `worker-build` if you switch to the template-based setup.
 - The built-in browser demo served by the Worker is `public/index.html` + `public/app.js`.
 - `src/kv.js` and `demo/src/*` are legacy/experimental code paths and are not used by `wrangler dev` or `wrangler deploy` in the current setup.
 
@@ -121,6 +123,7 @@ Cloudflare/Wrangler endpoints (default):
 - WebSocket: `ws://127.0.0.1:8787/ws` (`npm run dev:cf`)
 - Health: `http://127.0.0.1:8787/health` (`npm run dev:cf`)
 - Demo UI: `http://127.0.0.1:8787/` (`npm run dev:cf`)
+- Relay registry: `http://127.0.0.1:8787/api/v1/relays` (`GET`/`POST`, when D1 is configured)
 
 ## Deploy
 
@@ -130,6 +133,7 @@ npm run deploy
 
 Additional scripts:
 
+- `npm run build` builds the Rust/WASM worker via `worker-build --release`.
 - `npm run deploy:raw` deploys without `--env production`.
 - `npm run check` runs syntax validation (`node --check src/index.js`).
 - `npm run dev` runs the standalone local relay (non-Cloudflare).
