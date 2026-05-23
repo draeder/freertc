@@ -84,6 +84,7 @@ The wizard can:
 - Copy the worker runtime files into your current project when they are missing.
 - Verify Wrangler CLI.
 - Create `wrangler.jsonc` from `wrangler.template.jsonc` if needed.
+- No domain? No problem. Press Enter at the domain prompt to deploy on a free `workers.dev` subdomain.
 - Set Worker name automatically to `freertc-<your-domain>` when a domain is provided.
 - Initialize local D1 schema for `wrangler dev`.
 - Initialize remote D1 schema for deploy.

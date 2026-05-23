@@ -180,6 +180,18 @@ function firstUuidFromText(text) {
   return match ? match[0] : null;
 }
 
+function firstWorkersDevUrlFromText(text) {
+  if (!text) return null;
+  const match = text.match(/https:\/\/[a-z0-9-]+\.[a-z0-9-]+\.workers\.dev(?:\/ws)?/i);
+  return match ? match[0] : null;
+}
+
+function workersDevSubdomainFromWhoami(text) {
+  if (!text) return null;
+  const match = text.match(/workers\.dev\s+subdomain\s*:\s*([a-z0-9-]+)/i);
+  return match ? match[1] : null;
+}
+
 function resolveRemoteDbId(dbName) {
   // Try create first. If DB already exists, wrangler typically returns non-zero
   // and we fall back to list lookup.
@@ -248,6 +260,17 @@ function normalizeHost(value) {
   host = host.replace(/\/.*$/, '');
   host = host.replace(/:\d+$/, '');
   return host || null;
+}
+
+function wsUrlFromHttpOrWsUrl(value) {
+  if (!value || typeof value !== 'string') return null;
+  let url = value.trim();
+  if (!url) return null;
+  url = url.replace(/^https:\/\//i, 'wss://').replace(/^http:\/\//i, 'ws://');
+  if (!/\/ws$/i.test(url)) {
+    url = `${url.replace(/\/$/, '')}/ws`;
+  }
+  return url;
 }
 
 function firstRouteHostFromWranglerConfig(filePath) {
@@ -450,6 +473,7 @@ async function main() {
     // Derive D1 database name from domain or existing config.
     console.log('\nStep 3: Configure D1 database name');
     let preferredHealthHost = null;
+    let useWorkersDevFallback = false;
     const isFirstRun = wranglerInit.created;
     try {
       const existingDbName = parseFirstDatabaseName(WRANGLER_CONFIG);
@@ -458,12 +482,13 @@ async function main() {
       let derivedDbName;
       
       if (isFirstRun) {
-        console.log('Enter your custom domain, or press Enter to use a free workers.dev subdomain.');
+        console.log('No domain? No problem. Press Enter to use a free workers.dev subdomain.');
         const domainInput = (await rl.question('Domain (example: example.com) [Enter to skip]: ')).trim();
         if (!domainInput) {
           const suffix = randomSuffix();
           const workerName = `${PROJECT_NAME}-${suffix}`;
           derivedDbName = `freertc-signal-${suffix}`;
+          useWorkersDevFallback = true;
           console.log(`✓ No domain — using free workers.dev subdomain.`);
           console.log(`  Worker name : ${workerName}`);
           console.log(`  Database    : ${derivedDbName}`);
@@ -505,6 +530,7 @@ async function main() {
           const suffix = randomSuffix();
           const workerName = `${PROJECT_NAME}-${suffix}`;
           derivedDbName = `freertc-signal-${suffix}`;
+          useWorkersDevFallback = true;
           console.log(`✓ No domain — using free workers.dev subdomain.`);
           console.log(`  Worker name : ${workerName}`);
           console.log(`  Database    : ${derivedDbName}`);
@@ -525,8 +551,9 @@ async function main() {
         }
       }
 
-      // Patch DB name and auto-set RELAY_URL from domain.
-      const host = preferredHealthHost || normalizeHost(derivedDbName.replace(/^freertc-signal-/, ''));
+      // Patch DB name and set RELAY_URL only when host is known.
+      const routeHost = firstRouteHostFromWranglerConfig(WRANGLER_CONFIG);
+      const host = preferredHealthHost || routeHost;
       const relayWsUrl = host ? `wss://${host}/ws` : null;
 
       let wranglerText = fs.readFileSync(WRANGLER_CONFIG, 'utf8');
@@ -534,6 +561,9 @@ async function main() {
       if (relayWsUrl) {
         wranglerText = patchVar(wranglerText, 'RELAY_URL', relayWsUrl);
         console.log(`✓ Set RELAY_URL: ${relayWsUrl}`);
+      } else if (useWorkersDevFallback) {
+        wranglerText = removeVar(wranglerText, 'RELAY_URL');
+        console.log('✓ Deferred RELAY_URL until deploy (workers.dev URL is assigned at deploy time).');
       }
       fs.writeFileSync(WRANGLER_CONFIG, wranglerText, 'utf8');
       console.log(`✓ Updated wrangler.jsonc with database name: ${derivedDbName}`);
@@ -637,13 +667,43 @@ async function main() {
 
       const doDeploy = await rl.question('Deploy now (freertc deploy)? [Y/n]: ');
       if (yes(doDeploy, true)) {
-        runWrangler(['deploy', '--env', 'production']);
+        const deployResult = runWranglerCapture(['deploy', '--env', 'production'], { allowFailure: true });
+        if (deployResult.stdout) process.stdout.write(deployResult.stdout);
+        if (deployResult.stderr) process.stderr.write(deployResult.stderr);
+        if (!deployResult.ok) {
+          throw new Error('Deploy failed. See output above for details.');
+        }
+
+        let workersDevHealthHost = null;
+        if (useWorkersDevFallback) {
+          let workersDevUrl = firstWorkersDevUrlFromText(`${deployResult.stdout}\n${deployResult.stderr}`);
+          if (!workersDevUrl) {
+            const whoami = runWranglerCapture(['whoami'], { allowFailure: true });
+            const subdomain = workersDevSubdomainFromWhoami(`${whoami.stdout}\n${whoami.stderr}`);
+            const workerName = parseFirstWorkerName(WRANGLER_CONFIG);
+            if (subdomain && workerName) {
+              workersDevUrl = `https://${workerName}.${subdomain}.workers.dev`;
+            }
+          }
+
+          const workersDevRelayWsUrl = wsUrlFromHttpOrWsUrl(workersDevUrl);
+          if (workersDevRelayWsUrl) {
+            let postDeployText = fs.readFileSync(WRANGLER_CONFIG, 'utf8');
+            postDeployText = patchVar(postDeployText, 'RELAY_URL', workersDevRelayWsUrl);
+            fs.writeFileSync(WRANGLER_CONFIG, postDeployText, 'utf8');
+            workersDevHealthHost = normalizeHost(workersDevRelayWsUrl);
+            console.log(`✓ Set RELAY_URL from deployed workers.dev URL: ${workersDevRelayWsUrl}`);
+          } else {
+            console.log('Could not auto-detect workers.dev URL from deploy output.');
+            console.log('Set RELAY_URL manually in wrangler.jsonc to: wss://<worker>.<subdomain>.workers.dev/ws');
+          }
+        }
 
         console.log('\nStep 8: Verify deployment endpoint (recommended)');
         console.log('Auto-checking /health on detected domain(s)...');
 
         const routeHost = firstRouteHostFromWranglerConfig(WRANGLER_CONFIG);
-        const hosts = [preferredHealthHost, routeHost].filter(Boolean);
+        const hosts = [preferredHealthHost, routeHost, workersDevHealthHost].filter(Boolean);
         const uniqueHosts = [...new Set(hosts)];
 
         if (uniqueHosts.length === 0) {
