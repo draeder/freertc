@@ -67,6 +67,7 @@ The wizard can:
 - Install npm dependencies.
 - Verify Wrangler CLI.
 - Create `wrangler.jsonc` from `wrangler.template.jsonc` if needed.
+- Set Worker name automatically to `freertc-<your-domain>` when a domain is provided.
 - Initialize local D1 schema for `wrangler dev`.
 - Initialize remote D1 schema for deploy.
 - Detect Rust build configs and install `worker-build`/WASM target automatically when required.

@@ -321,6 +321,12 @@ function dbNameForDomain(domain) {
   return sanitized ? `freertc-signal-${sanitized}` : 'freertc-signal';
 }
 
+function workerNameForDomain(domain) {
+  const sanitized = sanitizeDomain(domain);
+  if (!sanitized) return PROJECT_NAME;
+  return `${PROJECT_NAME}-${sanitized}`;
+}
+
 // Extract the domain slug from an existing freertc-signal-<domain> DB name.
 // Returns null for placeholder values or plain 'freertc-signal'.
 function domainFromDbName(dbName) {
@@ -505,11 +511,16 @@ async function main() {
           fs.writeFileSync(WRANGLER_CONFIG, wText, 'utf8');
         } else {
           derivedDbName = dbNameForDomain(domainInput);
+          const workerName = workerNameForDomain(domainInput);
           preferredHealthHost = normalizeHost(domainInput);
           console.log(`✓ Domain-specific database name: ${derivedDbName}`);
+          console.log(`✓ Domain-specific worker name: ${workerName}`);
           const customDbName = (await rl.question(`Database name [press Enter for ${derivedDbName}]: `)).trim();
           derivedDbName = customDbName || derivedDbName;
           console.log(`Using database name: ${derivedDbName}`);
+          let wText = fs.readFileSync(WRANGLER_CONFIG, 'utf8');
+          wText = patchWorkerName(wText, workerName);
+          fs.writeFileSync(WRANGLER_CONFIG, wText, 'utf8');
         }
       } else if (existingDomain) {
         // Offer the existing domain-derived name as default
@@ -536,10 +547,15 @@ async function main() {
           fs.writeFileSync(WRANGLER_CONFIG, wText, 'utf8');
         } else {
           derivedDbName = dbNameForDomain(domainInput);
+          const workerName = workerNameForDomain(domainInput);
           preferredHealthHost = normalizeHost(domainInput);
           console.log(`✓ Domain-specific database name: ${derivedDbName}`);
+          console.log(`✓ Domain-specific worker name: ${workerName}`);
           const customDbName = (await rl.question(`Confirm [press Enter for ${derivedDbName}]: `)).trim();
           derivedDbName = customDbName || derivedDbName;
+          let wText = fs.readFileSync(WRANGLER_CONFIG, 'utf8');
+          wText = patchWorkerName(wText, workerName);
+          fs.writeFileSync(WRANGLER_CONFIG, wText, 'utf8');
         }
       }
 
