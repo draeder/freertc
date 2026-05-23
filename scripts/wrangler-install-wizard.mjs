@@ -376,6 +376,13 @@ function patchWorkerName(text, newName) {
   return text.replace(/^(\s*"name"\s*:\s*)"[^"]*"/gm, `$1"${newName}"`);
 }
 
+function parseFirstWorkerName(filePath) {
+  if (!fs.existsSync(filePath)) return null;
+  const jsonc = fs.readFileSync(filePath, 'utf8');
+  const match = jsonc.match(/"name"\s*:\s*"([^"]+)"/);
+  return match ? match[1] : null;
+}
+
 function modeFromAnswer(answer) {
   const normalized = (answer || '').trim().toLowerCase();
   if (normalized === '1' || normalized === 'dev') return 'dev';
@@ -528,6 +535,11 @@ async function main() {
         const customDbName = (await rl.question(dbNamePrompt)).trim();
         derivedDbName = customDbName || existingDbName;
         console.log(`Using database name: ${derivedDbName}`);
+        const workerName = workerNameForDomain(existingDomain);
+        let wText = fs.readFileSync(WRANGLER_CONFIG, 'utf8');
+        wText = patchWorkerName(wText, workerName);
+        fs.writeFileSync(WRANGLER_CONFIG, wText, 'utf8');
+        console.log(`✓ Domain-specific worker name: ${workerName}`);
       } else {
         // Existing DB is placeholder or missing domain flavor — always offer to upgrade
         if (existingDbName === 'freertc-signal') {
@@ -591,6 +603,18 @@ async function main() {
         console.log('✓ Skipped global network — relay will operate standalone.');
       }
       fs.writeFileSync(WRANGLER_CONFIG, updatedText, 'utf8');
+
+      // Safety pass: when DB name is domain-based and worker name is still default,
+      // normalize to freertc-<domain> before any deploy action.
+      const currentWorkerName = parseFirstWorkerName(WRANGLER_CONFIG);
+      const domainFromDb = domainFromDbName(derivedDbName);
+      if (domainFromDb && currentWorkerName === PROJECT_NAME) {
+        const normalizedWorkerName = workerNameForDomain(domainFromDb);
+        let normalizeText = fs.readFileSync(WRANGLER_CONFIG, 'utf8');
+        normalizeText = patchWorkerName(normalizeText, normalizedWorkerName);
+        fs.writeFileSync(WRANGLER_CONFIG, normalizeText, 'utf8');
+        console.log(`✓ Normalized worker name from ${PROJECT_NAME} to ${normalizedWorkerName}`);
+      }
     } catch (err) {
       console.error('Step 3 error:', err.message);
       throw err;
