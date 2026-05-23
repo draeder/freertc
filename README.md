@@ -35,6 +35,33 @@ Use the interactive wizard to set up Wrangler for local development, deploy, or 
 npm run wizard
 ```
 
+If `freertc` is installed in another project (for example via `npm install github:draeder/freertc`), run it from that project root without changing directories:
+
+```bash
+npx freertc wizard
+```
+
+Or use one command that preselects full setup mode (`both`):
+
+```bash
+npx freertc setup
+```
+
+Fastest option (same as `setup`):
+
+```bash
+npx freertc
+```
+
+Global install flow:
+
+```bash
+npm install -g github:draeder/freertc
+freertc
+```
+
+After install, freertc now prints a quick-start reminder with the exact next command.
+
 The wizard can:
 
 - Install npm dependencies.
@@ -129,6 +156,12 @@ Cloudflare/Wrangler endpoints (default):
 
 ```bash
 npm run deploy
+```
+
+When installed as a dependency in another project, you can deploy from that project's root:
+
+```bash
+npx freertc deploy
 ```
 
 Additional scripts:

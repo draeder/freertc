@@ -304,6 +304,20 @@ function modeFromAnswer(answer) {
   return null;
 }
 
+function modeFromArgs(argv) {
+  const args = argv.slice(2);
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--mode' && i + 1 < args.length) {
+      return modeFromAnswer(args[i + 1]);
+    }
+    if (arg.startsWith('--mode=')) {
+      return modeFromAnswer(arg.split('=')[1]);
+    }
+  }
+  return null;
+}
+
 function yes(answer, defaultYes = true) {
   const normalized = (answer || '').trim().toLowerCase();
   if (!normalized) return defaultYes;
@@ -331,6 +345,7 @@ function includesApiKeyMissing(text) {
 
 async function main() {
   const rl = createInterface({ input, output });
+  const forcedMode = modeFromArgs(process.argv);
 
   try {
     if (!fs.existsSync(path.join(ROOT, 'package.json'))) {
@@ -347,13 +362,19 @@ async function main() {
       console.log(`Running commands from project root instead of current directory: ${process.cwd()}\n`);
     }
 
-    console.log('Choose setup mode:');
-    console.log('  1) dev     (local wrangler dev + local D1 schema)');
-    console.log('  2) deploy  (Cloudflare login + remote D1 schema + deploy)');
-    console.log('  3) both    (dev + deploy setup)\n');
+    let mode = forcedMode;
+    if (!mode) {
+      console.log('Choose setup mode:');
+      console.log('  1) dev     (local wrangler dev + local D1 schema)');
+      console.log('  2) deploy  (Cloudflare login + remote D1 schema + deploy)');
+      console.log('  3) both    (dev + deploy setup)\n');
 
-    const modeAnswer = await rl.question('Mode [1/2/3]: ');
-    const mode = modeFromAnswer(modeAnswer);
+      const modeAnswer = await rl.question('Mode [1/2/3]: ');
+      mode = modeFromAnswer(modeAnswer);
+    } else {
+      console.log(`Using setup mode from args: ${mode}`);
+    }
+
     if (!mode) {
       throw new Error('Invalid mode. Please run the wizard again and choose 1, 2, or 3.');
     }
@@ -530,8 +551,12 @@ async function main() {
       console.log('\nStep 6: Initialize local D1 schema');
       runWrangler(['d1', 'execute', dbName, '--local', '--file', 'scripts/d1-schema.sql']);
 
-      const startDev = await rl.question('Start local dev server now (npm run dev)? [Y/n]: ');
-      if (yes(startDev, true)) {
+      const startDevDefaultYes = !needsDeploy;
+      const startDevPrompt = startDevDefaultYes
+        ? 'Start local dev server now (npm run dev)? [Y/n]: '
+        : 'Start local dev server now (npm run dev)? [y/N]: ';
+      const startDev = await rl.question(startDevPrompt);
+      if (yes(startDev, startDevDefaultYes)) {
         run('npm', ['run', 'dev']);
       }
     }
