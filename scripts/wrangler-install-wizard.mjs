@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
@@ -8,6 +9,9 @@ import { stdin as input, stdout as output } from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const CARGO_BIN = path.join(os.homedir(), '.cargo', 'bin');
+const PATH_WITH_CARGO = `${CARGO_BIN}${path.delimiter}${process.env.PATH || ''}`;
+const WASM_TARGET = 'wasm32-unknown-unknown';
 
 function looksLikeProjectRoot(dir) {
   const hasPackage = fs.existsSync(path.join(dir, 'package.json'));
@@ -74,7 +78,11 @@ function readProjectName(dir) {
 const PROJECT_NAME = readProjectName(ROOT);
 
 function run(command, args, { allowFailure = false } = {}) {
-  const result = spawnSync(command, args, { stdio: 'inherit', cwd: ROOT });
+  const result = spawnSync(command, args, {
+    stdio: 'inherit',
+    cwd: ROOT,
+    env: { ...process.env, PATH: PATH_WITH_CARGO }
+  });
   if (result.status !== 0 && !allowFailure) {
     throw new Error(`Command failed: ${command} ${args.join(' ')}`);
   }
@@ -82,7 +90,12 @@ function run(command, args, { allowFailure = false } = {}) {
 }
 
 function runCapture(command, args, { allowFailure = false } = {}) {
-  const result = spawnSync(command, args, { stdio: 'pipe', encoding: 'utf8', cwd: ROOT });
+  const result = spawnSync(command, args, {
+    stdio: 'pipe',
+    encoding: 'utf8',
+    cwd: ROOT,
+    env: { ...process.env, PATH: PATH_WITH_CARGO }
+  });
   if (result.status !== 0 && !allowFailure) {
     const stderr = (result.stderr || '').trim();
     throw new Error(`Command failed: ${command} ${args.join(' ')}${stderr ? `\n${stderr}` : ''}`);
@@ -93,6 +106,67 @@ function runCapture(command, args, { allowFailure = false } = {}) {
     stdout: result.stdout || '',
     stderr: result.stderr || ''
   };
+}
+
+function commandExists(command, args = ['--version']) {
+  const result = spawnSync(command, args, {
+    cwd: ROOT,
+    stdio: 'ignore',
+    env: { ...process.env, PATH: PATH_WITH_CARGO }
+  });
+  return result.status === 0;
+}
+
+function hasWasmTargetInstalled() {
+  const sysroot = runCapture('rustc', ['--print', 'sysroot'], { allowFailure: true });
+  if (!sysroot.ok) return false;
+  const sysrootPath = (sysroot.stdout || '').trim();
+  if (!sysrootPath) return false;
+
+  const targetDir = path.join(sysrootPath, 'lib', 'rustlib', WASM_TARGET);
+  return fs.existsSync(targetDir);
+}
+
+function ensureWorkerBuild() {
+  if (commandExists('worker-build')) return;
+
+  if (!commandExists('cargo')) {
+    throw new Error(
+      'Rust build required by wrangler config but Cargo is missing. Install Rust from https://rustup.rs or switch wrangler main/build to JS (src/index.js).'
+    );
+  }
+
+  console.log('Installing worker-build via Cargo...');
+  run('cargo', ['install', 'worker-build']);
+}
+
+function ensureWasmTarget() {
+  if (!commandExists('rustc')) {
+    throw new Error('Rust build required by wrangler config but rustc is missing. Install Rust from https://rustup.rs.');
+  }
+  if (hasWasmTargetInstalled()) return;
+
+  if (!commandExists('rustup')) {
+    throw new Error(`Missing ${WASM_TARGET} target and rustup is not available. Install rustup then run: rustup target add ${WASM_TARGET}`);
+  }
+
+  console.log(`Installing ${WASM_TARGET} Rust target...`);
+  run('rustup', ['target', 'add', WASM_TARGET]);
+}
+
+function wranglerConfigUsesWorkerBuild(filePath) {
+  if (!fs.existsSync(filePath)) return false;
+  const text = fs.readFileSync(filePath, 'utf8');
+  return /worker-build/.test(text);
+}
+
+function ensureBuildPrereqsForConfig(filePath) {
+  if (!wranglerConfigUsesWorkerBuild(filePath)) return;
+
+  console.log('\nDetected Rust worker build command in Wrangler config.');
+  console.log('Ensuring worker-build and WebAssembly target are available...');
+  ensureWorkerBuild();
+  ensureWasmTarget();
 }
 
 function getWranglerCommand() {
@@ -402,6 +476,8 @@ async function main() {
       console.log('\nCreated wrangler.jsonc from fallback defaults (template not found).');
       console.log('Update name/main/compatibility_date and add bindings before deploy.');
     }
+
+    ensureBuildPrereqsForConfig(WRANGLER_CONFIG);
 
     console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     // Derive D1 database name from domain or existing config.

@@ -16,7 +16,7 @@ This project provides a Cloudflare Worker signaling relay for WebRTC peers using
 ## Runtime scope
 
 - The checked-in Cloudflare Worker runtime is `src/index.js` with Cloudflare D1 (`DB` binding).
-- The Rust/WASM worker lives in `src/lib.rs` and is wired through `wrangler.template.jsonc` / `worker-build` if you switch to the template-based setup.
+- The Rust/WASM worker lives in `src/lib.rs` and is optional; the default template now uses the JS worker path.
 - The built-in browser demo served by the Worker is `public/index.html` + `public/app.js`.
 - `src/kv.js` and `demo/src/*` are legacy/experimental code paths and are not used by `wrangler dev` or `wrangler deploy` in the current setup.
 
@@ -69,6 +69,7 @@ The wizard can:
 - Create `wrangler.jsonc` from `wrangler.template.jsonc` if needed.
 - Initialize local D1 schema for `wrangler dev`.
 - Initialize remote D1 schema for deploy.
+- Detect Rust build configs and install `worker-build`/WASM target automatically when required.
 - Check existing Wrangler auth and only run `wrangler login` when needed.
 - Optionally run `npm run dev:cf` and `npm run deploy`.
 
