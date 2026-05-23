@@ -260,6 +260,41 @@ async function listRelays(db) {
   return (result.results || []).map(r => ({ url: r.url, name: r.name }));
 }
 
+function mergeDiscoveredPeers(...peerGroups) {
+  const merged = new Map();
+
+  for (const peers of peerGroups) {
+    if (!Array.isArray(peers)) continue;
+    for (const peer of peers) {
+      const peerId = peer?.peer_id;
+      if (typeof peerId !== "string" || !peerId) continue;
+
+      const existing = merged.get(peerId);
+      const nextTimestamp = Number(peer?.timestamp || 0);
+      const existingTimestamp = Number(existing?.timestamp || 0);
+      if (!existing || nextTimestamp >= existingTimestamp) {
+        merged.set(peerId, peer);
+      }
+    }
+  }
+
+  return Array.from(merged.values()).sort((left, right) => left.peer_id.localeCompare(right.peer_id));
+}
+
+function sendPeerList(socket, network, peers, to = null, from = "bootstrap-relay") {
+  socket.send(JSON.stringify({
+    psp_version: PSP_VERSION,
+    type: "peer_list",
+    network,
+    from,
+    to,
+    message_id: crypto.randomUUID(),
+    timestamp: Date.now(),
+    ttl_ms: DEFAULT_TTL_MS,
+    body: { peers }
+  }));
+}
+
 // Broadcast peer list to all connected peers in a network
 async function broadcastPeerList(db, network) {
   const sockets = networkSubscribers.get(network);
@@ -279,23 +314,9 @@ async function broadcastPeerList(db, network) {
     session_id: row.session_id,
     timestamp: row.updated_at_ms
   }));
-
-  const message = {
-    psp_version: PSP_VERSION,
-    type: "peer_list",
-    network,
-    from: "bootstrap-relay",
-    to: null,
-    message_id: crypto.randomUUID(),
-    timestamp: Date.now(),
-    ttl_ms: DEFAULT_TTL_MS,
-    body: { peers }
-  };
-
-  const payload = JSON.stringify(message);
   for (const socket of sockets) {
     try {
-      socket.send(payload);
+      sendPeerList(socket, network, peers);
     } catch (e) {
       sockets.delete(socket);
     }
@@ -566,35 +587,35 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
       }
 
     } else if (type === "discover") {
-      // Local peers first
+      let localPeers = [];
       if (db) {
-        broadcastPeerList(db, network).catch(() => {});
+        localPeers = await findPeers(db, network, peerId);
       }
-      // Fan out to all known peer relays, exchanging relay lists bidirectionally
-      if (env.RELAY_URL && env.DB) {
-        ctx.waitUntil((async () => {
-          const selfRelayId = env.RELAY_PEER_ID || "relay-bridge";
-          const selfUrl = normalizeRelayUrl(env.RELAY_URL);
-          const allRelays = await listRelays(env.DB);
-          const remoteUrls = allRelays.map(r => r.url).filter(u => u !== selfUrl);
-          if (!remoteUrls.length) return;
 
+      let remotePeers = [];
+      if (env.RELAY_URL && env.DB) {
+        const selfRelayId = env.RELAY_PEER_ID || "relay-bridge";
+        const selfUrl = normalizeRelayUrl(env.RELAY_URL);
+        const allRelays = await listRelays(env.DB);
+        const remoteUrls = allRelays.map(r => r.url).filter(u => u !== selfUrl);
+
+        if (remoteUrls.length) {
           const results = await Promise.all(
             remoteUrls.map(u => queryRelayForPeers(u, network, selfRelayId, env.DB, allRelays))
           );
-          const remotePeers = results.flat();
-          if (!remotePeers.length) return;
-
-          const message = {
-            psp_version: PSP_VERSION, type: "peer_list", network,
-            from: selfRelayId, to: peerId,
-            message_id: crypto.randomUUID(), timestamp: Date.now(),
-            ttl_ms: DEFAULT_TTL_MS,
-            body: { peers: remotePeers }
-          };
-          try { socket.send(JSON.stringify(message)); } catch {}
-        })());
+          remotePeers = results.flat();
+        }
       }
+
+      try {
+        sendPeerList(
+          socket,
+          network,
+          mergeDiscoveredPeers(localPeers, remotePeers).filter(peer => peer.peer_id !== peerId),
+          peerId,
+          env.RELAY_PEER_ID || "bootstrap-relay"
+        );
+      } catch {}
 
     } else if (type === "ext" && message.body?.action === "relay_list") {
       // Remote relay is sharing its known relay list — cache any new entries
