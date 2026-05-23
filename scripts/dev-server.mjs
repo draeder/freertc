@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { resolveWranglerCommand } from './project-bootstrap.mjs';
 
 const ROOT = process.cwd();
 const CARGO_BIN = path.join(os.homedir(), '.cargo', 'bin');
@@ -93,13 +94,13 @@ function resolveWranglerArgs() {
 
   if (fs.existsSync(localConfig)) {
     return {
-      args: ['wrangler', 'dev'],
+      args: ['dev'],
       configPath: localConfig
     };
   }
   if (fs.existsSync(workersDevConfig)) {
     return {
-      args: ['wrangler', 'dev', '--config', 'wrangler.workers-dev.jsonc'],
+      args: ['dev', '--config', 'wrangler.workers-dev.jsonc'],
       configPath: workersDevConfig
     };
   }
@@ -117,11 +118,12 @@ function configUsesWorkerBuild(configPath) {
 }
 
 const resolved = resolveWranglerArgs();
+const wrangler = resolveWranglerCommand(ROOT);
 
 if (configUsesWorkerBuild(resolved.configPath)) {
   ensureWorkerBuild();
   ensureWasmTarget();
 }
 
-const started = run('npx', resolved.args);
+const started = run(wrangler.command, [...wrangler.baseArgs, ...resolved.args]);
 process.exit(started.status ?? 1);

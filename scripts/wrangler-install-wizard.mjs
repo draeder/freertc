@@ -6,60 +6,12 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
-import { fileURLToPath } from 'node:url';
+import { PACKAGE_ROOT, ensureProjectFiles, resolveProjectRoot, resolveWranglerCommand } from './project-bootstrap.mjs';
 
-const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const CARGO_BIN = path.join(os.homedir(), '.cargo', 'bin');
 const PATH_WITH_CARGO = `${CARGO_BIN}${path.delimiter}${process.env.PATH || ''}`;
 const WASM_TARGET = 'wasm32-unknown-unknown';
-
-function looksLikeProjectRoot(dir) {
-  const hasPackage = fs.existsSync(path.join(dir, 'package.json'));
-  const hasWranglerConfig = fs.existsSync(path.join(dir, 'wrangler.jsonc'));
-  const hasWranglerTemplate = fs.existsSync(path.join(dir, 'wrangler.template.jsonc'));
-  return (
-    hasPackage && (hasWranglerConfig || hasWranglerTemplate)
-  );
-}
-
-function findProjectRoot(startDir) {
-  let dir = path.resolve(startDir);
-  while (true) {
-    if (looksLikeProjectRoot(dir)) {
-      return dir;
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) {
-      return null;
-    }
-    dir = parent;
-  }
-}
-
-function findNearestPackageRoot(startDir) {
-  let dir = path.resolve(startDir);
-  while (true) {
-    if (fs.existsSync(path.join(dir, 'package.json'))) {
-      return dir;
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) {
-      return null;
-    }
-    dir = parent;
-  }
-}
-
-// Prefer an explicit wrangler-config root found by walking up from either the
-// script file location or cwd. Only fall back to "nearest package.json" when
-// neither walk finds a wrangler config, to avoid accidentally binding to an
-// outer project that has this package installed as a dependency.
-const ROOT =
-  findProjectRoot(SCRIPT_DIR) ||
-  findProjectRoot(process.cwd()) ||
-  findNearestPackageRoot(SCRIPT_DIR) ||
-  findNearestPackageRoot(process.cwd()) ||
-  process.cwd();
+const ROOT = resolveProjectRoot(process.cwd());
 const WRANGLER_CONFIG = path.join(ROOT, 'wrangler.jsonc');
 const WRANGLER_TEMPLATE = path.join(ROOT, 'wrangler.template.jsonc');
 const D1_SCHEMA_FILE = path.join(ROOT, 'scripts', 'd1-schema.sql');
@@ -170,15 +122,7 @@ function ensureBuildPrereqsForConfig(filePath) {
 }
 
 function getWranglerCommand() {
-  const globalCheck = spawnSync('wrangler', ['--version'], {
-    stdio: 'pipe',
-    encoding: 'utf8',
-    cwd: ROOT
-  });
-  if (globalCheck.status === 0) {
-    return { command: 'wrangler', baseArgs: [], source: 'global' };
-  }
-  return { command: 'npx', baseArgs: ['wrangler'], source: 'npx' };
+  return resolveWranglerCommand(ROOT);
 }
 
 // Resolved lazily after npm install — do not call before resolveWrangler().
@@ -435,18 +379,25 @@ async function main() {
   const forcedMode = modeFromArgs(process.argv);
 
   try {
-    if (!fs.existsSync(path.join(ROOT, 'package.json'))) {
-      throw new Error(`Could not find a project with package.json from ${process.cwd()}`);
-    }
+    const copiedFiles = ensureProjectFiles(ROOT);
 
     console.log(`\n${PROJECT_NAME} Wrangler Install Wizard\n`);
     console.log(`Using project root: ${ROOT}`);
     console.log(`Wrangler config path: ${WRANGLER_CONFIG}`);
-    console.log(`Wrangler template path: ${WRANGLER_TEMPLATE}\n`);
+    console.log(`Wrangler template path: ${WRANGLER_TEMPLATE}`);
+    console.log(`Package assets path: ${PACKAGE_ROOT}\n`);
 
     if (path.resolve(process.cwd()) !== ROOT) {
       console.log(`Detected project root: ${ROOT}`);
       console.log(`Running commands from project root instead of current directory: ${process.cwd()}\n`);
+    }
+
+    if (copiedFiles.length > 0) {
+      console.log('Copied package files into this project:');
+      for (const file of copiedFiles) {
+        console.log(`  - ${file}`);
+      }
+      console.log('');
     }
 
     let mode = forcedMode;
@@ -469,10 +420,13 @@ async function main() {
     const needsDev = mode === 'dev' || mode === 'both';
     const needsDeploy = mode === 'deploy' || mode === 'both';
 
-    console.log('\nStep 1: Ensure dependencies are installed');
-    run('npm', ['install']);
+    console.log('\nStep 1: Ensure project files are present');
+    if (copiedFiles.length === 0) {
+      console.log('Required worker files already exist in this project.');
+    } else {
+      console.log('Project bootstrapped from the published freertc package.');
+    }
 
-    // Detect wrangler after npm install so local node_modules/.bin is available.
     resolveWrangler();
 
     console.log('\nStep 2: Verify Wrangler CLI is available');
@@ -669,11 +623,11 @@ async function main() {
 
       const startDevDefaultYes = !needsDeploy;
       const startDevPrompt = startDevDefaultYes
-        ? 'Start local dev server now (npm run dev)? [Y/n]: '
-        : 'Start local dev server now (npm run dev)? [y/N]: ';
+        ? 'Start local Wrangler dev server now (freertc dev:cf)? [Y/n]: '
+        : 'Start local Wrangler dev server now (freertc dev:cf)? [y/N]: ';
       const startDev = await rl.question(startDevPrompt);
       if (yes(startDev, startDevDefaultYes)) {
-        run('npm', ['run', 'dev']);
+        run(process.execPath, [path.join(PACKAGE_ROOT, 'scripts', 'dev-server.mjs')]);
       }
     }
 
@@ -681,9 +635,9 @@ async function main() {
       console.log('\nStep 7: Initialize remote D1 schema');
       runWrangler(['d1', 'execute', dbName, '--remote', '--file', 'scripts/d1-schema.sql']);
 
-      const doDeploy = await rl.question('Deploy now (npm run deploy)? [Y/n]: ');
+      const doDeploy = await rl.question('Deploy now (freertc deploy)? [Y/n]: ');
       if (yes(doDeploy, true)) {
-        run('npm', ['run', 'deploy']);
+        runWrangler(['deploy', '--env', 'production']);
 
         console.log('\nStep 8: Verify deployment endpoint (recommended)');
         console.log('Auto-checking /health on detected domain(s)...');
@@ -727,10 +681,11 @@ async function main() {
 
     console.log('\nWizard completed successfully.');
     console.log('\nQuick commands:');
-    console.log('  npm run d1:init:local');
-    console.log('  npm run d1:init:remote');
-    console.log('  npm run dev');
-    console.log('  npm run deploy');
+    console.log(`  ${WRANGLER.command} ${[...WRANGLER.baseArgs, 'd1', 'execute', dbName, '--local', '--file', 'scripts/d1-schema.sql'].join(' ')}`);
+    console.log(`  ${WRANGLER.command} ${[...WRANGLER.baseArgs, 'd1', 'execute', dbName, '--remote', '--file', 'scripts/d1-schema.sql'].join(' ')}`);
+    console.log('  npx freertc dev');
+    console.log('  npx freertc dev:cf');
+    console.log('  npx freertc deploy');
   } finally {
     rl.close();
   }

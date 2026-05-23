@@ -2,6 +2,29 @@
 
 This project provides a Cloudflare Worker signaling relay for WebRTC peers using the [Peer Signaling Protocol (PSP)](https://github.com/draeder/Peer-Signaling-Protocol-Specification) envelope shape.
 
+## Install from npm
+
+Local project install:
+
+```bash
+npm install freertc
+```
+
+Global install:
+
+```bash
+npm install -g freertc
+```
+
+When you run the CLI from your project directory, `freertc` copies the required worker files into that directory on first run:
+
+- `src/index.js`
+- `public/index.html`
+- `public/app.js`
+- `scripts/d1-schema.sql`
+- `wrangler.template.jsonc`
+- `wrangler.workers-dev.jsonc`
+
 ## What this worker does
 
 - Accepts WebSocket client connections at `/ws`.
@@ -29,42 +52,36 @@ This project provides a Cloudflare Worker signaling relay for WebRTC peers using
 
 ## Wrangler install wizard (recommended)
 
-Use the interactive wizard to set up Wrangler for local development, deploy, or both:
-
-```bash
-npm run wizard
-```
-
-If `freertc` is installed in another project (for example via `npm install github:draeder/freertc`), run it from that project root without changing directories:
+Use the interactive wizard from the project directory where you want the worker files and Wrangler config to live:
 
 ```bash
 npx freertc wizard
 ```
 
-Or use one command that preselects full setup mode (`both`):
-
-```bash
-npx freertc setup
-```
-
-Fastest option (same as `setup`):
+The default command runs full setup mode (`both`):
 
 ```bash
 npx freertc
 ```
 
+You can also preselect full setup mode explicitly:
+
+```bash
+npx freertc setup
+```
+
 Global install flow:
 
 ```bash
-npm install -g github:draeder/freertc
+freertc wizard
 freertc
 ```
 
-After install, freertc now prints a quick-start reminder with the exact next command.
+After install, freertc prints a quick-start reminder with the exact next command.
 
 The wizard can:
 
-- Install npm dependencies.
+- Copy the worker runtime files into your current project when they are missing.
 - Verify Wrangler CLI.
 - Create `wrangler.jsonc` from `wrangler.template.jsonc` if needed.
 - Set Worker name automatically to `freertc-<your-domain>` when a domain is provided.
@@ -81,6 +98,8 @@ The wizard can:
 ```bash
 npm install
 ```
+
+If you installed the npm package instead of cloning the repo, use `npx freertc wizard` instead of the repository scripts below.
 
 ### 2. Configure Wrangler
 
@@ -157,20 +176,20 @@ Cloudflare/Wrangler endpoints (default):
 ## Deploy
 
 ```bash
-npm run deploy
-```
-
-When installed as a dependency in another project, you can deploy from that project's root:
-
-```bash
 npx freertc deploy
 ```
 
-Additional scripts:
+If you installed freertc globally:
+
+```bash
+freertc deploy
+```
+
+Repository-only scripts:
 
 - `npm run build` builds the Rust/WASM worker via `worker-build --release`.
 - `npm run deploy:raw` deploys without `--env production`.
-- `npm run check` runs syntax validation (`node --check src/index.js`).
+- `npm run check` runs `cargo check --target wasm32-unknown-unknown` for the Rust worker path.
 - `npm run dev` runs the standalone local relay (non-Cloudflare).
 - `npm run dev:cf` runs Wrangler/Cloudflare local dev.
 - `npm run dev:node` runs a standalone local relay without Cloudflare/Wrangler.

@@ -2,6 +2,17 @@
   "name": "freertc",
   "version": "0.1.0",
   "description": "Cloudflare Worker signaling relay for WebRTC peers with D1 storage.",
+  "keywords": [
+    "webrtc",
+    "signaling",
+    "cloudflare-workers",
+    "cloudflare-d1",
+    "websocket"
+  ],
+  "homepage": "https://github.com/draeder/freertc#readme",
+  "bugs": {
+    "url": "https://github.com/draeder/freertc/issues"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/draeder/freertc.git"
@@ -11,6 +22,23 @@
   },
   "type": "module",
   "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "README.md",
+    "bin/",
+    "public/",
+    "scripts/d1-schema.sql",
+    "scripts/dev-server.mjs",
+    "scripts/non-cloudflare-server.mjs",
+    "scripts/postinstall-message.mjs",
+    "scripts/project-bootstrap.mjs",
+    "scripts/wrangler-install-wizard.mjs",
+    "src/index.js",
+    "wrangler.template.jsonc",
+    "wrangler.workers-dev.jsonc"
+  ],
   "scripts": {
     "build": "worker-build --release",
     "dev": "node scripts/non-cloudflare-server.mjs",
