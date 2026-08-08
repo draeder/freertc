@@ -12,6 +12,8 @@ const RTC_CONFIG = {
 };
 const SHARED_IDS_KEY = "freertc.shared.ids.v1";
 const UI_PREFS_KEY = "freertc.ui.prefs.v1";
+const DATA_PING_MS = 3000;
+const DATA_PONG_TIMEOUT_MS = 12000;
 
 function newId(prefix = "msg") {
   return `${prefix}-${crypto.randomUUID()}`;
@@ -112,6 +114,14 @@ function normalizeText(value) {
   return String(value).trim();
 }
 
+function deriveNetworkFromSession(sessionIdValue) {
+  const session = normalizeText(sessionIdValue);
+  if (!session || !isSpecToken(session)) {
+    return "";
+  }
+  return `room:${session}`;
+}
+
 createApp({
   setup() {
     const host = window.location.host;
@@ -184,6 +194,7 @@ createApp({
     let manualDisconnect = false;
     let stoppingRtc = false;
     let reconnectLockedByBye = false;
+    let _wakeLock = null;
     const CONNECT_REQUEST_TIMEOUT_MS = 10000; // 10 second timeout
     const DISCOVER_SYNC_INTERVAL_MS = 10000;
     const FAILED_PEER_COOLDOWN_MS = 5000;
@@ -673,9 +684,15 @@ createApp({
       const params = new URLSearchParams(window.location.search);
       const sessionParam = normalizeText(params.get("session_id") || params.get("sessionId"));
       const instanceParam = normalizeText(params.get("instance_id") || params.get("instanceId"));
+      const networkParam = normalizeText(
+        params.get("network") ||
+        params.get("network_id") ||
+        params.get("networkId")
+      );
 
       const hasValidUrlSession = isSpecToken(sessionParam);
       const hasValidUrlInstance = isSpecToken(instanceParam);
+      const hasValidUrlNetwork = isSpecToken(networkParam);
 
       if (sessionParam && !hasValidUrlSession) {
         pushLog("ids:error", "Ignoring invalid URL session_id");
@@ -683,9 +700,24 @@ createApp({
       if (instanceParam && !hasValidUrlInstance) {
         pushLog("ids:error", "Ignoring invalid URL instance_id");
       }
+      if (networkParam && !hasValidUrlNetwork) {
+        pushLog("network:error", "Ignoring invalid URL network");
+      }
 
       sessionId.value = hasValidUrlSession ? sessionParam : `sess-${Math.random().toString(36).slice(2, 10)}`;
       instanceId.value = hasValidUrlInstance ? instanceParam : `inst-${Math.random().toString(36).slice(2, 10)}`;
+
+      // Cross-domain links should land in the same room even when each origin has
+      // different sessionStorage UI state. URL network wins; otherwise derive from session_id.
+      const derivedNetwork = deriveNetworkFromSession(sessionId.value);
+      const nextNetwork = hasValidUrlNetwork ? networkParam : (derivedNetwork || normalizedNetworkValue());
+      if (nextNetwork && nextNetwork !== network.value) {
+        network.value = nextNetwork;
+      }
+      if (nextNetwork && nextNetwork !== appliedNetwork.value) {
+        appliedNetwork.value = nextNetwork;
+      }
+
       persistSharedIds();
     }
 
@@ -1254,6 +1286,12 @@ createApp({
 
     function selectPeer(peerId, options = {}) {
       const { manual = false, allowUnannounced = false } = options;
+
+      if (peerId === fromPeer.value) {
+        pushLog("discovery:error", "Ignoring self peer selection");
+        toPeer.value = "";
+        return;
+      }
       
       // Only allow selecting announced peers to prevent phantom links.
       const isAnnounced = discoveredPeers.value.some((p) => p?.peer_id === peerId);
@@ -1606,10 +1644,53 @@ createApp({
       link.dataState = channel.readyState;
       pushLog("rtc:datachannel", `${peerId} attached (${source})`);
 
+      let dcKeepaliveTimer = null;
+      let lastPongAt = Date.now();
+      let lastPingSentAt = 0;
+
+      function onTabVisible() {
+        if (typeof document !== "undefined" && document.hidden) return;
+        // Any ping sent while hidden can't have been answered — don't count the gap.
+        lastPingSentAt = 0;
+        lastPongAt = Date.now();
+      }
+
+      function startDcKeepalive() {
+        clearInterval(dcKeepaliveTimer);
+        dcKeepaliveTimer = setInterval(() => {
+          if (channel.readyState !== "open") return;
+
+          // Browser throttles timers in hidden tabs — skip timeout check while hidden.
+          if (typeof document !== "undefined" && document.hidden) {
+            lastPingSentAt = 0;
+            lastPongAt = Date.now();
+            return;
+          }
+
+          const pingInFlight = lastPingSentAt > lastPongAt;
+          if (pingInFlight && Date.now() - lastPingSentAt > DATA_PONG_TIMEOUT_MS) {
+            pushLog("rtc:datachannel", `${peerId} keepalive timeout`);
+            clearInterval(dcKeepaliveTimer);
+            dcKeepaliveTimer = null;
+            try { channel.close(); } catch { /* no-op */ }
+            try { link.pc?.close(); } catch { /* no-op */ }
+            return;
+          }
+
+          try {
+            channel.send(JSON.stringify({ type: "ping", ts: Date.now() }));
+            lastPingSentAt = Date.now();
+          } catch { /* ignore transient errors */ }
+        }, DATA_PING_MS);
+      }
+
       if (channel.readyState === "open") {
         link.phase = "connected";
         pushLog("rtc:datachannel", `${peerId} open`);
         refreshMeshStats();
+        acquireWakeLock();
+        document.addEventListener("visibilitychange", onTabVisible);
+        startDcKeepalive();
       }
 
       channel.onopen = () => {
@@ -1617,15 +1698,25 @@ createApp({
         link.phase = "connected";
         link.connectRequested = false;
         link.connectRequestTime = 0;
+        lastPongAt = Date.now();
         pushLog("rtc:datachannel", `${peerId} open`);
         refreshMeshStats();
         refreshSelectedPeerSnapshot();
+        acquireWakeLock();
+        document.addEventListener("visibilitychange", onTabVisible);
+        startDcKeepalive();
       };
 
       channel.onclose = () => {
         link.dataState = channel.readyState;
+        clearInterval(dcKeepaliveTimer);
+        dcKeepaliveTimer = null;
+        document.removeEventListener("visibilitychange", onTabVisible);
         pushLog("rtc:datachannel", `${peerId} closed`);
         refreshMeshStats();
+        // Release wake lock if no more open channels remain.
+        const anyOpen = [...meshLinks.values()].some((l) => l.dc?.readyState === "open");
+        if (!anyOpen) releaseWakeLock();
         if (!stoppingRtc && autoConnect.value && link.phase === "connected") {
           failoverFromCurrentPeer(peerId, "datachannel-closed");
         }
@@ -1637,6 +1728,17 @@ createApp({
       };
 
       channel.onmessage = (event) => {
+        let msg;
+        try { msg = JSON.parse(event.data); } catch { /* not JSON */ }
+        if (msg?.type === "ping") {
+          try { channel.send(JSON.stringify({ type: "pong", ts: Date.now() })); } catch { /* no-op */ }
+          return;
+        }
+        if (msg?.type === "pong") {
+          lastPongAt = Date.now();
+          lastPingSentAt = 0;
+          return;
+        }
         pushChatMessage(event.data, "incoming");
       };
 
@@ -1860,6 +1962,10 @@ createApp({
         return;
       }
 
+      if (message.from && message.from === fromPeer.value) {
+        return;
+      }
+
       if (message.type === "error") {
         pushLog("server:error", message.body || {});
         return;
@@ -2058,6 +2164,9 @@ createApp({
       }
 
       const peerId = message.from;
+      if (peerId === fromPeer.value) {
+        return;
+      }
       const link = getMeshLink(peerId);
 
       if (!hasMeshCapacityForPeer(peerId)) {
@@ -2115,6 +2224,9 @@ createApp({
         return;
       }
       const peerId = message.from;
+      if (peerId === fromPeer.value) {
+        return;
+      }
       const link = getMeshLink(peerId);
 
       if (link.dc && link.dc.readyState === "open") {
@@ -2147,6 +2259,9 @@ createApp({
         return;
       }
       const peerId = message.from;
+      if (peerId === fromPeer.value) {
+        return;
+      }
       const rejectCode = message.body?.code || "connect_reject";
       const link = getMeshLink(peerId);
       link.connectRequested = false;
@@ -2176,6 +2291,9 @@ createApp({
         return;
       }
       const peerId = message.from;
+      if (peerId === fromPeer.value) {
+        return;
+      }
 
       if (!hasMeshCapacityForPeer(peerId)) {
         sendRelayEnvelope(
@@ -2259,6 +2377,9 @@ createApp({
         return;
       }
       const peerId = message.from;
+      if (peerId === fromPeer.value) {
+        return;
+      }
       const link = getMeshLink(peerId, false);
       if (!link?.pc || link.phase === "connected") {
         return;
@@ -2299,6 +2420,10 @@ createApp({
 
     async function onIceCandidate(message) {
       if (!message.from || !message.body?.candidate) {
+        return;
+      }
+
+      if (message.from === fromPeer.value) {
         return;
       }
 
@@ -2403,6 +2528,64 @@ createApp({
     loadUiPrefs();
     initSharedIds();
 
+    function acquireWakeLock() {
+      if (_wakeLock) return;
+      if (typeof navigator === "undefined" || !("wakeLock" in navigator)) return;
+      navigator.wakeLock.request("screen").then((lock) => {
+        _wakeLock = lock;
+        lock.addEventListener("release", () => { _wakeLock = null; });
+        pushLog("wakelock", "acquired");
+      }).catch(() => { /* permission denied or unavailable — not fatal */ });
+    }
+
+    function releaseWakeLock() {
+      if (!_wakeLock) return;
+      try { _wakeLock.release(); } catch { /* no-op */ }
+      _wakeLock = null;
+    }
+
+    function handleTabVisible() {
+      if (typeof document !== "undefined" && document.hidden) return;
+      // Re-acquire wake lock lost while hidden.
+      const anyOpen = [...meshLinks.values()].some((l) => l.dc?.readyState === "open");
+      if (anyOpen) acquireWakeLock();
+      // Reconnect WebSocket if it dropped while the tab was inactive.
+      if (!manualDisconnect) {
+        const ws = socket.value;
+        if (!ws || (ws.readyState !== WebSocket.OPEN && ws.readyState !== WebSocket.CONNECTING)) {
+          pushLog("socket", "tab visible — WebSocket dropped while hidden, reconnecting");
+          // Purge stale peer connections before reconnect so they don't block re-dialing.
+          for (const peerId of meshLinks.keys()) closeMeshLink(peerId);
+          meshLinks.clear();
+          discoveredPeers.value = [];
+          if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+          connect();
+        }
+      }
+    }
+
+    function handleFreeze() {
+      // Tab is about to be CPU-suspended — proactively withdraw from signaling.
+      const ws = socket.value;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({
+            psp_version: PSP_VERSION,
+            type: "withdraw",
+            network: network.value || "room:test",
+            from: fromPeer.value,
+            to: null,
+            session_id: null,
+            message_id: crypto.randomUUID(),
+            timestamp: Date.now(),
+            ttl_ms: 30000,
+            body: { reason: "tab_freeze" }
+          }));
+        } catch { /* ignore */ }
+      }
+      releaseWakeLock();
+    }
+
     onMounted(() => {
       // Withdraw on page unload/reload using both beforeunload and pagehide to cover all cases.
       // Use fetch with keepalive to guarantee delivery even if socket closes immediately.
@@ -2434,6 +2617,14 @@ createApp({
           sendWithdraw();
         }
       });
+
+      // Inactive-tab resilience: reconnect when the tab becomes visible again.
+      document.addEventListener("visibilitychange", handleTabVisible);
+      // Page Lifecycle API: fires on freeze (CPU-suspend) and resume (thaw).
+      document.addEventListener("freeze", handleFreeze);
+      document.addEventListener("resume", handleTabVisible);
+      // bfcache restore: browser shows page from back/forward cache (WS is dead).
+      window.addEventListener("pageshow", (e) => { if (e.persisted) handleTabVisible(); });
 
       // No-click behavior: boot socket + auto-handshake loop on load.
       connect();
