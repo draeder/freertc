@@ -59,6 +59,8 @@ export function createSignalingClient(options = {}) {
   const {
     peerId: initialPeerId,
     networkId,
+    roomId: configuredRoomId,
+    sessionId: legacyRoomId,
     signalUrl,
     iceServers: configuredIceServers,
     capabilities = {},
@@ -74,8 +76,10 @@ export function createSignalingClient(options = {}) {
     onDataMessage,
   } = options
 
-  if (!initialPeerId || !networkId || !signalUrl) {
-    throw new Error('peerId, networkId, and signalUrl are required')
+  const roomId = configuredRoomId || legacyRoomId || networkId
+
+  if (!initialPeerId || !networkId || !roomId || !signalUrl) {
+    throw new Error('peerId, networkId, roomId, and signalUrl are required')
   }
 
   const mesh = {
@@ -172,9 +176,6 @@ export function createSignalingClient(options = {}) {
   // One-time alternate STUN fallback when default profile yields no candidates.
   const altStunFallbackTried = new Set()
 
-  // PSP session_id per remote peer (generated when initiating, adopted when receiving).
-  const sessionIds = new Map()
-
   // Remote pub keys learned from peer_list hints and incoming relay messages.
   // peerId → { pub: string, epub: string }
   const remotePubKeys = new Map()
@@ -194,21 +195,16 @@ export function createSignalingClient(options = {}) {
     } catch {}
   }
 
-  function getOrCreateSessionId(remotePeerId) {
-    if (!sessionIds.has(remotePeerId)) {
-      sessionIds.set(remotePeerId, generateMessageId())
-    }
-    return sessionIds.get(remotePeerId)
+  function getOrCreateSessionId() {
+    return roomId
   }
 
-  function setSessionId(remotePeerId, sessionId) {
-    if (sessionId) sessionIds.set(remotePeerId, sessionId)
+  function setSessionId(_remotePeerId, sessionId) {
+    return sessionId === roomId
   }
 
-  function rotateSessionId(remotePeerId) {
-    const sid = generateMessageId()
-    sessionIds.set(remotePeerId, sid)
-    return sid
+  function rotateSessionId() {
+    return roomId
   }
 
   function clearAnswerBurst(remotePeerId) {
@@ -313,7 +309,7 @@ export function createSignalingClient(options = {}) {
       network:    networkId,
       from:       peerId,
       to:         opts.to         ?? null,
-      session_id: opts.session_id ?? null,
+      session_id: opts.session_id ?? roomId,
       message_id: generateMessageId(),
       timestamp:  Date.now(),
       ttl_ms:     opts.ttl_ms    ?? null,
@@ -356,7 +352,7 @@ export function createSignalingClient(options = {}) {
       // Re-announce to refresh TTL in the server's peer registry.
       send(pspEnvelope('announce', {
         ttl_ms: 30000,
-        body: { capabilities, hints: { wants_peers: true, pub: myKeys.pub, epub: myKeys.epub } },
+        body: { instance_id: networkId, capabilities, hints: { wants_peers: true, pub: myKeys.pub, epub: myKeys.epub } },
       }))
     }, 12000)
   }
@@ -839,6 +835,11 @@ export function createSignalingClient(options = {}) {
 
     const msg = rawMsg
 
+    if (msg.session_id !== roomId) {
+      log(`[signal] ignoring ${msg.type} from ${fromPeerId} (different room)`)
+      return
+    }
+
     const conn = mesh.connections.get(fromPeerId)
     if (
       !conn &&
@@ -863,7 +864,7 @@ export function createSignalingClient(options = {}) {
         if (conn?.connection) {
           const incomingAnswerSdp = msg.body?.sdp ?? null
           if (!incomingAnswerSdp) break
-          const expectedSessionId = sessionIds.get(fromPeerId)
+          const expectedSessionId = roomId
           if (expectedSessionId && msg.session_id && msg.session_id !== expectedSessionId) {
             log(`[webrtc] ignoring answer from ${fromPeerId} (stale session)`)
             break
@@ -927,7 +928,7 @@ export function createSignalingClient(options = {}) {
       case 'ice_candidate': {
         const c = msg.body?.candidate
         if (!c) break
-        const expectedSessionId = sessionIds.get(fromPeerId)
+        const expectedSessionId = roomId
         if (expectedSessionId && msg.session_id && msg.session_id !== expectedSessionId) {
           log(`[webrtc] ignoring candidate from ${fromPeerId} (stale session)`)
           break
@@ -1065,6 +1066,9 @@ export function createSignalingClient(options = {}) {
     if (!wsUrl.searchParams.get('networkId')) {
       wsUrl.searchParams.set('networkId', networkId)
     }
+    if (!wsUrl.searchParams.get('room')) {
+      wsUrl.searchParams.set('room', roomId)
+    }
 
     setStatus('connecting')
     ws = new WebSocket(wsUrl.toString())
@@ -1085,6 +1089,7 @@ export function createSignalingClient(options = {}) {
         send(pspEnvelope('announce', {
           ttl_ms: 30000,
           body: {
+            instance_id: networkId,
             capabilities,
             hints: { wants_peers: true, pub: myKeys.pub, epub: myKeys.epub },
             ...(auth ? { auth } : {}),
@@ -1222,7 +1227,7 @@ export function createSignalingClient(options = {}) {
       if (!registered) return
       send(pspEnvelope('announce', {
         ttl_ms: 30000,
-        body: { capabilities: nextCapabilities, hints: { wants_peers: true } },
+        body: { instance_id: networkId, capabilities: nextCapabilities, hints: { wants_peers: true } },
       }))
     },
 
@@ -1242,7 +1247,6 @@ export function createSignalingClient(options = {}) {
         clearAnswerBurst(remotePeerId)
       }
       answerApplyInFlight.clear()
-      sessionIds.clear()
       remotePubKeys.clear()
       registered = false
       _releaseWakeLock()
@@ -1323,4 +1327,3 @@ export function createSignalingClient(options = {}) {
 
   return client
 }
-

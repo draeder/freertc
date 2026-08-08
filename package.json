@@ -40,6 +40,7 @@
     "wrangler.workers-dev.jsonc"
   ],
   "scripts": {
+    "test": "node --test test/*.test.js",
     "build": "worker-build --release",
     "dev": "node scripts/non-cloudflare-server.mjs",
     "dev:cf": "node scripts/dev-server.mjs",

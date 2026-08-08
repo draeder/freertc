@@ -14,7 +14,9 @@ import { createSignalingClient } from '../utils/signalingClient.js'
 export function useP2p({
   tech,          // ref<'raw'>
   serverUrl,     // ref<string>
-  topicHash,     // ref<string>   – SHA-256 hex of the room topic
+  networkId,     // ref<string>   – Network / PSP instance_id
+  roomId,        // ref<string>   – Room / PSP session_id
+  topicHash,     // legacy ref<string>; used for both scopes when explicit values are absent
   peerId,        // ref<string>   – this peer's unique ID
   sharedMagnet,  // ref<string>   – unused, kept for API compat
   onShare,       // fn(key, value) – called when this peer has data to share
@@ -85,7 +87,8 @@ export function useP2p({
 
   function _connectPeerOoo(modeLabel) {
     const rawUrl = String(toValue(serverUrl) || '').trim()
-    const networkId = String(toValue(topicHash) || '').trim()
+    const networkScope = String(toValue(networkId ?? topicHash) || '').trim()
+    const roomScope = String(toValue(roomId ?? topicHash) || '').trim()
     const localPeerId = String(toValue(peerId) || '').trim()
 
     if (!window.RTCPeerConnection) {
@@ -271,7 +274,8 @@ export function useP2p({
 
     _signalingClient = createSignalingClient({
       peerId: localPeerId,
-      networkId,
+      networkId: networkScope,
+      roomId: roomScope,
       signalUrl: rawUrl,
       iceServers: defaultIceServers,
       capabilities: { role: 'browser', mode: modeLabel.toLowerCase() },
@@ -290,7 +294,7 @@ export function useP2p({
         }
       },
       onRegistered: (message) => {
-        addLog('success', `Registered in network ${message.network ?? networkId}`)
+        addLog('success', `Registered in network ${message.network ?? networkScope}, room ${roomScope}`)
         isRegistered = true
         activeDialPeerIds.clear()
         lastDialAttemptAt.clear()
@@ -397,10 +401,11 @@ export function useP2p({
     logs.value = []
 
     const url = String(toValue(serverUrl) || '').trim()
-    const room = String(toValue(topicHash) || '').trim()
-    if (!url || !room) {
+    const networkScope = String(toValue(networkId ?? topicHash) || '').trim()
+    const roomScope = String(toValue(roomId ?? topicHash) || '').trim()
+    if (!url || !networkScope || !roomScope) {
       status.value = 'error'
-      addLog('warn', 'Enter both server URL and room/topic before connecting.')
+      addLog('warn', 'Enter a server URL, Network, and Room before connecting.')
       return
     }
 

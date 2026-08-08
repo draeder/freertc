@@ -1,5 +1,5 @@
 const PSP_VERSION = "1.0";
-const WORKER_VERSION = "0.1.31";
+const WORKER_VERSION = "0.1.32";
 
 const DISCOVERY_TYPES = new Set(["announce", "withdraw", "discover", "peer_list", "redirect"]);
 const NEGOTIATION_TYPES = new Set(["connect_request", "connect_accept", "connect_reject", "offer", "answer", "ice_candidate", "ice_end", "renegotiate"]);
@@ -24,8 +24,20 @@ const RELAY_EXPIRY_MS = 5 * 60_000;       // relay entry expires after 5 min wit
 const FEDERATION_INTERVAL_MS = 2 * 60_000; // re-heartbeat every 2 min per isolate
 const DEFAULT_HUB_URL = "wss://peer.ooo/ws"; // default bootstrap hub
 
-const livePeers = new Map(); // key: "network:peerId" -> { peerId, network, socket, lastSeen }
-const networkSubscribers = new Map(); // key: network -> Set of sockets
+const livePeers = new Map(); // key: JSON [network, room, peerId]
+const networkSubscribers = new Map(); // key: JSON [network, room] -> Set of sockets
+
+function normalizeRoom(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function scopeKey(network, room) {
+  return JSON.stringify([network, room]);
+}
+
+function peerScopeKey(network, room, peerId) {
+  return JSON.stringify([network, room, peerId]);
+}
 
 let lastFederationMs = 0; // tracks last heartbeat time within this isolate
 
@@ -136,9 +148,11 @@ async function handleListPeers(request, env) {
   if (!env.DB) return jsonResponse({ ok: false, error: "No database" }, 503);
   const url = new URL(request.url);
   const network = (url.searchParams.get("network") || "").trim();
+  const room = (url.searchParams.get("room") || url.searchParams.get("session_id") || "").trim();
   const excludePeerId = (url.searchParams.get("exclude") || "").trim();
   if (!network) return jsonResponse({ ok: false, error: "Missing network" }, 400);
-  const peers = await findPeers(env.DB, network, excludePeerId);
+  if (!room) return jsonResponse({ ok: false, error: "Missing room" }, 400);
+  const peers = await findPeers(env.DB, network, room, excludePeerId);
   return jsonResponse({ ok: true, peers });
 }
 
@@ -156,7 +170,8 @@ async function handleRelayForward(request, env) {
   if (!message.to || typeof message.to !== "string") {
     return jsonResponse({ ok: false, error: "Missing destination peer" }, 400);
   }
-  const liveKey = `${message.network}:${message.to}`;
+  const room = normalizeRoom(message.session_id);
+  const liveKey = peerScopeKey(message.network, room, message.to);
   const live = livePeers.get(liveKey);
   if (live) {
     try {
@@ -213,10 +228,10 @@ function relayHttpBase(wsUrl) {
 }
 
 // Query a remote relay's HTTP peer-list endpoint.
-async function queryRelayForPeers(relayUrl, network, requesterPeerId) {
+async function queryRelayForPeers(relayUrl, network, room, requesterPeerId) {
   try {
     const base = relayHttpBase(relayUrl);
-    const params = new URLSearchParams({ network });
+    const params = new URLSearchParams({ network, room });
     if (requesterPeerId) params.set("exclude", requesterPeerId);
     const resp = await fetch(`${base}/api/v1/peers?${params.toString()}`);
     if (!resp.ok) return [];
@@ -282,11 +297,12 @@ function mergeDiscoveredPeers(...peerGroups) {
   return Array.from(merged.values()).sort((left, right) => left.peer_id.localeCompare(right.peer_id));
 }
 
-function sendPeerList(socket, network, peers, to = null, from = "bootstrap-relay") {
+function sendPeerList(socket, network, room, peers, to = null, from = "bootstrap-relay") {
   socket.send(JSON.stringify({
     psp_version: PSP_VERSION,
     type: "peer_list",
     network,
+    session_id: room,
     from,
     to,
     message_id: crypto.randomUUID(),
@@ -296,9 +312,10 @@ function sendPeerList(socket, network, peers, to = null, from = "bootstrap-relay
   }));
 }
 
-// Broadcast peer list to all connected peers in a network
-async function broadcastPeerList(db, network) {
-  const sockets = networkSubscribers.get(network);
+// Broadcast only to peers in the same Network + Room scope.
+async function broadcastPeerList(db, network, room) {
+  const storageScope = scopeKey(network, room);
+  const sockets = networkSubscribers.get(storageScope);
   if (!sockets || sockets.size === 0) return;
 
   const now = Date.now();
@@ -308,7 +325,7 @@ async function broadcastPeerList(db, network) {
     WHERE network = ?1 AND expires_at_ms > ?2
     ORDER BY peer_id ASC
     LIMIT ?3
-  `).bind(network, now, MAX_BATCH).all();
+  `).bind(storageScope, now, MAX_BATCH).all();
 
   const peers = (result.results || []).map(row => ({
     peer_id: row.peer_id,
@@ -317,7 +334,7 @@ async function broadcastPeerList(db, network) {
   }));
   for (const socket of sockets) {
     try {
-      sendPeerList(socket, network, peers);
+      sendPeerList(socket, network, room, peers);
     } catch (e) {
       sockets.delete(socket);
     }
@@ -338,23 +355,24 @@ async function upsertAnnouncement(db, message) {
       session_id = excluded.session_id,
       expires_at_ms = excluded.expires_at_ms,
       updated_at_ms = excluded.updated_at_ms
-  `).bind(message.network, message.from, message.session_id || null, expiresAt, now).run();
+  `).bind(scopeKey(message.network, normalizeRoom(message.session_id)), message.from, message.session_id, expiresAt, now).run();
 }
 
-async function deleteAnnouncement(db, network, peerId) {
+async function deleteAnnouncement(db, network, room, peerId) {
   await db.prepare(`DELETE FROM psp_announcements WHERE network = ?1 AND peer_id = ?2`)
-    .bind(network, peerId).run();
+    .bind(scopeKey(network, room), peerId).run();
 }
 
-async function findPeers(db, network, requesterPeerId) {
+async function findPeers(db, network, room, requesterPeerId) {
   const now = Date.now();
+  const storageScope = scopeKey(network, room);
   const result = await db.prepare(`
     SELECT peer_id, session_id, updated_at_ms
     FROM psp_announcements
     WHERE network = ?1 AND peer_id != ?2 AND expires_at_ms > ?3
     ORDER BY peer_id ASC
     LIMIT ?4
-  `).bind(network, requesterPeerId, now, MAX_BATCH).all();
+  `).bind(storageScope, requesterPeerId, now, MAX_BATCH).all();
 
   return (result.results || []).map(row => ({
     peer_id: row.peer_id,
@@ -372,7 +390,7 @@ async function insertRelayMessage(db, message) {
     INSERT INTO psp_relay (network, to_peer_id, type, session_id, message_json, expires_at_ms, created_at_ms)
     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
   `).bind(
-    message.network,
+    scopeKey(message.network, normalizeRoom(message.session_id)),
     message.to,
     message.type,
     message.session_id || null,
@@ -382,7 +400,7 @@ async function insertRelayMessage(db, message) {
   ).run();
 }
 
-async function fetchRelayMessages(db, network, toPeerId) {
+async function fetchRelayMessages(db, network, room, toPeerId) {
   const now = Date.now();
   const result = await db.prepare(`
     SELECT id, message_json
@@ -390,7 +408,7 @@ async function fetchRelayMessages(db, network, toPeerId) {
     WHERE network = ?1 AND to_peer_id = ?2 AND expires_at_ms > ?3
     ORDER BY created_at_ms ASC
     LIMIT ?4
-  `).bind(network, toPeerId, now, MAX_BATCH).all();
+  `).bind(scopeKey(network, room), toPeerId, now, MAX_BATCH).all();
 
   return (result.results || []).map(row => ({
     id: row.id,
@@ -398,10 +416,10 @@ async function fetchRelayMessages(db, network, toPeerId) {
   }));
 }
 
-async function deliverQueuedRelayMessages(db, socket, network, peerId) {
+async function deliverQueuedRelayMessages(db, socket, network, room, peerId) {
   if (!db) return 0;
 
-  const queued = await fetchRelayMessages(db, network, peerId);
+  const queued = await fetchRelayMessages(db, network, room, peerId);
   if (queued.length === 0) return 0;
 
   console.log(`[OUT] Delivering ${queued.length} queued messages to ${peerId}`);
@@ -442,40 +460,45 @@ function handleWebSocket(request, env, ctx) {
 
   let peerKey = null;
   let network = null;
+  let room = null;
   let peerId = null;
 
   function cleanupPeerState() {
     const currentNetwork = network;
+    const currentRoom = room;
 
-    if (!network || !peerId) {
-      return currentNetwork;
+    if (!network || !room || !peerId) {
+      return currentNetwork && currentRoom ? scopeKey(currentNetwork, currentRoom) : null;
     }
 
     const currentPeerId = peerId;
-    const key = `${currentNetwork}:${currentPeerId}`;
+    const key = peerScopeKey(currentNetwork, currentRoom, currentPeerId);
+    const subscriberScope = scopeKey(currentNetwork, currentRoom);
 
     livePeers.delete(key);
     peerKey = null;
     peerId = null;
     network = null;
+    room = null;
 
     if (env.DB) {
       ctx.waitUntil(
-        deleteAnnouncement(env.DB, currentNetwork, currentPeerId)
-          .then(() => broadcastPeerList(env.DB, currentNetwork))
+        deleteAnnouncement(env.DB, currentNetwork, currentRoom, currentPeerId)
+          .then(() => broadcastPeerList(env.DB, currentNetwork, currentRoom))
           .catch(() => {})
       );
     }
 
-    return currentNetwork;
+    return subscriberScope;
   }
 
   server.addEventListener("message", async (event) => {
     try {
-      const result = await handleClientMessage(server, event.data, env, ctx, peerKey, network);
+      const result = await handleClientMessage(server, event.data, env, ctx, peerKey, network, room);
       if (result) {
         peerKey = result.peerKey;
         network = result.network;
+        room = result.room;
         peerId = result.peerId;
       }
     } catch (err) {
@@ -491,9 +514,9 @@ function handleWebSocket(request, env, ctx) {
   });
 
   server.addEventListener("close", () => {
-    const subscriberNetwork = cleanupPeerState();
-    if (subscriberNetwork) {
-      const sockets = networkSubscribers.get(subscriberNetwork);
+    const subscriberScope = cleanupPeerState();
+    if (subscriberScope) {
+      const sockets = networkSubscribers.get(subscriberScope);
       if (sockets) {
         sockets.delete(server);
       }
@@ -501,9 +524,9 @@ function handleWebSocket(request, env, ctx) {
   });
 
   server.addEventListener("error", () => {
-    const subscriberNetwork = cleanupPeerState();
-    if (subscriberNetwork) {
-      const sockets = networkSubscribers.get(subscriberNetwork);
+    const subscriberScope = cleanupPeerState();
+    if (subscriberScope) {
+      const sockets = networkSubscribers.get(subscriberScope);
       if (sockets) {
         sockets.delete(server);
       }
@@ -515,7 +538,7 @@ function handleWebSocket(request, env, ctx) {
   return new Response(null, { status: 101, webSocket: client });
 }
 
-async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null, prevNetwork = null) {
+async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null, prevNetwork = null, prevRoom = null) {
   try {
     if (!rawData) return null;
     if (rawData.length > MAX_MESSAGE_SIZE) return null;
@@ -542,35 +565,54 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
     }
 
     const { network, from: peerId, type } = message;
+    const room = normalizeRoom(message.session_id);
     const db = env.DB;
-    const peerKey = `${network}:${peerId}`;
+    const peerKey = peerScopeKey(network, room, peerId);
+    const subscriberScope = scopeKey(network, room);
 
-    if (message.to && message.to === peerId && RELAY_TYPES.has(type)) {
-      return { peerKey, network, peerId };
+    if (type === "announce" && message.body?.instance_id !== network) {
+      socket.send(JSON.stringify({
+        psp_version: PSP_VERSION,
+        type: "error",
+        network,
+        session_id: room,
+        from: env.RELAY_PEER_ID || "relay",
+        to: peerId,
+        message_id: crypto.randomUUID(),
+        timestamp: Date.now(),
+        ttl_ms: DEFAULT_TTL_MS,
+        body: { error: "instance_id must match network" }
+      }));
+      return null;
     }
 
-    // Subscribe to network on first message and whenever network changes on the same socket.
-    if (!prevPeerKey || prevNetwork !== network) {
-      if (prevNetwork && prevNetwork !== network) {
-        const oldSockets = networkSubscribers.get(prevNetwork);
+    if (message.to && message.to === peerId && RELAY_TYPES.has(type)) {
+      return { peerKey, network, room, peerId };
+    }
+
+    // Subscribe to the exact Network + Room scope. A domain is only a relay;
+    // domain boundaries do not replace application scope boundaries.
+    if (!prevPeerKey || prevNetwork !== network || prevRoom !== room) {
+      if (prevNetwork && prevRoom && (prevNetwork !== network || prevRoom !== room)) {
+        const oldSockets = networkSubscribers.get(scopeKey(prevNetwork, prevRoom));
         if (oldSockets) {
           oldSockets.delete(socket);
         }
       }
-      if (!networkSubscribers.has(network)) {
-        networkSubscribers.set(network, new Set());
+      if (!networkSubscribers.has(subscriberScope)) {
+        networkSubscribers.set(subscriberScope, new Set());
       }
-      networkSubscribers.get(network).add(socket);
-      console.log(`[NET] Peer ${peerId} subscribed to ${network}`);
+      networkSubscribers.get(subscriberScope).add(socket);
+      console.log(`[NET] Peer ${peerId} subscribed to network=${network} room=${room}`);
     }
 
     // Track live peer
-    livePeers.set(peerKey, { peerId, network, socket, lastSeen: Date.now() });
+    livePeers.set(peerKey, { peerId, network, room, socket, lastSeen: Date.now() });
 
     if (type === "announce") {
       if (db) {
         await upsertAnnouncement(db, message);
-        await deliverQueuedRelayMessages(db, socket, network, peerId);
+        await deliverQueuedRelayMessages(db, socket, network, room, peerId);
       }
       
       // Only broadcast peer_list when the peer is newly joining, not on heartbeat re-announces.
@@ -578,23 +620,23 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
       // no topology change occurred, so no need to push a new list to everyone.
       const isHeartbeat = prevPeerKey === peerKey;
       if (!isHeartbeat && db) {
-        console.log(`[NET] Broadcasting peer_list for ${network} after new announce from ${peerId}`);
-        broadcastPeerList(db, network).catch((err) => console.error(`[Broadcast error]`, err?.message));
+        console.log(`[NET] Broadcasting peer_list for network=${network} room=${room} after new announce from ${peerId}`);
+        broadcastPeerList(db, network, room).catch((err) => console.error(`[Broadcast error]`, err?.message));
       }
 
     } else if (type === "withdraw") {
       if (db) {
-        await deleteAnnouncement(db, network, peerId);
+        await deleteAnnouncement(db, network, room, peerId);
       }
       livePeers.delete(peerKey);
       if (db) {
-        broadcastPeerList(db, network).catch(() => {});
+        broadcastPeerList(db, network, room).catch(() => {});
       }
 
     } else if (type === "discover") {
       let localPeers = [];
       if (db) {
-        localPeers = await findPeers(db, network, peerId);
+        localPeers = await findPeers(db, network, room, peerId);
       }
 
       let remotePeers = [];
@@ -605,7 +647,7 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
 
         if (remoteUrls.length) {
           const results = await Promise.all(
-            remoteUrls.map(u => queryRelayForPeers(u, network, peerId))
+            remoteUrls.map(u => queryRelayForPeers(u, network, room, peerId))
           );
           remotePeers = results.flat();
         }
@@ -615,6 +657,7 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
         sendPeerList(
           socket,
           network,
+          room,
           mergeDiscoveredPeers(localPeers, remotePeers).filter(peer => peer.peer_id !== peerId),
           peerId,
           env.RELAY_PEER_ID || "bootstrap-relay"
@@ -635,30 +678,31 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
     } else if (type === "ping") {
       socket.send(JSON.stringify({
         psp_version: PSP_VERSION, type: "pong", network,
+        session_id: room,
         from: env.RELAY_PEER_ID || "relay", to: peerId,
         message_id: crypto.randomUUID(), timestamp: Date.now(),
         ttl_ms: DEFAULT_TTL_MS, body: {}
       }));
       if (db) {
-        await deliverQueuedRelayMessages(db, socket, network, peerId);
+        await deliverQueuedRelayMessages(db, socket, network, room, peerId);
       }
 
     } else if (type === "bye") {
       if (db) {
-        await deleteAnnouncement(db, network, peerId);
+        await deleteAnnouncement(db, network, room, peerId);
       }
       livePeers.delete(peerKey);
       if (db) {
-        broadcastPeerList(db, network).catch(() => {});
+        broadcastPeerList(db, network, room).catch(() => {});
       }
 
     } else if (RELAY_TYPES.has(type)) {
       // RTC negotiation messages - relay immediately if online, queue if offline
-      if (!message.to) return { peerKey, network, peerId };
-      if (message.to === peerId) return { peerKey, network, peerId };
+      if (!message.to) return { peerKey, network, room, peerId };
+      if (message.to === peerId) return { peerKey, network, room, peerId };
 
       // Try immediate delivery to live peer
-      const liveKey = `${network}:${message.to}`;
+      const liveKey = peerScopeKey(network, room, message.to);
       const live = livePeers.get(liveKey);
       let deliveredLive = false;
       if (live) {
@@ -696,7 +740,7 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
     }
 
     ctx.waitUntil(cleanupExpired(db).catch(() => {}));
-    return { peerKey, network, peerId };
+    return { peerKey, network, room, peerId };
   } catch (err) {
     console.error("[Handler] Error:", err?.message || String(err));
     return null;
@@ -704,13 +748,16 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
 }
 
 function validEnvelope(msg) {
-  return (
+  return Boolean(
     typeof msg === "object" && msg !== null &&
     msg.psp_version === PSP_VERSION &&
     typeof msg.type === "string" && MESSAGE_TYPES.has(msg.type) &&
     typeof msg.from === "string" && msg.from.trim() &&
     typeof msg.network === "string" && msg.network.trim() &&
+    typeof msg.session_id === "string" && msg.session_id.trim() &&
     typeof msg.message_id === "string" &&
     typeof msg.timestamp === "number"
   );
 }
+
+export { normalizeRoom, scopeKey, peerScopeKey, validEnvelope };

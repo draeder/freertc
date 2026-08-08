@@ -10,7 +10,7 @@ const RTC_CONFIG = {
     { urls: "stun:global.stun.twilio.com:3478" }
   ]
 };
-const SHARED_IDS_KEY = "freertc.shared.ids.v1";
+const SHARED_IDS_KEY = "freertc.scopes.v2";
 const UI_PREFS_KEY = "freertc.ui.prefs.v1";
 const DATA_PING_MS = 3000;
 const DATA_PONG_TIMEOUT_MS = 12000;
@@ -114,14 +114,6 @@ function normalizeText(value) {
   return String(value).trim();
 }
 
-function deriveNetworkFromSession(sessionIdValue) {
-  const session = normalizeText(sessionIdValue);
-  if (!session || !isSpecToken(session)) {
-    return "";
-  }
-  return `room:${session}`;
-}
-
 createApp({
   setup() {
     const host = window.location.host;
@@ -131,7 +123,7 @@ createApp({
     const status = ref("disconnected");
     const socket = ref(null);
 
-    const network = ref("room:test");
+    const network = ref("network:test");
 
     function normalizedWsUrlValue() {
       const trimmed = normalizeText(wsUrl.value);
@@ -140,7 +132,15 @@ createApp({
 
     function normalizedNetworkValue() {
       const trimmed = normalizeText(network.value);
-      return trimmed || "room:test";
+      return trimmed || "network:test";
+    }
+
+    function normalizedAppliedNetworkValue() {
+      return normalizeText(appliedNetwork.value) || normalizedNetworkValue();
+    }
+
+    function normalizedAppliedRoomValue() {
+      return normalizeText(appliedSessionId.value) || normalizeText(sessionId.value) || "room:test";
     }
 
     // Keep peer identity in-memory per tab so duplicate tabs cannot share IDs.
@@ -154,7 +154,10 @@ createApp({
     const appliedFromPeer = ref(fromPeer.value);
     const toPeer = ref("");
     const sessionId = ref("");
-    const instanceId = ref("");
+    const appliedSessionId = ref("");
+    // PSP instance_id is the network scope; keep one canonical value so they
+    // can never drift apart in the UI or on the wire.
+    const instanceId = computed(() => normalizedAppliedNetworkValue());
 
     const activeView = ref("webrtc");
     const relayType = ref("announce");
@@ -311,11 +314,11 @@ createApp({
         warnings.push("Signaling Server URL must be a valid absolute WebSocket URL");
       }
 
-      const topic = normalizeText(network.value);
-      if (!topic) {
-        warnings.push("Room / Topic is required");
-      } else if (!isSpecToken(topic)) {
-        warnings.push("Room / Topic should be 1-128 chars using A-Z, a-z, 0-9, . _ : / -");
+      const networkScope = normalizeText(network.value);
+      if (!networkScope) {
+        warnings.push("Network is required");
+      } else if (!isSpecToken(networkScope)) {
+        warnings.push("Network should be 1-128 chars using A-Z, a-z, 0-9, . _ : / -");
       }
 
       const localPeer = normalizePeerId(fromPeer.value);
@@ -328,18 +331,11 @@ createApp({
         warnings.push("To Peer must be empty or a token-safe, fingerprint-like peer ID");
       }
 
-      const sess = normalizeText(sessionId.value);
-      if (!sess) {
-        warnings.push("Session ID is required");
-      } else if (!isSpecToken(sess)) {
-        warnings.push("Session ID should be 1-128 chars using A-Z, a-z, 0-9, . _ : / -");
-      }
-
-      const inst = normalizeText(instanceId.value);
-      if (!inst) {
-        warnings.push("Instance ID is required");
-      } else if (!isSpecToken(inst)) {
-        warnings.push("Instance ID should be 1-128 chars using A-Z, a-z, 0-9, . _ : / -");
+      const roomScope = normalizeText(sessionId.value);
+      if (!roomScope) {
+        warnings.push("Room is required");
+      } else if (!isSpecToken(roomScope)) {
+        warnings.push("Room should be 1-128 chars using A-Z, a-z, 0-9, . _ : / -");
       }
 
       return warnings;
@@ -682,62 +678,79 @@ createApp({
 
     function initSharedIds() {
       const params = new URLSearchParams(window.location.search);
-      const sessionParam = normalizeText(params.get("session_id") || params.get("sessionId"));
-      const instanceParam = normalizeText(params.get("instance_id") || params.get("instanceId"));
+      const roomParam = normalizeText(
+        params.get("room") ||
+        params.get("room_id") ||
+        params.get("roomId") ||
+        params.get("session_id") ||
+        params.get("sessionId")
+      );
       const networkParam = normalizeText(
         params.get("network") ||
         params.get("network_id") ||
-        params.get("networkId")
+        params.get("networkId") ||
+        params.get("instance_id") ||
+        params.get("instanceId")
       );
 
-      const hasValidUrlSession = isSpecToken(sessionParam);
-      const hasValidUrlInstance = isSpecToken(instanceParam);
+      const hasValidUrlRoom = isSpecToken(roomParam);
       const hasValidUrlNetwork = isSpecToken(networkParam);
 
-      if (sessionParam && !hasValidUrlSession) {
-        pushLog("ids:error", "Ignoring invalid URL session_id");
-      }
-      if (instanceParam && !hasValidUrlInstance) {
-        pushLog("ids:error", "Ignoring invalid URL instance_id");
+      if (roomParam && !hasValidUrlRoom) {
+        pushLog("room:error", "Ignoring invalid URL room");
       }
       if (networkParam && !hasValidUrlNetwork) {
         pushLog("network:error", "Ignoring invalid URL network");
       }
 
-      sessionId.value = hasValidUrlSession ? sessionParam : `sess-${Math.random().toString(36).slice(2, 10)}`;
-      instanceId.value = hasValidUrlInstance ? instanceParam : `inst-${Math.random().toString(36).slice(2, 10)}`;
-
-      // Cross-domain links should land in the same room even when each origin has
-      // different sessionStorage UI state. URL network wins; otherwise derive from session_id.
-      const derivedNetwork = deriveNetworkFromSession(sessionId.value);
-      const nextNetwork = hasValidUrlNetwork ? networkParam : (derivedNetwork || normalizedNetworkValue());
+      const nextNetwork = hasValidUrlNetwork ? networkParam : normalizedNetworkValue();
+      const nextRoom = hasValidUrlRoom ? roomParam : `room-${Math.random().toString(36).slice(2, 10)}`;
       if (nextNetwork && nextNetwork !== network.value) {
         network.value = nextNetwork;
       }
       if (nextNetwork && nextNetwork !== appliedNetwork.value) {
         appliedNetwork.value = nextNetwork;
       }
+      sessionId.value = nextRoom;
+      appliedSessionId.value = nextRoom;
 
       persistSharedIds();
     }
 
     function persistSharedIds() {
+      const canonicalNetwork = normalizedNetworkValue();
+      const canonicalRoom = normalizeText(sessionId.value) || "room:test";
+      network.value = canonicalNetwork;
+      sessionId.value = canonicalRoom;
+
       localStorage.setItem(
         SHARED_IDS_KEY,
         JSON.stringify({
-          session_id: sessionId.value,
-          instance_id: instanceId.value
+          network: canonicalNetwork,
+          room: canonicalRoom,
+          instance_id: canonicalNetwork,
+          session_id: canonicalRoom
         })
       );
 
       const url = new URL(window.location.href);
-      url.searchParams.set("session_id", sessionId.value);
-      url.searchParams.set("instance_id", instanceId.value);
+      url.searchParams.set("network", canonicalNetwork);
+      url.searchParams.set("room", canonicalRoom);
+      url.searchParams.delete("network_id");
+      url.searchParams.delete("networkId");
+      url.searchParams.delete("room_id");
+      url.searchParams.delete("roomId");
+      url.searchParams.delete("session_id");
+      url.searchParams.delete("sessionId");
+      url.searchParams.delete("instance_id");
+      url.searchParams.delete("instanceId");
       window.history.replaceState(null, "", url);
 
-      pushLog("ids", {
-        session_id: sessionId.value,
-        instance_id: instanceId.value
+      pushLog("scope", {
+        network: canonicalNetwork,
+        room: canonicalRoom,
+        instance_id: canonicalNetwork,
+        session_id: canonicalRoom
       });
     }
 
@@ -808,11 +821,67 @@ createApp({
       }
     }
 
-    function regenerateSharedIds() {
-      sessionId.value = `sess-${Math.random().toString(36).slice(2, 10)}`;
-      instanceId.value = `inst-${Math.random().toString(36).slice(2, 10)}`;
+    function switchScope(nextNetworkValue, nextRoomValue, message) {
+      const nextNetwork = normalizeText(nextNetworkValue) || "network:test";
+      const nextRoom = normalizeText(nextRoomValue) || "room:test";
+      const previousNetwork = appliedNetwork.value || normalizedNetworkValue();
+      const previousRoom = appliedSessionId.value || normalizeText(sessionId.value);
+      const changed = nextNetwork !== previousNetwork || nextRoom !== previousRoom;
+
+      if (!changed) {
+        network.value = nextNetwork;
+        sessionId.value = nextRoom;
+        persistSharedIds();
+        return;
+      }
+
+      // Leave using the previously applied scope before changing the values on
+      // the wire. This prevents an existing direct channel from surviving a
+      // Network or Room change.
+      network.value = previousNetwork;
+      sessionId.value = previousRoom;
+      if (isConnected.value) {
+        const peers = new Set([
+          ...Array.from(meshLinks.keys()),
+          ...discoveredPeers.value.map((peer) => peer?.peer_id).filter((peerId) => typeof peerId === "string")
+        ]);
+        for (const peerId of peers) {
+          if (peerId && peerId !== fromPeer.value) {
+            sendRelayEnvelope("bye", { reason: "scope_changed" }, { to: peerId });
+          }
+        }
+        sendWithdraw();
+      }
+
+      reconnectLockedByBye = false;
+      byeCooldowns.clear();
+      failedPeerCooldowns.clear();
+      toPeer.value = "";
+      discoveredPeers.value = [];
+      stopAutomation();
+      stopRtc();
+      meshLinks.clear();
+
+      network.value = nextNetwork;
+      sessionId.value = nextRoom;
+      appliedNetwork.value = nextNetwork;
+      appliedSessionId.value = nextRoom;
       persistSharedIds();
-      pushLog("ids", "Generated new shared session_id and instance_id");
+      refreshMeshStats();
+      refreshSelectedPeerSnapshot();
+      pushLog("scope", message || `Switched to network ${nextNetwork}, room ${nextRoom}`);
+
+      if (isConnected.value) {
+        void beginRtc();
+      }
+    }
+
+    function regenerateNetworkAndRoom() {
+      switchScope(
+        `network-${Math.random().toString(36).slice(2, 10)}`,
+        `room-${Math.random().toString(36).slice(2, 10)}`,
+        "Generated a new Network and Room"
+      );
     }
 
     function regeneratePeerId() {
@@ -829,31 +898,13 @@ createApp({
     }
 
     function applyNetworkChange() {
-      const next = normalizeText(network.value) || "room:test";
-      const changed = next !== appliedNetwork.value;
-      network.value = next;
+      const next = normalizeText(network.value) || "network:test";
+      switchScope(next, sessionId.value, `Switched network to ${next}`);
+    }
 
-      if (!changed) {
-        return;
-      }
-      appliedNetwork.value = next;
-
-      reconnectLockedByBye = false;
-      byeCooldowns.clear();
-      failedPeerCooldowns.clear();
-      toPeer.value = "";
-      discoveredPeers.value = [];
-
-      stopAutomation();
-      stopRtc();
-      meshLinks.clear();
-      refreshMeshStats();
-      refreshSelectedPeerSnapshot();
-      pushLog("network", `Switched to ${network.value}`);
-
-      if (isConnected.value) {
-        void beginRtc();
-      }
+    function applyRoomChange() {
+      const next = normalizeText(sessionId.value) || "room:test";
+      switchScope(network.value, next, `Switched room to ${next}`);
     }
 
     function applyWsUrlChange() {
@@ -921,10 +972,7 @@ createApp({
       }
 
       // Keep network token stable even if the editable field has trailing spaces.
-      const stableNetwork = normalizedNetworkValue();
-      if (stableNetwork !== network.value) {
-        network.value = stableNetwork;
-      }
+      const stableNetwork = normalizedAppliedNetworkValue();
 
       const outbound = {
         ...envelope,
@@ -951,7 +999,7 @@ createApp({
         network: network.value,
         from: fromPeer.value,
         to: target,
-        session_id: sessionId.value,
+        session_id: normalizedAppliedRoomValue(),
         message_id: newId(type),
         timestamp: now(),
         ttl_ms: 30000,
@@ -1073,7 +1121,7 @@ createApp({
         network: network.value,
         from: fromPeer.value,
         to: null,
-        session_id: sessionId.value,
+        session_id: normalizedAppliedRoomValue(),
         message_id: newId("announce"),
         timestamp: now(),
         ttl_ms: 30000,
@@ -1104,7 +1152,7 @@ createApp({
         network: network.value,
         from: fromPeer.value,
         to: null,
-        session_id: null,
+        session_id: normalizedAppliedRoomValue(),
         message_id: newId("withdraw"),
         timestamp: now(),
         ttl_ms: 30000,
@@ -1122,7 +1170,7 @@ createApp({
         network: network.value,
         from: fromPeer.value,
         to: null,
-        session_id: null,
+        session_id: normalizedAppliedRoomValue(),
         message_id: newId("discover"),
         timestamp: now(),
         ttl_ms: 30000,
@@ -1138,7 +1186,7 @@ createApp({
     }
 
     function isMatchingSessionId(value) {
-      return normalizeText(value) === normalizeText(sessionId.value);
+      return normalizeText(value) === normalizedAppliedRoomValue();
     }
 
     function sendPing(peerId = toPeer.value || null) {
@@ -1158,7 +1206,7 @@ createApp({
         network: network.value,
         from: fromPeer.value,
         to: peerId,
-        session_id: null,
+        session_id: normalizedAppliedRoomValue(),
         message_id: newId("ping"),
         timestamp: now(),
         ttl_ms: 30000,
@@ -2575,7 +2623,7 @@ createApp({
             network: network.value || "room:test",
             from: fromPeer.value,
             to: null,
-            session_id: null,
+            session_id: normalizedAppliedRoomValue(),
             message_id: crypto.randomUUID(),
             timestamp: Date.now(),
             ttl_ms: 30000,
@@ -2596,7 +2644,7 @@ createApp({
           network: network.value || "room:test",
           from: fromPeer.value,
           to: null,
-          session_id: null,
+          session_id: normalizedAppliedRoomValue(),
           message_id: crypto.randomUUID(),
           timestamp: Date.now(),
           ttl_ms: 30000,
@@ -2646,7 +2694,6 @@ createApp({
       fromPeer,
       toPeer,
       sessionId,
-      instanceId,
       relayType,
       relayBody,
       discoveredPeers,
@@ -2686,6 +2733,7 @@ createApp({
       disconnect,
       applyWsUrlChange,
       applyNetworkChange,
+      applyRoomChange,
       applyFromPeerChange,
       sendAnnounce,
       sendDiscover,
@@ -2698,8 +2746,7 @@ createApp({
       sendChat,
       hangup,
       regeneratePeerId,
-      regenerateSharedIds,
-      persistSharedIds,
+      regenerateNetworkAndRoom,
       selectPeer,
       selectPeerFromUi,
       handleSpecLinkClick
@@ -2762,8 +2809,12 @@ createApp({
               <input class="stat-input mono" v-model="wsUrl" @change="applyWsUrlChange" placeholder="wss://peer.ooo/ws">
             </div>
             <div class="stat-card">
-              <div class="stat-label">Room / Topic</div>
-              <input class="stat-input mono" v-model="network" @change="applyNetworkChange" placeholder="room:abc">
+              <div class="stat-label">Network</div>
+              <input class="stat-input mono" v-model="network" @change="applyNetworkChange" placeholder="network:abc">
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Room</div>
+              <input class="stat-input mono" v-model="sessionId" @change="applyRoomChange" placeholder="room:abc">
             </div>
             <div class="stat-card">
               <div class="stat-label">Your Peer ID</div>
@@ -2775,7 +2826,7 @@ createApp({
             <button @click="connect" :disabled="!canConnect">Connect</button>
             <button class="secondary" @click="disconnect" :disabled="!canDisconnect">Disconnect</button>
             <button class="secondary" @click="regeneratePeerId">New Peer ID</button>
-            <button class="secondary" @click="regenerateSharedIds">Regenerate Session + Instance IDs</button>
+            <button class="secondary" @click="regenerateNetworkAndRoom">New Network + Room</button>
           </div>
 
           <div class="metrics">
@@ -2807,24 +2858,16 @@ createApp({
             </label>
             <label>
               Network
-              <input v-model="network" placeholder="room:abc" @change="applyNetworkChange">
+              <input v-model="network" placeholder="network:abc" @change="applyNetworkChange">
+            </label>
+            <label>
+              Room
+              <input v-model="sessionId" placeholder="room:abc" @change="applyRoomChange">
             </label>
           </div>
           <div class="row">
             <span class="pill"><strong>mesh</strong> {{ meshConnectedCount }}/{{ meshTargetCount }} connected</span>
-          </div>
-          <div class="field-grid">
-            <label>
-              Session ID
-              <input v-model="sessionId" @change="persistSharedIds">
-            </label>
-            <label>
-              Instance ID
-              <input v-model="instanceId" @change="persistSharedIds">
-            </label>
-          </div>
-          <div class="row">
-            <button class="secondary" @click="regenerateSharedIds">Regenerate Session + Instance IDs</button>
+            <button class="secondary" @click="regenerateNetworkAndRoom">New Network + Room</button>
           </div>
           <div class="row">
             <button :class="{ active: announceFlash }" @click="sendAnnounce" :disabled="!isConnected">{{ announceButtonLabel }}</button>
