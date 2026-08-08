@@ -1,4 +1,5 @@
 const PSP_VERSION = "1.0";
+const WORKER_VERSION = "0.1.31";
 
 const DISCOVERY_TYPES = new Set(["announce", "withdraw", "discover", "peer_list", "redirect"]);
 const NEGOTIATION_TYPES = new Set(["connect_request", "connect_accept", "connect_reject", "offer", "answer", "ice_candidate", "ice_end", "renegotiate"]);
@@ -63,7 +64,12 @@ export default {
     }
 
     if (url.pathname === "/health") {
-      return jsonResponse({ ok: true, version: PSP_VERSION, peers: livePeers.size }, 200);
+      return jsonResponse({
+        ok: true,
+        version: WORKER_VERSION,
+        protocol_version: PSP_VERSION,
+        peers: livePeers.size
+      }, 200);
     }
 
     // Federation: relay registry endpoints (any worker can serve these from its own D1)
@@ -73,6 +79,20 @@ export default {
       }
       if (request.method === "POST") {
         return handleRegisterRelay(request, env);
+      }
+      return jsonResponse({ ok: false, error: "Method not allowed" }, 405);
+    }
+
+    if (url.pathname === "/api/v1/peers") {
+      if (request.method === "GET") {
+        return handleListPeers(request, env);
+      }
+      return jsonResponse({ ok: false, error: "Method not allowed" }, 405);
+    }
+
+    if (url.pathname === "/api/v1/relay") {
+      if (request.method === "POST") {
+        return handleRelayForward(request, env);
       }
       return jsonResponse({ ok: false, error: "Method not allowed" }, 405);
     }
@@ -110,6 +130,42 @@ async function handleRegisterRelay(request, env) {
   await upsertRelay(env.DB, normalizedUrl, body.name || null);
   const relays = await listRelays(env.DB);
   return jsonResponse({ ok: true, relays });
+}
+
+async function handleListPeers(request, env) {
+  if (!env.DB) return jsonResponse({ ok: false, error: "No database" }, 503);
+  const url = new URL(request.url);
+  const network = (url.searchParams.get("network") || "").trim();
+  const excludePeerId = (url.searchParams.get("exclude") || "").trim();
+  if (!network) return jsonResponse({ ok: false, error: "Missing network" }, 400);
+  const peers = await findPeers(env.DB, network, excludePeerId);
+  return jsonResponse({ ok: true, peers });
+}
+
+async function handleRelayForward(request, env) {
+  if (!env.DB) return jsonResponse({ ok: false, error: "No database" }, 503);
+  let body;
+  try { body = await request.json(); } catch { return jsonResponse({ ok: false, error: "Invalid JSON" }, 400); }
+  const message = body?.message || body;
+  if (!validEnvelope(message)) {
+    return jsonResponse({ ok: false, error: "Invalid PSP envelope" }, 400);
+  }
+  if (!RELAY_TYPES.has(message.type)) {
+    return jsonResponse({ ok: false, error: "Unsupported relay message type" }, 400);
+  }
+  if (!message.to || typeof message.to !== "string") {
+    return jsonResponse({ ok: false, error: "Missing destination peer" }, 400);
+  }
+  const liveKey = `${message.network}:${message.to}`;
+  const live = livePeers.get(liveKey);
+  if (live) {
+    try {
+      live.socket.send(JSON.stringify(message));
+      return jsonResponse({ ok: true, delivered: true }, 200);
+    } catch {}
+  }
+  await insertRelayMessage(env.DB, message);
+  return jsonResponse({ ok: true, delivered: false, queued: true }, 202);
 }
 
 // POST to the global hub; cache returned relay list into own D1 so both sides know each other
@@ -156,86 +212,31 @@ function relayHttpBase(wsUrl) {
   return wsUrl.replace(/^wss?:\/\//, (m) => m === "wss://" ? "https://" : "http://").replace(/\/ws$/, "");
 }
 
-// Open a short-lived WebSocket to a remote relay: get its peer list and exchange relay lists
-async function queryRelayForPeers(relayUrl, network, selfRelayId, db, selfKnownRelays) {
+// Query a remote relay's HTTP peer-list endpoint.
+async function queryRelayForPeers(relayUrl, network, requesterPeerId) {
   try {
-    const resp = await fetch(relayUrl, { headers: { Upgrade: "websocket" } });
-    if (resp.status !== 101) return [];
-    const ws = resp.webSocket;
-    ws.accept();
-
-    return await new Promise((resolve) => {
-      const timer = setTimeout(() => { try { ws.close(); } catch {} resolve([]); }, 4000);
-      let gotPeerList = false;
-
-      ws.addEventListener("message", async (ev) => {
-        try {
-          const msg = JSON.parse(ev.data);
-          if (msg.type === "peer_list" && msg.network === network && !gotPeerList) {
-            gotPeerList = true;
-            clearTimeout(timer);
-            ws.close();
-            resolve((msg.body?.peers || []).map(p => ({ ...p, relay_url: relayUrl })));
-          }
-          // Cache any relay list the remote sends us via ext
-          if (msg.type === "ext" && msg.body?.action === "relay_list" && db) {
-            const remoteRelays = msg.body.relays || [];
-            await Promise.all(
-              remoteRelays.map(r => r.url ? upsertRelay(db, r.url, r.name || null).catch(() => {}) : null)
-            );
-          }
-        } catch {}
-      });
-
-      ws.addEventListener("error", () => { clearTimeout(timer); resolve([]); });
-      ws.addEventListener("close", () => { if (!gotPeerList) { clearTimeout(timer); resolve([]); } });
-
-      const relayPeerId = selfRelayId || "relay-bridge";
-      // Announce as relay bridge
-      ws.send(JSON.stringify({
-        psp_version: PSP_VERSION, type: "announce", network,
-        from: relayPeerId, message_id: crypto.randomUUID(),
-        timestamp: Date.now(), ttl_ms: 10_000, body: { capabilities: { relay: true } }
-      }));
-      // Share our known relay list so the remote can cache us
-      if (selfKnownRelays?.length) {
-        ws.send(JSON.stringify({
-          psp_version: PSP_VERSION, type: "ext", network,
-          from: relayPeerId, message_id: crypto.randomUUID(),
-          timestamp: Date.now(), ttl_ms: 10_000,
-          body: { action: "relay_list", relays: selfKnownRelays }
-        }));
-      }
-      // Request their peers
-      ws.send(JSON.stringify({
-        psp_version: PSP_VERSION, type: "discover", network,
-        from: relayPeerId, message_id: crypto.randomUUID(),
-        timestamp: Date.now(), ttl_ms: 10_000, body: {}
-      }));
-    });
+    const base = relayHttpBase(relayUrl);
+    const params = new URLSearchParams({ network });
+    if (requesterPeerId) params.set("exclude", requesterPeerId);
+    const resp = await fetch(`${base}/api/v1/peers?${params.toString()}`);
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    const peers = Array.isArray(data?.peers) ? data.peers : [];
+    return peers.map(p => ({ ...p, relay_url: relayUrl }));
   } catch {
     return [];
   }
 }
 
-// Open a short-lived WebSocket to a remote relay and forward a PSP message through it
+// Forward a PSP message through a remote relay's HTTP endpoint.
 async function forwardToRelay(relayUrl, message, selfRelayId) {
   try {
-    const wsUrl = relayUrl;
-    const resp = await fetch(wsUrl, { headers: { Upgrade: "websocket" } });
-    if (resp.status !== 101) return;
-    const ws = resp.webSocket;
-    ws.accept();
-
-    // Outbound Worker WebSocket: send immediately after accept(), no open event needed
-    const relayPeerId = selfRelayId || "relay-bridge";
-    ws.send(JSON.stringify({
-      psp_version: PSP_VERSION, type: "announce", network: message.network,
-      from: relayPeerId, message_id: crypto.randomUUID(),
-      timestamp: Date.now(), ttl_ms: 10_000, body: { capabilities: { relay: true } }
-    }));
-    ws.send(JSON.stringify(message));
-    ws.close();
+    const base = relayHttpBase(relayUrl);
+    await fetch(`${base}/api/v1/relay`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message, via: selfRelayId || "relay-bridge" })
+    });
   } catch {}
 }
 
@@ -544,6 +545,10 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
     const db = env.DB;
     const peerKey = `${network}:${peerId}`;
 
+    if (message.to && message.to === peerId && RELAY_TYPES.has(type)) {
+      return { peerKey, network, peerId };
+    }
+
     // Subscribe to network on first message and whenever network changes on the same socket.
     if (!prevPeerKey || prevNetwork !== network) {
       if (prevNetwork && prevNetwork !== network) {
@@ -594,14 +599,13 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
 
       let remotePeers = [];
       if (env.RELAY_URL && env.DB) {
-        const selfRelayId = env.RELAY_PEER_ID || "relay-bridge";
         const selfUrl = normalizeRelayUrl(env.RELAY_URL);
         const allRelays = await listRelays(env.DB);
         const remoteUrls = allRelays.map(r => r.url).filter(u => u !== selfUrl);
 
         if (remoteUrls.length) {
           const results = await Promise.all(
-            remoteUrls.map(u => queryRelayForPeers(u, network, selfRelayId, env.DB, allRelays))
+            remoteUrls.map(u => queryRelayForPeers(u, network, peerId))
           );
           remotePeers = results.flat();
         }
@@ -651,6 +655,7 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
     } else if (RELAY_TYPES.has(type)) {
       // RTC negotiation messages - relay immediately if online, queue if offline
       if (!message.to) return { peerKey, network, peerId };
+      if (message.to === peerId) return { peerKey, network, peerId };
 
       // Try immediate delivery to live peer
       const liveKey = `${network}:${message.to}`;

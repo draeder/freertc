@@ -33,6 +33,7 @@ When you run the CLI from your project directory, `freertc` copies the required 
 - Stores peer announcements in Cloudflare D1 (`psp_announcements`).
 - Stores directed signaling messages in Cloudflare D1 (`psp_relay`).
 - Exposes a simple relay registry at `/api/v1/relays` when D1 is configured.
+- Exposes federation peer lookup at `/api/v1/peers` and message forwarding at `/api/v1/relay`.
 - Delivers queued relay messages when peers reconnect.
 - Serves the browser demo from `public/`.
 
@@ -216,7 +217,7 @@ Quick checks:
 Expected `/health` response includes JSON like:
 
 ```json
-{"ok":true,"version":"1.0","peers":0}
+{"ok":true,"version":"0.1.31","protocol_version":"1.0","peers":0}
 ```
 
 ## Auto WebRTC two-tab test
@@ -244,4 +245,3 @@ The demo defaults to Auto WebRTC and performs real offer/answer + ICE exchange o
 
 - TTL is enforced using `timestamp + ttl_ms` (default 30 seconds, max 120 seconds).
 - Malformed envelopes produce [PSP](https://github.com/draeder/Peer-Signaling-Protocol-Specification) `error` responses.
-

@@ -123,6 +123,39 @@ export function createSignalingClient(options = {}) {
   let onConnectionStateChangeCb = onConnectionStateChange
   let lastBootstrapCountLogged = null
 
+  // ── Wake Lock ─────────────────────────────────────────────────────────────
+  // Acquired while we have active peer connections so the browser doesn't
+  // throttle timers or freeze the tab mid-session.
+  let _wakeLock = null
+
+  async function _acquireWakeLock() {
+    if (_wakeLock) return
+    if (typeof navigator === 'undefined' || !('wakeLock' in navigator)) return
+    try {
+      _wakeLock = await navigator.wakeLock.request('screen')
+      _wakeLock.addEventListener('release', () => {
+        _wakeLock = null
+        log('[wakelock] screen wake lock released')
+      })
+      log('[wakelock] screen wake lock acquired')
+    } catch {
+      // Permission denied or API unavailable — not fatal.
+    }
+  }
+
+  function _releaseWakeLock() {
+    if (!_wakeLock) return
+    try { _wakeLock.release() } catch { /* ignore */ }
+    _wakeLock = null
+  }
+
+  // Re-acquire the wake lock whenever the tab becomes visible again, since
+  // the browser automatically releases it on tab hide.
+  function _reacquireWakeLockIfNeeded() {
+    if (typeof document === 'undefined' || document.hidden) return
+    if (!stoppedByUser && registered) _acquireWakeLock()
+  }
+
   // Pending ICE candidate queues — keyed by peerId.
   const pendingCandidates = new Map()
   // Serialize incoming offer processing per remote peer.
@@ -378,6 +411,7 @@ export function createSignalingClient(options = {}) {
     channel.onopen = () => {
       log(`[webrtc] data channel open to ${remotePeerId}`)
       lastPongAt = Date.now()
+      _acquireWakeLock()
 
       if (typeof document !== 'undefined') {
         document.removeEventListener('visibilitychange', onVisible)
@@ -462,6 +496,11 @@ export function createSignalingClient(options = {}) {
       }
       const closedEntry = mesh.connections.get(remotePeerId)
       if (closedEntry?.channel === channel) closedEntry.channel = null
+      // Release the wake lock if no more open data channels remain.
+      const anyOpen = [...mesh.connections.values()].some(
+        (e) => e.channel?.readyState === 'open'
+      )
+      if (!anyOpen) _releaseWakeLock()
     }
 
     channel.onerror = (evt) => {
@@ -1108,10 +1147,33 @@ export function createSignalingClient(options = {}) {
     client.disconnect()
   }
 
+  function handleFreeze() {
+    // Page Lifecycle API: tab is about to be frozen (CPU-suspended).
+    // Proactively send a withdraw so the server removes this peer before the
+    // WebSocket is force-closed by the OS.
+    if (registered && ws?.readyState === WebSocket.OPEN) {
+      try {
+        send(pspEnvelope('withdraw', { body: { reason: 'tab_freeze' } }))
+      } catch { /* ignore */ }
+    }
+    // Mark all connected peers as recovering so they are re-verified on resume.
+    for (const entry of mesh.connections.values()) {
+      if (entry.state === 'connected') entry.state = 'recovering'
+    }
+    _releaseWakeLock()
+  }
+
+  function handlePageShow(event) {
+    // bfcache restore: the page is shown from the browser's back/forward cache.
+    // The WebSocket is dead at this point — reconnect exactly as on freeze→resume.
+    if (event.persisted) handleVisibilityChange()
+  }
+
   function handleVisibilityChange() {
     if (typeof document === 'undefined' || document.hidden) return
     // Tab became visible (or resumed from freeze) — check if WebSocket dropped
     // while the tab was inactive.
+    _reacquireWakeLockIfNeeded()
     if (!stoppedByUser) {
       if (!ws || (ws.readyState !== WebSocket.OPEN && ws.readyState !== WebSocket.CONNECTING)) {
         log('[signal] tab visible — WebSocket dropped while hidden, reconnecting')
@@ -1183,14 +1245,17 @@ export function createSignalingClient(options = {}) {
       sessionIds.clear()
       remotePubKeys.clear()
       registered = false
+      _releaseWakeLock()
 
       if (typeof window !== 'undefined') {
         window.removeEventListener('beforeunload', unloadHandler)
+        window.removeEventListener('pageshow', handlePageShow)
       }
 
       if (typeof document !== 'undefined') {
         document.removeEventListener('visibilitychange', handleVisibilityChange)
         document.removeEventListener('resume', handleVisibilityChange)
+        document.removeEventListener('freeze', handleFreeze)
       }
 
       if (ws) {
@@ -1241,6 +1306,8 @@ export function createSignalingClient(options = {}) {
 
   if (typeof window !== 'undefined') {
     window.addEventListener('beforeunload', unloadHandler, { once: true })
+    // bfcache: restore from back/forward cache.
+    window.addEventListener('pageshow', handlePageShow)
   }
 
   if (typeof document !== 'undefined') {
@@ -1248,6 +1315,8 @@ export function createSignalingClient(options = {}) {
     // Page Lifecycle API: fires when a frozen tab is thawed back to active.
     // This is distinct from visibilitychange and fires first on resume.
     document.addEventListener('resume', handleVisibilityChange)
+    // Page Lifecycle API: fires just before the tab CPU is suspended.
+    document.addEventListener('freeze', handleFreeze)
   }
 
   if (autoConnect) client.connect()
