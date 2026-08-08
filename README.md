@@ -28,7 +28,7 @@ When you run the CLI from your project directory, `freertc` copies the required 
 ## What this worker does
 
 - Accepts WebSocket client connections at `/ws`.
-- Validates [PSP](https://github.com/draeder/Peer-Signaling-Protocol-Specification) message envelopes (`psp_version`, `type`, `network`, `from`, `message_id`, `timestamp`).
+- Validates [PSP](https://github.com/draeder/Peer-Signaling-Protocol-Specification) message envelopes (`psp_version`, `type`, `network`, `session_id`, `from`, `message_id`, `timestamp`).
 - Supports discovery, negotiation, control, and extension message types.
 - Stores peer announcements in Cloudflare D1 (`psp_announcements`).
 - Stores directed signaling messages in Cloudflare D1 (`psp_relay`).
@@ -36,6 +36,15 @@ When you run the CLI from your project directory, `freertc` copies the required 
 - Exposes federation peer lookup at `/api/v1/peers` and message forwarding at `/api/v1/relay`.
 - Delivers queued relay messages when peers reconnect.
 - Serves the browser demo from `public/`.
+
+## Network and Room scopes
+
+The browser UI uses two distinct scopes:
+
+- **Network** maps to the PSP envelope `network` and announce `instance_id`.
+- **Room** maps to the PSP envelope `session_id`.
+
+Peers are discoverable and relay messages are deliverable only when both Network and Room match. The relay domain is not an isolation boundary: `peer.ooo` and `decentralize.ooo` can federate peers that deliberately use the same Network and Room.
 
 ## Runtime scope
 
@@ -217,7 +226,7 @@ Quick checks:
 Expected `/health` response includes JSON like:
 
 ```json
-{"ok":true,"version":"0.1.31","protocol_version":"1.0","peers":0}
+{"ok":true,"version":"0.1.32","protocol_version":"1.0","peers":0}
 ```
 
 ## Auto WebRTC two-tab test
@@ -225,7 +234,7 @@ Expected `/health` response includes JSON like:
 The demo defaults to Auto WebRTC and performs real offer/answer + ICE exchange over this Worker.
 
 1. Open `http://127.0.0.1:8787/` in two tabs.
-2. Set both tabs to the same `network` and `session_id`.
+2. Set both tabs to the same **Network** and **Room**.
 3. Set opposite peer IDs using random hex strings:
    - Tab A `from`: `fc2142e44ec5c76f1bd46ccbb1eb2ed48f66f64260a5299c871f37ac742fa0c9`
    - Tab B `from`: `3e45d44c4ce4f9304a53f42b978fd13d23f85df4d97a88f8eb33ec13a2f8f7b1`
@@ -235,8 +244,9 @@ The demo defaults to Auto WebRTC and performs real offer/answer + ICE exchange o
 
 ## Minimal client expectations
 
-- Send `announce` first to bind socket identity (`from`, `network`).
-- Include `session_id` for negotiation messages.
+- Send `announce` first to bind socket identity (`from`, `network`, `session_id`).
+- Set announce `body.instance_id` to the same value as `network`.
+- Include the Room as `session_id` on every message.
 - Include `to` for directed messages.
 - Use periodic `announce` to refresh presence TTL and receive queued relay messages.
 - Use `ping` for liveness (`pong`) and keepalive.
