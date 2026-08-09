@@ -312,6 +312,22 @@ function sendPeerList(socket, network, room, peers, to = null, from = "bootstrap
   }));
 }
 
+function createRegistrationAck(message, relayPeerId = "bootstrap-relay") {
+  return {
+    psp_version: PSP_VERSION,
+    type: "ack",
+    network: message.network,
+    session_id: normalizeRoom(message.session_id),
+    from: relayPeerId,
+    to: message.from,
+    message_id: crypto.randomUUID(),
+    reply_to: message.message_id,
+    timestamp: Date.now(),
+    ttl_ms: DEFAULT_TTL_MS,
+    body: { status: "ok", action: "announce" }
+  };
+}
+
 // Broadcast only to peers in the same Network + Room scope.
 async function broadcastPeerList(db, network, room) {
   const storageScope = scopeKey(network, room);
@@ -614,6 +630,13 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
         await upsertAnnouncement(db, message);
         await deliverQueuedRelayMessages(db, socket, network, room, peerId);
       }
+
+      // Registration is complete only after the relay has accepted the
+      // announcement. Clients use this ACK to begin discovery and signaling.
+      socket.send(JSON.stringify(createRegistrationAck(
+        message,
+        env.RELAY_PEER_ID || "bootstrap-relay"
+      )));
       
       // Only broadcast peer_list when the peer is newly joining, not on heartbeat re-announces.
       // prevPeerKey === peerKey means same peer on the same socket sending a periodic keep-alive;
@@ -760,4 +783,4 @@ function validEnvelope(msg) {
   );
 }
 
-export { normalizeRoom, scopeKey, peerScopeKey, validEnvelope };
+export { createRegistrationAck, normalizeRoom, scopeKey, peerScopeKey, validEnvelope };

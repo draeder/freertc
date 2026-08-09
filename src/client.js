@@ -961,18 +961,25 @@ export function createSignalingClient(options = {}) {
   }
 
   function handleMessage(msg) {
+    const completeRegistration = (registrationMessage, source = 'ack') => {
+      if (registered) return
+      registered = true
+      setStatus('registered')
+      log(`[signal] registered as ${peerId} on network ${networkId} (${source})`)
+      startAdvertiseHeartbeat()
+      onRegistered?.(registrationMessage)
+    }
+
     switch (msg.type) {
       case 'ack':
-        if (!registered && msg.body?.status === 'ok') {
-          registered = true
-          setStatus('registered')
-          log(`[signal] registered as ${peerId} on network ${networkId}`)
-          startAdvertiseHeartbeat()
-          onRegistered?.(msg)
-        }
+        if (msg.body?.status === 'ok') completeRegistration(msg)
         break
 
       case 'peer_list': {
+        // Older FreeRTC relays broadcast a scoped peer_list after accepting an
+        // announcement but did not send the explicit ACK. Receiving that list
+        // proves registration and keeps new clients compatible with them.
+        completeRegistration(msg, 'peer_list')
         const rawPeers = msg.body?.peers ?? []
         if (rawPeers.length !== lastBootstrapCountLogged) {
           lastBootstrapCountLogged = rawPeers.length

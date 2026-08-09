@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { peerScopeKey, scopeKey, validEnvelope } from "../src/index.js";
+import { createRegistrationAck, peerScopeKey, scopeKey, validEnvelope } from "../src/index.js";
 
 const envelope = {
   psp_version: "1.0",
@@ -40,4 +40,15 @@ test("Room is required on every client envelope", () => {
   assert.equal(validEnvelope(envelope), true);
   assert.equal(validEnvelope({ ...envelope, session_id: "" }), false);
   assert.equal(validEnvelope({ ...envelope, session_id: null }), false);
+});
+
+test("accepted announcements receive a scoped registration acknowledgement", () => {
+  const ack = createRegistrationAck(envelope, "relay-one");
+  assert.equal(ack.type, "ack");
+  assert.equal(ack.network, envelope.network);
+  assert.equal(ack.session_id, envelope.session_id);
+  assert.equal(ack.to, envelope.from);
+  assert.equal(ack.reply_to, envelope.message_id);
+  assert.deepEqual(ack.body, { status: "ok", action: "announce" });
+  assert.equal(validEnvelope(ack), true);
 });
