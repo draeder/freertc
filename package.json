@@ -1,7 +1,7 @@
 {
   "name": "freertc",
-  "version": "0.1.1",
-  "description": "Cloudflare Worker signaling relay for WebRTC peers with D1 storage.",
+  "version": "0.2.0",
+  "description": "WebRTC browser client and Cloudflare Worker signaling relay with D1 storage.",
   "keywords": [
     "webrtc",
     "signaling",
@@ -20,6 +20,10 @@
   "bin": {
     "freertc": "bin/freertc.mjs"
   },
+  "exports": {
+    "./client": "./src/client.js",
+    "./package.json": "./package.json"
+  },
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -35,6 +39,7 @@
     "scripts/postinstall-message.mjs",
     "scripts/project-bootstrap.mjs",
     "scripts/wrangler-install-wizard.mjs",
+    "src/client.js",
     "src/index.js",
     "wrangler.template.jsonc",
     "wrangler.workers-dev.jsonc"

@@ -25,6 +25,31 @@ When you run the CLI from your project directory, `freertc` copies the required 
 - `wrangler.template.jsonc`
 - `wrangler.workers-dev.jsonc`
 
+## Browser client
+
+The package also exports the browser signaling and WebRTC client used by the demo:
+
+```js
+import { createSignalingClient } from "freertc/client";
+
+const client = createSignalingClient({
+  peerId: crypto.randomUUID(),
+  networkId: "my-app",
+  roomId: "pairing-room",
+  signalUrl: "wss://your-relay.example/ws",
+  autoConnect: false,
+  onDataMessage: ({ peerId, data }) => {
+    console.log("data from", peerId, data);
+  },
+});
+
+client.connect();
+```
+
+Use `client.initiateConnection(peerId)` to open a WebRTC data channel and
+`client.sendData(data, peerId)` to send an application payload. Calling
+`client.disconnect()` closes signaling and peer connections.
+
 ## What this worker does
 
 - Accepts WebSocket client connections at `/ws`.
