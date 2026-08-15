@@ -8,6 +8,7 @@
   },
   "vars": {
     "RELAY_PEER_ID": "bootstrap-relay",
+    // npm run dev:cf creates the private relay identity in .dev.vars.
     "GLOBAL_RELAY_URL": "wss://peer.ooo/ws"
   },
   "d1_databases": [

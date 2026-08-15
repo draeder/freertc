@@ -1,5 +1,14 @@
+import {
+  handleKademliaRequest,
+  heartbeatKademlia,
+  isKademliaEnabled,
+  lookupPeerProviders,
+  lookupScopeProviders,
+  publishPeerProviderRecords,
+} from "./relay-overlay.js";
+
 const PSP_VERSION = "1.0";
-const WORKER_VERSION = "0.1.32";
+const WORKER_VERSION = "0.2.0";
 
 const DISCOVERY_TYPES = new Set(["announce", "withdraw", "discover", "peer_list", "redirect"]);
 const NEGOTIATION_TYPES = new Set(["connect_request", "connect_accept", "connect_reject", "offer", "answer", "ice_candidate", "ice_end", "renegotiate"]);
@@ -23,6 +32,7 @@ const MAX_BATCH = 50;
 const RELAY_EXPIRY_MS = 5 * 60_000;       // relay entry expires after 5 min without heartbeat
 const FEDERATION_INTERVAL_MS = 2 * 60_000; // re-heartbeat every 2 min per isolate
 const DEFAULT_HUB_URL = "wss://peer.ooo/ws"; // default bootstrap hub
+const KADEMLIA_FORWARD_LIMIT = 2;
 
 const livePeers = new Map(); // key: JSON [network, room, peerId]
 const networkSubscribers = new Map(); // key: JSON [network, room] -> Set of sockets
@@ -47,13 +57,19 @@ export default {
     const upgrade = request.headers.get("Upgrade");
     const selfRelayUrl = resolveSelfRelayUrl(request, env.RELAY_URL);
 
-    // Heartbeat: self-register and sync with hub every FEDERATION_INTERVAL_MS
+    // Heartbeat: join the bounded Kademlia overlay when signing keys are
+    // configured. Older deployments retain the legacy registry fallback.
     if (selfRelayUrl && env.DB) {
       const now = Date.now();
       if (now - lastFederationMs > FEDERATION_INTERVAL_MS) {
         lastFederationMs = now;
         ctx.waitUntil((async () => {
           const relayName = env.RELAY_NAME || relayHostname(selfRelayUrl);
+          if (isKademliaEnabled(env)) {
+            await heartbeatKademlia(env, selfRelayUrl, { connections: livePeers.size });
+            return;
+          }
+
           await upsertRelay(env.DB, selfRelayUrl, relayName).catch(() => {});
           const hubUrl = env.GLOBAL_RELAY_URL || DEFAULT_HUB_URL;
           // Skip registering with hub if we ARE the hub
@@ -85,10 +101,18 @@ export default {
         protocol_version: PSP_VERSION,
         peers: livePeers.size,
         relay_url: selfRelayUrl,
+        kademlia_enabled: isKademliaEnabled(env),
         federation_hub: selfRelayUrl
           ? normalizeRelayUrl(env.GLOBAL_RELAY_URL || DEFAULT_HUB_URL)
           : null
       }, 200);
+    }
+
+    if (url.pathname.startsWith("/api/v1/kad/")) {
+      return handleKademliaRequest(request, env, {
+        selfUrl: selfRelayUrl,
+        connections: livePeers.size,
+      });
     }
 
     // Federation: relay registry endpoints (any worker can serve these from its own D1)
@@ -499,6 +523,8 @@ async function cleanupExpired(db) {
   const now = Date.now();
   await db.prepare(`DELETE FROM psp_announcements WHERE expires_at_ms <= ?1`).bind(now).run();
   await db.prepare(`DELETE FROM psp_relay WHERE expires_at_ms <= ?1`).bind(now).run();
+  await db.prepare(`DELETE FROM psp_kad_nodes WHERE expires_at_ms <= ?1`).bind(now).run();
+  await db.prepare(`DELETE FROM psp_kad_records WHERE expires_at_ms <= ?1`).bind(now).run();
 }
 
 // ===================== WebSocket Handler =====================
@@ -681,6 +707,17 @@ async function handleClientMessage(
         await deliverQueuedRelayMessages(db, socket, network, room, peerId);
       }
 
+      if (selfRelayUrl && isKademliaEnabled(env)) {
+        ctx.waitUntil(publishPeerProviderRecords(
+          env,
+          selfRelayUrl,
+          network,
+          room,
+          peerId,
+          { connections: livePeers.size },
+        ).catch((err) => console.error("[KAD] Provider publish failed:", err?.message)));
+      }
+
       // Registration is complete only after the relay has accepted the
       // announcement. Clients use this ACK to begin discovery and signaling.
       socket.send(JSON.stringify(createRegistrationAck(
@@ -714,8 +751,21 @@ async function handleClientMessage(
 
       let remotePeers = [];
       if (selfRelayUrl && env.DB) {
-        const allRelays = await listRelays(env.DB);
-        const remoteUrls = allRelays.map(r => r.url).filter(u => u !== selfRelayUrl);
+        let remoteUrls;
+        if (isKademliaEnabled(env)) {
+          const providers = await lookupScopeProviders(
+            env,
+            selfRelayUrl,
+            network,
+            room,
+            { connections: livePeers.size },
+          );
+          remoteUrls = [...new Set(providers.map((provider) => provider.url))]
+            .filter((relayUrl) => relayUrl !== selfRelayUrl);
+        } else {
+          const allRelays = await listRelays(env.DB);
+          remoteUrls = allRelays.map(r => r.url).filter(u => u !== selfRelayUrl);
+        }
 
         if (remoteUrls.length) {
           const results = await Promise.all(
@@ -798,11 +848,27 @@ async function handleClientMessage(
         console.warn(`[RELAY] Could not deliver ${type} to ${message.to}; persistence unavailable`);
       }
 
-      // If still not delivered locally and federation is enabled, fan out to peer relays via WebSocket
+      // If still not delivered locally, use the peer's Kademlia providers.
+      // Legacy deployments without relay signing keys retain registry fanout.
       if (!deliveredLive && selfRelayUrl && env.DB) {
         ctx.waitUntil((async () => {
           const selfRelayId = env.RELAY_PEER_ID || "relay-bridge";
-          const remoteUrls = await getPeerRelayUrls(env.DB, selfRelayUrl);
+          let remoteUrls;
+          if (isKademliaEnabled(env)) {
+            const providers = await lookupPeerProviders(
+              env,
+              selfRelayUrl,
+              network,
+              room,
+              message.to,
+              { connections: livePeers.size },
+            );
+            remoteUrls = [...new Set(providers.map((provider) => provider.url))]
+              .filter((relayUrl) => relayUrl !== selfRelayUrl)
+              .slice(0, KADEMLIA_FORWARD_LIMIT);
+          } else {
+            remoteUrls = await getPeerRelayUrls(env.DB, selfRelayUrl);
+          }
           if (!remoteUrls.length) return;
           console.log(`[FED] Forwarding ${type} to ${remoteUrls.length} peer relay(s) for ${message.to}`);
           await Promise.all(remoteUrls.map(u => forwardToRelay(u, message, selfRelayId)));

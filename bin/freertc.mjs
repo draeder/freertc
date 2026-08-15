@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { ensureProjectFiles, resolveProjectRoot, resolveWranglerCommand } from '../scripts/project-bootstrap.mjs';
+import { ensureProjectFiles, resolveProjectRoot } from '../scripts/project-bootstrap.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const PACKAGE_ROOT = path.resolve(path.dirname(__filename), '..');
@@ -19,6 +19,7 @@ Usage:
   freertc setup
   freertc init
   freertc install
+  freertc relay:keygen
   freertc deploy [-- <deploy-args>]
   freertc dev [-- <dev-args>]
   freertc dev:cf [-- <dev-args>]
@@ -27,6 +28,7 @@ Examples:
   npx freertc
   npx freertc wizard
   npx freertc setup
+  npx freertc relay:keygen
   freertc
   npx freertc deploy
 `);
@@ -86,11 +88,19 @@ if (subcommand === 'init' || subcommand === 'install') {
   runInProject(process.execPath, [path.join(PACKAGE_ROOT, 'scripts', 'wrangler-install-wizard.mjs'), '--mode', 'both', ...rest], { bootstrap: true });
 }
 
+if (subcommand === 'relay:keygen' || subcommand === 'keygen') {
+  runInProject(process.execPath, [path.join(PACKAGE_ROOT, 'scripts', 'generate-relay-identity.mjs'), ...rest]);
+}
+
 if (subcommand === 'deploy') {
   ensureProjectFiles(PROJECT_ROOT);
   requireWranglerConfig();
-  const wrangler = resolveWranglerCommand(PROJECT_ROOT);
-  runInProject(wrangler.command, [...wrangler.baseArgs, 'deploy', '--env', 'production', ...rest]);
+  runInProject(process.execPath, [
+    path.join(PACKAGE_ROOT, 'scripts', 'deploy-cloudflare.mjs'),
+    '--env',
+    'production',
+    ...rest,
+  ]);
 }
 
 if (subcommand === 'dev') {

@@ -667,7 +667,12 @@ async function main() {
 
       const doDeploy = await rl.question('Deploy now (freertc deploy)? [Y/n]: ');
       if (yes(doDeploy, true)) {
-        const deployResult = runWranglerCapture(['deploy', '--env', 'production'], { allowFailure: true });
+        const deployResult = runCapture(process.execPath, [
+          path.join(PACKAGE_ROOT, 'scripts', 'deploy-cloudflare.mjs'),
+          '--env',
+          'production',
+          '--skip-health-check'
+        ], { allowFailure: true });
         if (deployResult.stdout) process.stdout.write(deployResult.stdout);
         if (deployResult.stderr) process.stderr.write(deployResult.stderr);
         if (!deployResult.ok) {

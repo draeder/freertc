@@ -3,7 +3,13 @@
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
-const ROOT = process.cwd();
+import { generateRandomPair } from 'unsea';
+import { encodeRelayIdentitySecret } from '../src/relay-identity.js';
+import { resolveProjectRoot, resolveWranglerCommand } from './project-bootstrap.mjs';
+
+const ROOT = resolveProjectRoot(process.cwd());
+const RELAY_IDENTITY_SECRET = 'RELAY_IDENTITY_SECRET';
+const LEGACY_RELAY_IDENTITY_SECRET = 'RELAY_SIGNING_PRIVATE_KEY';
 
 export function firstWorkersDevUrlFromText(text) {
   if (!text) return null;
@@ -19,6 +25,35 @@ export function relayUrlFromWorkersDevUrl(url) {
     return `wss://${parsed.host}/ws`;
   } catch {
     return null;
+  }
+}
+
+export function scopedWranglerArgs(args, { includeName = false } = {}) {
+  const valueFlags = new Set([
+    '--config', '-c', '--cwd', '--env', '-e', '--env-file', '--profile',
+    ...(includeName ? ['--name'] : []),
+  ]);
+  const longFlags = [...valueFlags].filter((flag) => flag.startsWith('--'));
+  const scoped = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (valueFlags.has(arg) && index + 1 < args.length) {
+      scoped.push(arg, args[index + 1]);
+      index += 1;
+      continue;
+    }
+    if (longFlags.some((flag) => arg.startsWith(`${flag}=`))) scoped.push(arg);
+  }
+  return scoped;
+}
+
+export function relaySecretNames(text) {
+  try {
+    const parsed = JSON.parse(text);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((secret) => secret?.name).filter((name) => typeof name === 'string');
+  } catch {
+    return [];
   }
 }
 
@@ -50,30 +85,86 @@ async function requestHealth(deploymentUrl) {
   throw lastError || new Error('Health request failed');
 }
 
-export async function main() {
-  const deploy = spawnSync('wrangler', ['deploy'], {
+function printResult(result) {
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+}
+
+function runWrangler(wrangler, args, options = {}) {
+  return spawnSync(wrangler.command, [...wrangler.baseArgs, ...args], {
     cwd: ROOT,
     encoding: 'utf8',
     env: process.env,
-    stdio: 'pipe'
+    stdio: 'pipe',
+    ...options,
   });
+}
 
-  if (deploy.stdout) process.stdout.write(deploy.stdout);
-  if (deploy.stderr) process.stderr.write(deploy.stderr);
+function failed(result, label) {
+  if (result.error) console.error(`[freertc] Could not start ${label}: ${result.error.message}`);
+  if (result.status === 0) return false;
+  process.exitCode = result.status || 1;
+  return true;
+}
 
-  if (deploy.error) {
-    console.error(`[freertc] Could not start Wrangler: ${deploy.error.message}`);
+async function ensureRelayIdentitySecret(wrangler, deployArgs) {
+  const secretArgs = scopedWranglerArgs(deployArgs, { includeName: true });
+  const listed = runWrangler(wrangler, ['secret', 'list', '--format', 'json', ...secretArgs]);
+  if (failed(listed, 'Wrangler secret listing')) {
+    printResult(listed);
+    return false;
   }
-  if (deploy.status !== 0) {
-    process.exitCode = deploy.status || 1;
-    return;
+
+  const names = relaySecretNames(listed.stdout || '');
+  if (names.includes(RELAY_IDENTITY_SECRET) || names.includes(LEGACY_RELAY_IDENTITY_SECRET)) {
+    console.log('[freertc] Existing relay identity secret preserved.');
+    return true;
   }
+
+  const pair = await generateRandomPair();
+  const secretInput = JSON.stringify({
+    [RELAY_IDENTITY_SECRET]: encodeRelayIdentitySecret(pair.pub, pair.priv),
+  });
+  const uploaded = runWrangler(
+    wrangler,
+    ['secret', 'bulk', ...secretArgs],
+    { input: secretInput },
+  );
+  printResult(uploaded);
+  if (failed(uploaded, 'Wrangler secret upload')) return false;
+
+  console.log('[freertc] Generated and installed a private relay identity secret.');
+  return true;
+}
+
+export async function main(args = process.argv.slice(2)) {
+  const wrangler = resolveWranglerCommand(ROOT);
+  const skipHealthCheck = args.includes('--skip-health-check');
+  const deployArgs = args.filter((arg) => arg !== '--' && arg !== '--skip-health-check');
+  const dryRun = deployArgs.includes('--dry-run');
+
+  if (!dryRun) {
+    console.log('[freertc] Applying remote D1 migrations...');
+    const migrationArgs = scopedWranglerArgs(deployArgs);
+    const migration = runWrangler(wrangler, [
+      'd1', 'migrations', 'apply', 'DB', '--remote', ...migrationArgs,
+    ]);
+    printResult(migration);
+    if (failed(migration, 'Wrangler D1 migration')) return;
+  }
+
+  const deploy = runWrangler(wrangler, ['deploy', ...deployArgs]);
+  printResult(deploy);
+  if (failed(deploy, 'Wrangler deployment')) return;
+
+  if (dryRun) return;
+  if (!await ensureRelayIdentitySecret(wrangler, deployArgs)) return;
+  if (skipHealthCheck) return;
 
   const deploymentUrl = firstWorkersDevUrlFromText(`${deploy.stdout || ''}\n${deploy.stderr || ''}`);
   const expectedRelayUrl = relayUrlFromWorkersDevUrl(deploymentUrl);
   if (!deploymentUrl || !expectedRelayUrl) {
-    console.warn('[freertc] Deployment succeeded, but no workers.dev URL was found in Wrangler output.');
-    console.warn('[freertc] Open the deployed Worker once to trigger federation registration.');
+    console.warn('[freertc] Deployment and private relay identity setup succeeded, but no workers.dev URL was found.');
     return;
   }
 
@@ -82,11 +173,14 @@ export async function main() {
     if (health?.relay_url !== expectedRelayUrl) {
       throw new Error(`expected relay_url ${expectedRelayUrl}, received ${health?.relay_url || '(missing)'}`);
     }
-    console.log(`[freertc] Federation registration triggered through ${healthUrl}`);
+    if (health?.kademlia_enabled !== true) {
+      throw new Error('the deployed Worker did not report Kademlia as enabled');
+    }
+    console.log(`[freertc] Kademlia relay initialized through ${healthUrl}`);
     console.log(`[freertc] Relay URL: ${expectedRelayUrl}`);
   } catch (error) {
-    console.warn(`[freertc] Worker deployed, but the registration health check did not complete: ${error.message}`);
-    console.warn(`[freertc] Open ${deploymentUrl} once to retry federation registration.`);
+    console.warn(`[freertc] Worker deployed, but the health check did not complete: ${error.message}`);
+    console.warn(`[freertc] Open ${deploymentUrl} once to retry overlay registration.`);
   }
 }
 

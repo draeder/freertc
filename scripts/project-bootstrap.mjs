@@ -9,11 +9,16 @@ export const PACKAGE_ROOT = path.resolve(SCRIPT_DIR, '..');
 
 const PROJECT_FILE_MAPPINGS = [
   ['src/index.js', 'src/index.js'],
+  ['src/kademlia.js', 'src/kademlia.js'],
+  ['src/relay-identity.js', 'src/relay-identity.js'],
+  ['src/relay-overlay.js', 'src/relay-overlay.js'],
   ['public/index.html', 'public/index.html'],
   ['public/app.js', 'public/app.js'],
   ['migrations/0001_initial.sql', 'migrations/0001_initial.sql'],
+  ['migrations/0002_kademlia_overlay.sql', 'migrations/0002_kademlia_overlay.sql'],
   ['scripts/d1-schema.sql', 'scripts/d1-schema.sql'],
   ['scripts/deploy-cloudflare.mjs', 'scripts/deploy-cloudflare.mjs'],
+  ['scripts/project-bootstrap.mjs', 'scripts/project-bootstrap.mjs'],
   ['wrangler.template.jsonc', 'wrangler.template.jsonc'],
   ['wrangler.workers-dev.jsonc', 'wrangler.workers-dev.jsonc']
 ];

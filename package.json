@@ -27,7 +27,7 @@
   "type": "module",
   "license": "MIT",
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "files": [
     "README.md",
@@ -37,23 +37,28 @@
     "scripts/d1-schema.sql",
     "scripts/deploy-cloudflare.mjs",
     "scripts/dev-server.mjs",
+    "scripts/generate-relay-identity.mjs",
     "scripts/non-cloudflare-server.mjs",
     "scripts/postinstall-message.mjs",
     "scripts/project-bootstrap.mjs",
     "scripts/wrangler-install-wizard.mjs",
     "src/client.js",
     "src/index.js",
+    "src/kademlia.js",
+    "src/relay-identity.js",
+    "src/relay-overlay.js",
     "wrangler.template.jsonc",
     "wrangler.workers-dev.jsonc"
   ],
   "scripts": {
     "test": "node --test test/*.test.js",
-    "build": "worker-build --release",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "build:rust": "worker-build --release",
     "dev": "node scripts/non-cloudflare-server.mjs",
     "dev:cf": "node scripts/dev-server.mjs",
     "dev:node": "node scripts/non-cloudflare-server.mjs",
     "dev:local": "npm run dev:node",
-    "predeploy": "npm run d1:init:remote",
+    "relay:keygen": "node scripts/generate-relay-identity.mjs",
     "deploy": "node scripts/deploy-cloudflare.mjs",
     "deploy:raw": "wrangler deploy",
     "check": "cargo check --target wasm32-unknown-unknown",
@@ -69,6 +74,7 @@
     "deploy:local-prod:stop": "docker-compose -f docker-compose.prod.yml down"
   },
   "dependencies": {
+    "unsea": "https://codeload.github.com/draeder/unsea/tar.gz/5425b41d39cea5aa2116241af0fed82865ffea29",
     "ws": "^8.18.0"
   },
   "devDependencies": {

@@ -301,7 +301,7 @@ export function useP2p({
         updateStatusFromMesh()
         startBootstrapRefresh()
         // Server pushes same-isolate peers immediately after registered.
-        // Also request bootstrap for cross-isolate (MongoDB) peers.
+        // Also request bootstrap for peers connected through other relay instances.
         // Retry a handful of times with backoff in case of write-lag.
         let retries = 0
         const RETRY_DELAYS_MS = [0, 500, 1500, 3500]
