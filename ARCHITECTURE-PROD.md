@@ -43,7 +43,6 @@ Production deployment **requires** domain configuration through environment vari
 
 | File | Purpose | Required | Version Control |
 |------|---------|----------|-----------------|
-| `.env.example` | All available options | Reference | ✓ Tracked |
 | `.env.local.prod.example` | Production template | Reference | ✓ Tracked |
 | `.env.local.prod` | Your actual config | ✓ Yes | ✗ Ignored |
 | `config.local-prod.json` | Generated config | Auto-generated | ✗ Ignored |
@@ -335,7 +334,6 @@ openssl req -x509 -newkey rsa:4096 \
 - `scripts/validate-config.mjs` - Config validation
 - `scripts/generate-prod-config.mjs` - Config generation  
 - `scripts/prod-server.mjs` - Production HTTPS server
-- `.env.example` - All config options
 - `.env.local.prod.example` - Production template
 - `Dockerfile.prod` - Docker production image
 - `docker-compose.prod.yml` - Docker Compose setup

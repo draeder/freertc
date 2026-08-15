@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
@@ -22,6 +22,10 @@ test("README presents the official Deploy to Cloudflare button before manual ins
   assert.ok(readme.indexOf(button) < readme.indexOf("## Install from npm (manual)"));
 });
 
+test("Deploy Button does not advertise optional local settings as required secrets", async () => {
+  await assert.rejects(access(new URL(".env.example", root)));
+});
+
 test("Deploy Button configuration provisions D1, migrations, and private relay identity", async () => {
   const [buttonConfig, workersDevConfig, packageText, deployScript, initialMigration, kademliaMigration, schema] = await Promise.all([
     read("wrangler.jsonc"),
@@ -37,6 +41,7 @@ test("Deploy Button configuration provisions D1, migrations, and private relay i
   for (const config of [buttonConfig, workersDevConfig]) {
     assert.match(config, /"workers_dev"\s*:\s*true/);
     assert.match(config, /"GLOBAL_RELAY_URL"\s*:\s*"wss:\/\/peer\.ooo\/ws"/);
+    assert.doesNotMatch(config, /"RELAY_URL"\s*:/);
     assert.match(config, /"database_id"\s*:\s*"00000000-0000-0000-0000-000000000000"/);
     assert.match(config, /"migrations_dir"\s*:\s*"migrations"/);
     assert.doesNotMatch(config, /peer-ooo-worker-devtest|52acefe2/i);
