@@ -26,6 +26,18 @@ Global install:
 npm install -g freertc
 ```
 
+When installed as a project dependency, FreeRTC's postinstall step materializes
+the installed package's `public/`, `src/`, and `migrations/` directories in the
+project root. This gives one-click Git builders a deployable layout even when
+the installer repository has no Wrangler file. If any of those paths already
+contain files, the complete layout is placed in `freertc-deploy/` (or the next
+available numbered directory) instead of mixing with the existing application.
+Existing project files are never overwritten, and global installs do not modify
+the current directory. A versioned manifest tracks files created by FreeRTC. If
+a different pinned FreeRTC version is later installed, those managed files are
+updated in place and obsolete managed files are removed; unrelated files remain
+untouched. The postinstall output reports the selected deploy root.
+
 When you run the CLI from your project directory, `freertc` copies the required worker files into that directory on first run:
 
 - `src/index.js`
