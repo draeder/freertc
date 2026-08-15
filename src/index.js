@@ -101,6 +101,7 @@ export default {
         protocol_version: PSP_VERSION,
         peers: livePeers.size,
         relay_url: selfRelayUrl,
+        relay_peer_id: resolveRelayPeerId(env.RELAY_PEER_ID, selfRelayUrl),
         kademlia_enabled: isKademliaEnabled(env),
         federation_hub: selfRelayUrl
           ? normalizeRelayUrl(env.GLOBAL_RELAY_URL || DEFAULT_HUB_URL)
@@ -278,6 +279,14 @@ function relayHostname(relayUrl) {
   }
 }
 
+function resolveRelayPeerId(configuredPeerId, selfRelayUrl) {
+  const configured = typeof configuredPeerId === "string" ? configuredPeerId.trim() : "";
+  if (configured) return configured;
+
+  const hostname = relayHostname(selfRelayUrl);
+  return hostname ? `bootstrap:${hostname}` : "bootstrap:local";
+}
+
 // Derive HTTP base URL from a wss:// relay URL (wss://peer.ooo/ws → https://peer.ooo)
 function relayHttpBase(wsUrl) {
   return wsUrl.replace(/^wss?:\/\//, (m) => m === "wss://" ? "https://" : "http://").replace(/\/ws$/, "");
@@ -353,7 +362,7 @@ function mergeDiscoveredPeers(...peerGroups) {
   return Array.from(merged.values()).sort((left, right) => left.peer_id.localeCompare(right.peer_id));
 }
 
-function sendPeerList(socket, network, room, peers, to = null, from = "bootstrap-relay") {
+function sendPeerList(socket, network, room, peers, to = null, from = "bootstrap:local") {
   socket.send(JSON.stringify({
     psp_version: PSP_VERSION,
     type: "peer_list",
@@ -368,7 +377,7 @@ function sendPeerList(socket, network, room, peers, to = null, from = "bootstrap
   }));
 }
 
-function createRegistrationAck(message, relayPeerId = "bootstrap-relay") {
+function createRegistrationAck(message, relayPeerId = "bootstrap:local") {
   return {
     psp_version: PSP_VERSION,
     type: "ack",
@@ -385,7 +394,7 @@ function createRegistrationAck(message, relayPeerId = "bootstrap-relay") {
 }
 
 // Broadcast only to peers in the same Network + Room scope.
-async function broadcastPeerList(db, network, room) {
+async function broadcastPeerList(db, network, room, relayPeerId) {
   const storageScope = scopeKey(network, room);
   const sockets = networkSubscribers.get(storageScope);
   if (!sockets || sockets.size === 0) return;
@@ -406,7 +415,7 @@ async function broadcastPeerList(db, network, room) {
   }));
   for (const socket of sockets) {
     try {
-      sendPeerList(socket, network, room, peers);
+      sendPeerList(socket, network, room, peers, null, relayPeerId);
     } catch (e) {
       sockets.delete(socket);
     }
@@ -531,6 +540,7 @@ async function cleanupExpired(db) {
 
 function handleWebSocket(request, env, ctx, selfRelayUrl) {
   const { 0: client, 1: server } = new WebSocketPair();
+  const relayPeerId = resolveRelayPeerId(env.RELAY_PEER_ID, selfRelayUrl);
 
   let peerKey = null;
   let network = null;
@@ -558,7 +568,7 @@ function handleWebSocket(request, env, ctx, selfRelayUrl) {
     if (env.DB) {
       ctx.waitUntil(
         deleteAnnouncement(env.DB, currentNetwork, currentRoom, currentPeerId)
-          .then(() => broadcastPeerList(env.DB, currentNetwork, currentRoom))
+          .then(() => broadcastPeerList(env.DB, currentNetwork, currentRoom, relayPeerId))
           .catch(() => {})
       );
     }
@@ -589,7 +599,7 @@ function handleWebSocket(request, env, ctx, selfRelayUrl) {
       try {
         server.send(JSON.stringify({
           psp_version: PSP_VERSION, type: "error",
-          from: env.RELAY_PEER_ID || "relay", to: "client",
+          from: relayPeerId, to: "client",
           body: { error: err?.message || "Unknown error" }
         }));
       } catch {}
@@ -632,6 +642,7 @@ async function handleClientMessage(
   prevRoom = null
 ) {
   try {
+    const relayPeerId = resolveRelayPeerId(env.RELAY_PEER_ID, selfRelayUrl);
     if (!rawData) return null;
     if (rawData.length > MAX_MESSAGE_SIZE) return null;
 
@@ -641,7 +652,7 @@ async function handleClientMessage(
     } catch (e) {
       socket.send(JSON.stringify({
         psp_version: PSP_VERSION, type: "error",
-        from: env.RELAY_PEER_ID || "relay", to: "client",
+        from: relayPeerId, to: "client",
         body: { error: "Invalid JSON" }
       }));
       return null;
@@ -650,7 +661,7 @@ async function handleClientMessage(
     if (!validEnvelope(message)) {
       socket.send(JSON.stringify({
         psp_version: PSP_VERSION, type: "error",
-        from: env.RELAY_PEER_ID || "relay", to: message?.from || "unknown",
+        from: relayPeerId, to: message?.from || "unknown",
         body: { error: "Invalid PSP envelope" }
       }));
       return null;
@@ -668,7 +679,7 @@ async function handleClientMessage(
         type: "error",
         network,
         session_id: room,
-        from: env.RELAY_PEER_ID || "relay",
+        from: relayPeerId,
         to: peerId,
         message_id: crypto.randomUUID(),
         timestamp: Date.now(),
@@ -722,7 +733,7 @@ async function handleClientMessage(
       // announcement. Clients use this ACK to begin discovery and signaling.
       socket.send(JSON.stringify(createRegistrationAck(
         message,
-        env.RELAY_PEER_ID || "bootstrap-relay"
+        relayPeerId
       )));
       
       // Only broadcast peer_list when the peer is newly joining, not on heartbeat re-announces.
@@ -731,7 +742,7 @@ async function handleClientMessage(
       const isHeartbeat = prevPeerKey === peerKey;
       if (!isHeartbeat && db) {
         console.log(`[NET] Broadcasting peer_list for network=${network} room=${room} after new announce from ${peerId}`);
-        broadcastPeerList(db, network, room).catch((err) => console.error(`[Broadcast error]`, err?.message));
+        broadcastPeerList(db, network, room, relayPeerId).catch((err) => console.error(`[Broadcast error]`, err?.message));
       }
 
     } else if (type === "withdraw") {
@@ -740,7 +751,7 @@ async function handleClientMessage(
       }
       livePeers.delete(peerKey);
       if (db) {
-        broadcastPeerList(db, network, room).catch(() => {});
+        broadcastPeerList(db, network, room, relayPeerId).catch(() => {});
       }
 
     } else if (type === "discover") {
@@ -782,7 +793,7 @@ async function handleClientMessage(
           room,
           mergeDiscoveredPeers(localPeers, remotePeers).filter(peer => peer.peer_id !== peerId),
           peerId,
-          env.RELAY_PEER_ID || "bootstrap-relay"
+          relayPeerId
         );
       } catch {}
 
@@ -801,7 +812,7 @@ async function handleClientMessage(
       socket.send(JSON.stringify({
         psp_version: PSP_VERSION, type: "pong", network,
         session_id: room,
-        from: env.RELAY_PEER_ID || "relay", to: peerId,
+        from: relayPeerId, to: peerId,
         message_id: crypto.randomUUID(), timestamp: Date.now(),
         ttl_ms: DEFAULT_TTL_MS, body: {}
       }));
@@ -815,7 +826,7 @@ async function handleClientMessage(
       }
       livePeers.delete(peerKey);
       if (db) {
-        broadcastPeerList(db, network, room).catch(() => {});
+        broadcastPeerList(db, network, room, relayPeerId).catch(() => {});
       }
 
     } else if (RELAY_TYPES.has(type)) {
@@ -852,7 +863,7 @@ async function handleClientMessage(
       // Legacy deployments without relay signing keys retain registry fanout.
       if (!deliveredLive && selfRelayUrl && env.DB) {
         ctx.waitUntil((async () => {
-          const selfRelayId = env.RELAY_PEER_ID || "relay-bridge";
+          const selfRelayId = relayPeerId;
           let remoteUrls;
           if (isKademliaEnabled(env)) {
             const providers = await lookupPeerProviders(
@@ -901,6 +912,7 @@ export {
   createRegistrationAck,
   normalizeRoom,
   peerScopeKey,
+  resolveRelayPeerId,
   resolveSelfRelayUrl,
   scopeKey,
   validEnvelope

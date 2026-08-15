@@ -7,7 +7,6 @@
     "directory": "public"
   },
   "vars": {
-    "RELAY_PEER_ID": "bootstrap-relay",
     "GLOBAL_RELAY_URL": "wss://peer.ooo/ws"
   },
   "d1_databases": [
