@@ -10,6 +10,8 @@ This project provides a Cloudflare Worker signaling relay for WebRTC peers using
 
 Immediately after deployment, the install script requests the new Worker's `/health` endpoint. The Worker derives `wss://<worker>.<account>.workers.dev/ws` from that request and registers the address with the `wss://peer.ooo/ws` federation hub. No custom domain is required. Cloudflare lets you customize the Worker and database names before deployment.
 
+Every one-click relay joins the bootstrap network through `wss://peer.ooo/ws` and derives a unique PSP relay sender ID from its deployed hostname (`bootstrap:<worker>.<account>.workers.dev`).
+
 See [Cloudflare's Deploy Button documentation](https://developers.cloudflare.com/workers/platform/deploy-buttons/) for details about the account and repository flow.
 
 ## Install from npm (manual)

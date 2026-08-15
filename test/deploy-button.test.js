@@ -8,7 +8,7 @@ import {
   relayUrlFromWorkersDevUrl,
   scopedWranglerArgs
 } from "../scripts/deploy-cloudflare.mjs";
-import worker from "../src/index.js";
+import worker, { resolveRelayPeerId } from "../src/index.js";
 
 const root = new URL("../", import.meta.url);
 const read = (path) => readFile(new URL(path, root), "utf8");
@@ -27,11 +27,12 @@ test("Deploy Button does not advertise optional local settings as required secre
 });
 
 test("Deploy Button configuration provisions D1, migrations, and private relay identity", async () => {
-  const [buttonConfig, workersDevConfig, packageText, deployScript, initialMigration, kademliaMigration, schema] = await Promise.all([
+  const [buttonConfig, workersDevConfig, packageText, deployScript, workerSource, initialMigration, kademliaMigration, schema] = await Promise.all([
     read("wrangler.jsonc"),
     read("wrangler.workers-dev.jsonc"),
     read("package.json"),
     read("scripts/deploy-cloudflare.mjs"),
+    read("src/index.js"),
     read("migrations/0001_initial.sql"),
     read("migrations/0002_kademlia_overlay.sql"),
     read("scripts/d1-schema.sql")
@@ -48,7 +49,9 @@ test("Deploy Button configuration provisions D1, migrations, and private relay i
 
   assert.doesNotMatch(buttonConfig, /"database_name"\s*:/);
   assert.doesNotMatch(buttonConfig, /"database_id"\s*:/);
+  assert.doesNotMatch(buttonConfig, /"RELAY_PEER_ID"\s*:/);
   assert.match(workersDevConfig, /"database_id"\s*:\s*"00000000-0000-0000-0000-000000000000"/);
+  assert.doesNotMatch(workerSource, /bootstrap-relay/);
 
   assert.equal(packageJson.scripts.deploy, "node scripts/deploy-cloudflare.mjs");
   assert.equal(packageJson.scripts.build, "wrangler deploy --dry-run --outdir dist");
@@ -61,6 +64,17 @@ test("Deploy Button configuration provisions D1, migrations, and private relay i
   assert.match(deployScript, /generateRandomPair/);
   assert.match(deployScript, /'secret', 'bulk'/);
   assert.doesNotMatch(deployScript, /console\.log\([^\n]*(pair\.priv|secretInput)/);
+});
+
+test("one-click relays derive a unique bootstrap peer ID from their workers.dev hostname", () => {
+  const relayUrl = "wss://freertc-relay.example-account.workers.dev/ws";
+
+  assert.equal(
+    resolveRelayPeerId(undefined, relayUrl),
+    "bootstrap:freertc-relay.example-account.workers.dev"
+  );
+  assert.equal(resolveRelayPeerId("custom-relay", relayUrl), "custom-relay");
+  assert.equal(resolveRelayPeerId(undefined, null), "bootstrap:local");
 });
 
 test("deployment helpers preserve Wrangler scope and detect an existing identity", () => {
@@ -127,7 +141,6 @@ test("the first workers.dev request registers that domain with the federation hu
       new Request("https://freertc-relay.example-account.workers.dev/health"),
       {
         DB: database,
-        RELAY_PEER_ID: "bootstrap-relay",
         GLOBAL_RELAY_URL: "wss://peer.ooo/ws"
       },
       context
@@ -137,6 +150,7 @@ test("the first workers.dev request registers that domain with the federation hu
 
     assert.equal(response.status, 200);
     assert.equal(health.relay_url, "wss://freertc-relay.example-account.workers.dev/ws");
+    assert.equal(health.relay_peer_id, "bootstrap:freertc-relay.example-account.workers.dev");
     assert.equal(health.federation_hub, "wss://peer.ooo/ws");
     assert.equal(registration.url, "https://peer.ooo/api/v1/relays");
     assert.deepEqual(JSON.parse(registration.options.body), {
