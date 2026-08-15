@@ -46,6 +46,7 @@ test("Deploy Button configuration provisions D1, migrations, and private relay i
     assert.doesNotMatch(config, /peer-ooo-worker-devtest|52acefe2/i);
   }
 
+  assert.doesNotMatch(buttonConfig, /"database_name"\s*:/);
   assert.doesNotMatch(buttonConfig, /"database_id"\s*:/);
   assert.match(workersDevConfig, /"database_id"\s*:\s*"00000000-0000-0000-0000-000000000000"/);
 

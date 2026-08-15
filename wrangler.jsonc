@@ -13,9 +13,8 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "freertc-signal",
-      // Omitting database_id makes Cloudflare's Deploy Button default to
-      // creating a new D1 database in the installer's account.
+      // Omitting both resource selectors prevents Cloudflare's Deploy Button
+      // from matching an existing database and forces new D1 provisioning.
       "migrations_dir": "migrations"
     }
   ]
