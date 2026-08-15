@@ -4,7 +4,9 @@ import test from "node:test";
 
 import {
   firstWorkersDevUrlFromText,
-  relayUrlFromWorkersDevUrl
+  relaySecretNames,
+  relayUrlFromWorkersDevUrl,
+  scopedWranglerArgs
 } from "../scripts/deploy-cloudflare.mjs";
 import worker from "../src/index.js";
 
@@ -20,12 +22,14 @@ test("README presents the official Deploy to Cloudflare button before manual ins
   assert.ok(readme.indexOf(button) < readme.indexOf("## Install from npm (manual)"));
 });
 
-test("Deploy Button configuration provisions D1 and joins the federation hub", async () => {
-  const [buttonConfig, workersDevConfig, packageText, migration, schema] = await Promise.all([
+test("Deploy Button configuration provisions D1, migrations, and private relay identity", async () => {
+  const [buttonConfig, workersDevConfig, packageText, deployScript, initialMigration, kademliaMigration, schema] = await Promise.all([
     read("wrangler.jsonc"),
     read("wrangler.workers-dev.jsonc"),
     read("package.json"),
+    read("scripts/deploy-cloudflare.mjs"),
     read("migrations/0001_initial.sql"),
+    read("migrations/0002_kademlia_overlay.sql"),
     read("scripts/d1-schema.sql")
   ]);
   const packageJson = JSON.parse(packageText);
@@ -38,12 +42,32 @@ test("Deploy Button configuration provisions D1 and joins the federation hub", a
     assert.doesNotMatch(config, /peer-ooo-worker-devtest|52acefe2/i);
   }
 
-  assert.equal(packageJson.scripts.predeploy, "npm run d1:init:remote");
   assert.equal(packageJson.scripts.deploy, "node scripts/deploy-cloudflare.mjs");
+  assert.equal(packageJson.scripts.build, "wrangler deploy --dry-run --outdir dist");
   assert.equal(packageJson.scripts["d1:init:remote"], "wrangler d1 migrations apply DB --remote");
-  assert.match(migration, /CREATE TABLE IF NOT EXISTS psp_relays/);
+  assert.match(initialMigration, /CREATE TABLE IF NOT EXISTS psp_relays/);
+  assert.match(kademliaMigration, /CREATE TABLE IF NOT EXISTS psp_kad_nodes/);
   const normalizeSql = (sql) => sql.replace(/^--.*$/gm, "").replace(/\s+/g, " ").trim();
-  assert.equal(normalizeSql(migration), normalizeSql(schema));
+  assert.equal(normalizeSql(`${initialMigration}\n${kademliaMigration}`), normalizeSql(schema));
+  assert.match(deployScript, /'d1', 'migrations', 'apply', 'DB', '--remote'/);
+  assert.match(deployScript, /generateRandomPair/);
+  assert.match(deployScript, /'secret', 'bulk'/);
+  assert.doesNotMatch(deployScript, /console\.log\([^\n]*(pair\.priv|secretInput)/);
+});
+
+test("deployment helpers preserve Wrangler scope and detect an existing identity", () => {
+  assert.deepEqual(
+    scopedWranglerArgs(['--env', 'production', '--config=custom.jsonc', '--minify']),
+    ['--env', 'production', '--config=custom.jsonc']
+  );
+  assert.deepEqual(
+    scopedWranglerArgs(['--name', 'relay-a', '--env=production'], { includeName: true }),
+    ['--name', 'relay-a', '--env=production']
+  );
+  assert.deepEqual(
+    relaySecretNames('[{"name":"RELAY_IDENTITY_SECRET","type":"secret_text"}]'),
+    ['RELAY_IDENTITY_SECRET']
+  );
 });
 
 test("deployment output resolves to the relay URL used for registration", () => {

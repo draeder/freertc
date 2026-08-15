@@ -6,7 +6,7 @@ This project provides a Cloudflare Worker signaling relay for WebRTC peers using
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/draeder/freertc)
 
-**This is the fastest installation path.** The button creates the Worker and D1 database in your Cloudflare account, applies the signaling schema, and deploys the relay to your own `<worker>.<account>.workers.dev` address.
+**This is the fastest installation path.** The button creates the Worker and D1 database in your Cloudflare account, applies every D1 migration, generates an UnSEA relay identity, installs it directly as an encrypted Worker secret, and deploys the relay to your own `<worker>.<account>.workers.dev` address. The private identity is never printed or added to the generated repository.
 
 Immediately after deployment, the install script requests the new Worker's `/health` endpoint. The Worker derives `wss://<worker>.<account>.workers.dev/ws` from that request and registers the address with the `wss://peer.ooo/ws` federation hub. No custom domain is required. Cloudflare lets you customize the Worker and database names before deployment.
 
@@ -29,9 +29,13 @@ npm install -g freertc
 When you run the CLI from your project directory, `freertc` copies the required worker files into that directory on first run:
 
 - `src/index.js`
+- `src/kademlia.js`
+- `src/relay-identity.js`
+- `src/relay-overlay.js`
 - `public/index.html`
 - `public/app.js`
 - `migrations/0001_initial.sql`
+- `migrations/0002_kademlia_overlay.sql`
 - `scripts/d1-schema.sql`
 - `scripts/deploy-cloudflare.mjs`
 - `wrangler.template.jsonc`
@@ -69,7 +73,8 @@ Use `client.initiateConnection(peerId)` to open a WebRTC data channel and
 - Supports discovery, negotiation, control, and extension message types.
 - Stores peer announcements in Cloudflare D1 (`psp_announcements`).
 - Stores directed signaling messages in Cloudflare D1 (`psp_relay`).
-- Exposes a simple relay registry at `/api/v1/relays` when D1 is configured.
+- Routes across federated relays through bounded Kademlia buckets when a signed relay identity is configured.
+- Keeps the simple `/api/v1/relays` registry as a compatibility fallback for relays without signing keys.
 - Exposes federation peer lookup at `/api/v1/peers` and message forwarding at `/api/v1/relay`.
 - Delivers queued relay messages when peers reconnect.
 - Serves the browser demo from `public/`.
@@ -83,12 +88,42 @@ The browser UI uses two distinct scopes:
 
 Peers are discoverable and relay messages are deliverable only when both Network and Room match. The relay domain is not an isolation boundary: `peer.ooo` and `decentralize.ooo` can federate peers that deliberately use the same Network and Room.
 
+## Kademlia relay overlay
+
+FreeRTC uses Kademlia between federated relays—not between browser peers. Relay IDs, scope keys, and exact-peer keys are deterministic 256-bit SHA-256 values produced by UnSEA. Relay and provider records are signed with stable UnSEA P-256 identities before they are accepted or replicated.
+
+The overlay keeps at most 20 contacts per XOR-distance bucket, performs lookups three relays at a time with a 24-query ceiling, and replicates provider records to the five closest relays. Discovery queries at most eight load-ranked providers for a Network + Room; directed signaling forwards to at most two providers for the exact destination peer. These bounds replace federation-wide fanout as the relay population grows.
+
+Kademlia is enabled when D1 and the relay identity secret are present. Both are configured automatically:
+
+```bash
+# Deploy from a cloned repository
+npm run deploy
+
+# Deploy an npm-installed project using its production environment
+npx freertc deploy
+
+# Local Cloudflare development
+npm run dev:cf
+```
+
+Production deployment applies pending remote migrations, deploys the Worker, then checks for an existing relay identity. Existing identities are preserved. On the first deployment, a new UnSEA identity is held only in process memory and streamed directly to Wrangler's bulk-secret command. Local development stores its automatically generated identity in the git-ignored `.dev.vars` file and applies local migrations before starting Wrangler.
+
+Optional routing settings remain ordinary Wrangler variables:
+
+```jsonc
+"KADEMLIA_BOOTSTRAP_URLS": "wss://peer.ooo/ws",
+"RELAY_CAPACITY": "10000"
+```
+
+Every bootstrap URL must point to a FreeRTC relay with Kademlia enabled. `GLOBAL_RELAY_URL` is also treated as a bootstrap URL for compatibility. Legacy deployments using separate `RELAY_SIGNING_PUBLIC_KEY` and `RELAY_SIGNING_PRIVATE_KEY` values continue to work during migration. `npx freertc relay:keygen` remains available only for manual identity recovery or migration.
+
 ## Runtime scope
 
 - The checked-in Cloudflare Worker runtime is `src/index.js` with Cloudflare D1 (`DB` binding).
 - The Rust/WASM worker lives in `src/lib.rs` and is optional; the default template now uses the JS worker path.
 - The built-in browser demo served by the Worker is `public/index.html` + `public/app.js`.
-- `src/kv.js` and `demo/src/*` are legacy/experimental code paths and are not used by `wrangler dev` or `wrangler deploy` in the current setup.
+- `demo/src/*` is a legacy/experimental code path and is not used by `wrangler dev` or `wrangler deploy` in the current setup.
 
 ## Supported message types
 
@@ -156,6 +191,8 @@ If you installed the npm package instead of cloning the repo, use `npx freertc w
 - Ensure `d1_databases[0].binding` is `DB`.
 
 ### 3. Initialize D1 schema
+
+Normal deploy and `dev:cf` commands perform this step automatically. The following commands are available for manual database maintenance.
 
 Local (for `wrangler dev`):
 
@@ -235,7 +272,8 @@ freertc deploy
 
 Repository-only scripts:
 
-- `npm run build` builds the Rust/WASM worker via `worker-build --release`.
+- `npm run build` bundles and validates the default JavaScript Worker without deploying it.
+- `npm run build:rust` builds the optional Rust/WASM worker via `worker-build --release`.
 - `npm run deploy:raw` deploys without `--env production`.
 - `npm run check` runs `cargo check --target wasm32-unknown-unknown` for the Rust worker path.
 - `npm run dev` runs the standalone local relay (non-Cloudflare).

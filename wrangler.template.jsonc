@@ -18,8 +18,13 @@
     "RELAY_URL": "wss://YOUR_DOMAIN/ws",
 
     // Set automatically by the wizard if you opt into the global network.
-    // Remove this line to run standalone (no cross-relay peer discovery).
+    // Kademlia uses this as a bootstrap relay. Remove it to run standalone.
     "GLOBAL_RELAY_URL": "wss://peer.ooo/ws",
+
+    // Deploy and local-dev scripts generate a stable private relay identity
+    // automatically. It is never stored in this configuration file.
+    // "KADEMLIA_BOOTSTRAP_URLS": "wss://peer.ooo/ws",
+    // "RELAY_CAPACITY": "10000",
     "RELAY_NAME": "Your App Relay"
   },
 
@@ -58,6 +63,7 @@
         "RELAY_PEER_ID": "bootstrap-relay",
         "RELAY_URL": "wss://YOUR_DOMAIN/ws",
         "GLOBAL_RELAY_URL": "wss://peer.ooo/ws",
+        // The deploy script installs the production relay identity secret.
         "RELAY_NAME": "Your App Relay"
       },
       "d1_databases": [
