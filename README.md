@@ -194,7 +194,7 @@ HOST=127.0.0.1 PORT=8788 npm run dev:node
 
 - Uses `wrangler.workers-dev.jsonc` automatically when `wrangler.jsonc` is not present.
 - Only installs `worker-build` and the WebAssembly Rust target when the selected Wrangler config uses a `worker-build` command.
-- The checked-in `wrangler.workers-dev.jsonc` now points to `src/index.js`, so standard demo runs do not require Rust/WASM setup.
+- The checked-in `wrangler.workers-dev.jsonc` uses generic local-development values and points to `src/index.js`, so standard demo runs do not require Rust/WASM setup.
 
 Endpoints:
 

@@ -1,5 +1,5 @@
 {
-  "name": "peer-ooo-worker-devtest",
+  "name": "freertc-worker-dev",
   "main": "src/index.js",
   "compatibility_date": "2024-09-23",
   "workers_dev": true,
@@ -13,7 +13,9 @@
     {
       "binding": "DB",
       "database_name": "freertc-signal",
-      "database_id": "52acefe2-e810-4b81-8225-1ca87d0205cc"
+      // Local development uses isolated D1 state. Replace this placeholder
+      // before using this config with a remote D1 database.
+      "database_id": "00000000-0000-0000-0000-000000000000"
     }
   ]
 }

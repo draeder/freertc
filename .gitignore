@@ -17,6 +17,7 @@ build/
 *~
 wrangler.jsonc
 wrangler.toml
+wrangler.*.local.jsonc
 
 # Production deployment
 .env.local.prod
