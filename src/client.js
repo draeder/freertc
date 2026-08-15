@@ -1135,7 +1135,43 @@ export function createSignalingClient(options = {}) {
   function handlePageShow(event) {
     // bfcache restore: the page is shown from the browser's back/forward cache.
     // The WebSocket is dead at this point — reconnect exactly as on freeze→resume.
-    if (event.persisted) handleVisibilityChange()
+    if (event.persisted) handleSuspendRestore()
+  }
+
+  function resetReconnectBackoff() {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
+    backoffMs = BACKOFF_BASE_MS
+  }
+
+  function handleSuspendRestore() {
+    if (stoppedByUser) return
+
+    log('[signal] browser resumed — reconnecting immediately')
+    resetReconnectBackoff()
+
+    // A socket can remain OPEN/CONNECTING briefly after the browser thaws even
+    // though its underlying connection was lost. Retire it without letting its
+    // eventual close schedule another retry, then establish a fresh socket now.
+    const staleSocket = ws
+    ws = null
+    if (staleSocket) {
+      staleSocket.onopen = null
+      staleSocket.onmessage = null
+      staleSocket.onerror = null
+      staleSocket.onclose = null
+      try {
+        staleSocket.close(1000, 'browser_resume')
+      } catch { /* ignore */ }
+    }
+
+    registered = false
+    stopAdvertiseHeartbeat()
+    stopKeepalive()
+    closeAllPeerConnections()
+    mesh.connections.clear()
+    intentionalClose = false
+    openSocket()
   }
 
   function handleVisibilityChange() {
@@ -1150,9 +1186,7 @@ export function createSignalingClient(options = {}) {
         // doesn't think they are alive and block re-dialing after reconnect.
         closeAllPeerConnections()
         mesh.connections.clear()
-        clearTimeout(reconnectTimer)
-        reconnectTimer = null
-        backoffMs = BACKOFF_BASE_MS
+        resetReconnectBackoff()
         openSocket()
       } else if (registered) {
         // WS still open — close any dead WebRTC connections then refresh peers.
@@ -1221,7 +1255,7 @@ export function createSignalingClient(options = {}) {
 
       if (typeof document !== 'undefined') {
         document.removeEventListener('visibilitychange', handleVisibilityChange)
-        document.removeEventListener('resume', handleVisibilityChange)
+        document.removeEventListener('resume', handleSuspendRestore)
         document.removeEventListener('freeze', handleFreeze)
       }
 
@@ -1281,7 +1315,7 @@ export function createSignalingClient(options = {}) {
     document.addEventListener('visibilitychange', handleVisibilityChange)
     // Page Lifecycle API: fires when a frozen tab is thawed back to active.
     // This is distinct from visibilitychange and fires first on resume.
-    document.addEventListener('resume', handleVisibilityChange)
+    document.addEventListener('resume', handleSuspendRestore)
     // Page Lifecycle API: fires just before the tab CPU is suspended.
     document.addEventListener('freeze', handleFreeze)
   }

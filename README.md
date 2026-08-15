@@ -2,7 +2,17 @@
 
 This project provides a Cloudflare Worker signaling relay for WebRTC peers using the [Peer Signaling Protocol (PSP)](https://github.com/draeder/Peer-Signaling-Protocol-Specification) envelope shape.
 
-## Install from npm
+## Deploy your own federated relay
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/draeder/freertc)
+
+**This is the fastest installation path.** The button creates the Worker and D1 database in your Cloudflare account, applies the signaling schema, and deploys the relay to your own `<worker>.<account>.workers.dev` address.
+
+Immediately after deployment, the install script requests the new Worker's `/health` endpoint. The Worker derives `wss://<worker>.<account>.workers.dev/ws` from that request and registers the address with the `wss://peer.ooo/ws` federation hub. No custom domain is required. Cloudflare lets you customize the Worker and database names before deployment.
+
+See [Cloudflare's Deploy Button documentation](https://developers.cloudflare.com/workers/platform/deploy-buttons/) for details about the account and repository flow.
+
+## Install from npm (manual)
 
 Local project install:
 
@@ -21,7 +31,9 @@ When you run the CLI from your project directory, `freertc` copies the required 
 - `src/index.js`
 - `public/index.html`
 - `public/app.js`
+- `migrations/0001_initial.sql`
 - `scripts/d1-schema.sql`
+- `scripts/deploy-cloudflare.mjs`
 - `wrangler.template.jsonc`
 - `wrangler.workers-dev.jsonc`
 

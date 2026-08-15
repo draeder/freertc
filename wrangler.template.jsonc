@@ -31,7 +31,8 @@
     {
       "binding": "DB",
       "database_name": "freertc-signal-YOUR_DOMAIN",
-      "database_id": "YOUR_D1_DATABASE_ID"
+      "database_id": "YOUR_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
     }
   ],
 
@@ -63,7 +64,8 @@
         {
           "binding": "DB",
           "database_name": "freertc-signal-YOUR_DOMAIN",
-          "database_id": "YOUR_D1_DATABASE_ID"
+          "database_id": "YOUR_D1_DATABASE_ID",
+          "migrations_dir": "migrations"
         }
       ]
     }

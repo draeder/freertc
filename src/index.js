@@ -45,20 +45,23 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const upgrade = request.headers.get("Upgrade");
+    const selfRelayUrl = resolveSelfRelayUrl(request, env.RELAY_URL);
 
     // Heartbeat: self-register and sync with hub every FEDERATION_INTERVAL_MS
-    if (env.RELAY_URL && env.DB) {
+    if (selfRelayUrl && env.DB) {
       const now = Date.now();
       if (now - lastFederationMs > FEDERATION_INTERVAL_MS) {
         lastFederationMs = now;
         ctx.waitUntil((async () => {
-          const selfUrl = normalizeRelayUrl(env.RELAY_URL);
-          if (!selfUrl) return;
-          await upsertRelay(env.DB, selfUrl, env.RELAY_NAME || null).catch(() => {});
+          const relayName = env.RELAY_NAME || relayHostname(selfRelayUrl);
+          await upsertRelay(env.DB, selfRelayUrl, relayName).catch(() => {});
           const hubUrl = env.GLOBAL_RELAY_URL || DEFAULT_HUB_URL;
           // Skip registering with hub if we ARE the hub
-          if (normalizeRelayUrl(hubUrl) !== selfUrl) {
-            await registerWithHub({ ...env, GLOBAL_RELAY_URL: hubUrl }, selfUrl).catch(() => {});
+          if (normalizeRelayUrl(hubUrl) !== selfRelayUrl) {
+            await registerWithHub(
+              { ...env, GLOBAL_RELAY_URL: hubUrl, RELAY_NAME: relayName },
+              selfRelayUrl
+            ).catch(() => {});
           }
         })());
       }
@@ -68,7 +71,7 @@ export default {
       if (url.pathname !== "/ws") {
         return jsonResponse({ ok: false, error: "WebSocket endpoint is /ws" }, 404);
       }
-      return handleWebSocket(request, env, ctx);
+      return handleWebSocket(request, env, ctx, selfRelayUrl);
     }
 
     if (url.pathname === "/ws") {
@@ -80,7 +83,11 @@ export default {
         ok: true,
         version: WORKER_VERSION,
         protocol_version: PSP_VERSION,
-        peers: livePeers.size
+        peers: livePeers.size,
+        relay_url: selfRelayUrl,
+        federation_hub: selfRelayUrl
+          ? normalizeRelayUrl(env.GLOBAL_RELAY_URL || DEFAULT_HUB_URL)
+          : null
       }, 200);
     }
 
@@ -220,6 +227,31 @@ function normalizeRelayUrl(url) {
   // Ensure it ends with /ws
   if (!u.endsWith("/ws")) u = u.replace(/\/$/, "") + "/ws";
   return u;
+}
+
+// A Deploy to Cloudflare flow does not know the account's workers.dev
+// subdomain in advance. Derive it from the first HTTPS request unless an
+// explicit RELAY_URL was configured. Local HTTP development stays unfederated.
+function resolveSelfRelayUrl(request, configuredUrl) {
+  const configured = normalizeRelayUrl(configuredUrl);
+  if (configured) return configured;
+
+  try {
+    const requestUrl = new URL(request.url);
+    if (requestUrl.protocol !== "https:") return null;
+    if (!requestUrl.hostname.toLowerCase().endsWith(".workers.dev")) return null;
+    return `wss://${requestUrl.host}/ws`;
+  } catch {
+    return null;
+  }
+}
+
+function relayHostname(relayUrl) {
+  try {
+    return new URL(relayUrl).hostname;
+  } catch {
+    return null;
+  }
 }
 
 // Derive HTTP base URL from a wss:// relay URL (wss://peer.ooo/ws → https://peer.ooo)
@@ -471,7 +503,7 @@ async function cleanupExpired(db) {
 
 // ===================== WebSocket Handler =====================
 
-function handleWebSocket(request, env, ctx) {
+function handleWebSocket(request, env, ctx, selfRelayUrl) {
   const { 0: client, 1: server } = new WebSocketPair();
 
   let peerKey = null;
@@ -510,7 +542,16 @@ function handleWebSocket(request, env, ctx) {
 
   server.addEventListener("message", async (event) => {
     try {
-      const result = await handleClientMessage(server, event.data, env, ctx, peerKey, network, room);
+      const result = await handleClientMessage(
+        server,
+        event.data,
+        env,
+        ctx,
+        selfRelayUrl,
+        peerKey,
+        network,
+        room
+      );
       if (result) {
         peerKey = result.peerKey;
         network = result.network;
@@ -554,7 +595,16 @@ function handleWebSocket(request, env, ctx) {
   return new Response(null, { status: 101, webSocket: client });
 }
 
-async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null, prevNetwork = null, prevRoom = null) {
+async function handleClientMessage(
+  socket,
+  rawData,
+  env,
+  ctx,
+  selfRelayUrl,
+  prevPeerKey = null,
+  prevNetwork = null,
+  prevRoom = null
+) {
   try {
     if (!rawData) return null;
     if (rawData.length > MAX_MESSAGE_SIZE) return null;
@@ -663,10 +713,9 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
       }
 
       let remotePeers = [];
-      if (env.RELAY_URL && env.DB) {
-        const selfUrl = normalizeRelayUrl(env.RELAY_URL);
+      if (selfRelayUrl && env.DB) {
         const allRelays = await listRelays(env.DB);
-        const remoteUrls = allRelays.map(r => r.url).filter(u => u !== selfUrl);
+        const remoteUrls = allRelays.map(r => r.url).filter(u => u !== selfRelayUrl);
 
         if (remoteUrls.length) {
           const results = await Promise.all(
@@ -750,11 +799,10 @@ async function handleClientMessage(socket, rawData, env, ctx, prevPeerKey = null
       }
 
       // If still not delivered locally and federation is enabled, fan out to peer relays via WebSocket
-      if (!deliveredLive && env.RELAY_URL && env.DB) {
+      if (!deliveredLive && selfRelayUrl && env.DB) {
         ctx.waitUntil((async () => {
           const selfRelayId = env.RELAY_PEER_ID || "relay-bridge";
-          const selfUrl = normalizeRelayUrl(env.RELAY_URL);
-          const remoteUrls = await getPeerRelayUrls(env.DB, selfUrl);
+          const remoteUrls = await getPeerRelayUrls(env.DB, selfRelayUrl);
           if (!remoteUrls.length) return;
           console.log(`[FED] Forwarding ${type} to ${remoteUrls.length} peer relay(s) for ${message.to}`);
           await Promise.all(remoteUrls.map(u => forwardToRelay(u, message, selfRelayId)));
@@ -783,4 +831,11 @@ function validEnvelope(msg) {
   );
 }
 
-export { createRegistrationAck, normalizeRoom, scopeKey, peerScopeKey, validEnvelope };
+export {
+  createRegistrationAck,
+  normalizeRoom,
+  peerScopeKey,
+  resolveSelfRelayUrl,
+  scopeKey,
+  validEnvelope
+};
