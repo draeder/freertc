@@ -1,4 +1,4 @@
-# freertc Cloudflare Worker (WebSocket + D1)
+# freertc
 
 This project provides a Cloudflare Worker signaling relay for WebRTC peers using the [Peer Signaling Protocol (PSP)](https://github.com/draeder/Peer-Signaling-Protocol-Specification) envelope shape.
 
