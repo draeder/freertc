@@ -42,10 +42,12 @@ test("Deploy Button configuration provisions D1, migrations, and private relay i
     assert.match(config, /"workers_dev"\s*:\s*true/);
     assert.match(config, /"GLOBAL_RELAY_URL"\s*:\s*"wss:\/\/peer\.ooo\/ws"/);
     assert.doesNotMatch(config, /"RELAY_URL"\s*:/);
-    assert.match(config, /"database_id"\s*:\s*"00000000-0000-0000-0000-000000000000"/);
     assert.match(config, /"migrations_dir"\s*:\s*"migrations"/);
     assert.doesNotMatch(config, /peer-ooo-worker-devtest|52acefe2/i);
   }
+
+  assert.doesNotMatch(buttonConfig, /"database_id"\s*:/);
+  assert.match(workersDevConfig, /"database_id"\s*:\s*"00000000-0000-0000-0000-000000000000"/);
 
   assert.equal(packageJson.scripts.deploy, "node scripts/deploy-cloudflare.mjs");
   assert.equal(packageJson.scripts.build, "wrangler deploy --dry-run --outdir dist");

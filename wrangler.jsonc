@@ -14,9 +14,8 @@
     {
       "binding": "DB",
       "database_name": "freertc-signal",
-      // Cloudflare's Deploy Button replaces this placeholder with the D1
-      // database it provisions in the installer's account.
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      // Omitting database_id makes Cloudflare's Deploy Button default to
+      // creating a new D1 database in the installer's account.
       "migrations_dir": "migrations"
     }
   ]
