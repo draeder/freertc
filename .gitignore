@@ -15,7 +15,6 @@ build/
 *.swp
 *.swo
 *~
-wrangler.jsonc
 wrangler.toml
 wrangler.*.local.jsonc
 

@@ -2612,6 +2612,36 @@ createApp({
       }
     }
 
+    function handleSuspendRestore() {
+      if (manualDisconnect) return;
+
+      pushLog("socket", "browser resumed — reconnecting immediately");
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+
+      // A thawed browser can briefly report a dead socket as OPEN/CONNECTING.
+      // Detach it so its delayed close cannot schedule a duplicate reconnect.
+      const staleSocket = socket.value;
+      socket.value = null;
+      if (staleSocket) {
+        staleSocket.onopen = null;
+        staleSocket.onmessage = null;
+        staleSocket.onerror = null;
+        staleSocket.onclose = null;
+        try { staleSocket.close(1000, "browser_resume"); } catch { /* no-op */ }
+      }
+
+      for (const peerId of meshLinks.keys()) closeMeshLink(peerId);
+      meshLinks.clear();
+      discoveredPeers.value = [];
+      status.value = "disconnected";
+      stopAutoLoop();
+      stopRtc();
+      connect();
+    }
+
     function handleFreeze() {
       // Tab is about to be CPU-suspended — proactively withdraw from signaling.
       const ws = socket.value;
@@ -2670,9 +2700,9 @@ createApp({
       document.addEventListener("visibilitychange", handleTabVisible);
       // Page Lifecycle API: fires on freeze (CPU-suspend) and resume (thaw).
       document.addEventListener("freeze", handleFreeze);
-      document.addEventListener("resume", handleTabVisible);
+      document.addEventListener("resume", handleSuspendRestore);
       // bfcache restore: browser shows page from back/forward cache (WS is dead).
-      window.addEventListener("pageshow", (e) => { if (e.persisted) handleTabVisible(); });
+      window.addEventListener("pageshow", (e) => { if (e.persisted) handleSuspendRestore(); });
 
       // No-click behavior: boot socket + auto-handshake loop on load.
       connect();

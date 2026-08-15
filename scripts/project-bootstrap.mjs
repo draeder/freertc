@@ -11,7 +11,9 @@ const PROJECT_FILE_MAPPINGS = [
   ['src/index.js', 'src/index.js'],
   ['public/index.html', 'public/index.html'],
   ['public/app.js', 'public/app.js'],
+  ['migrations/0001_initial.sql', 'migrations/0001_initial.sql'],
   ['scripts/d1-schema.sql', 'scripts/d1-schema.sql'],
+  ['scripts/deploy-cloudflare.mjs', 'scripts/deploy-cloudflare.mjs'],
   ['wrangler.template.jsonc', 'wrangler.template.jsonc'],
   ['wrangler.workers-dev.jsonc', 'wrangler.workers-dev.jsonc']
 ];

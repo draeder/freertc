@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createRegistrationAck, peerScopeKey, scopeKey, validEnvelope } from "../src/index.js";
+import {
+  createRegistrationAck,
+  peerScopeKey,
+  resolveSelfRelayUrl,
+  scopeKey,
+  validEnvelope
+} from "../src/index.js";
 
 const envelope = {
   psp_version: "1.0",
@@ -51,4 +57,29 @@ test("accepted announcements receive a scoped registration acknowledgement", () 
   assert.equal(ack.reply_to, envelope.message_id);
   assert.deepEqual(ack.body, { status: "ok", action: "announce" });
   assert.equal(validEnvelope(ack), true);
+});
+
+test("workers.dev deployments derive their public federation relay URL", () => {
+  assert.equal(
+    resolveSelfRelayUrl(
+      new Request("https://freertc-relay.example-account.workers.dev/health"),
+      null
+    ),
+    "wss://freertc-relay.example-account.workers.dev/ws"
+  );
+  assert.equal(
+    resolveSelfRelayUrl(new Request("http://127.0.0.1:8787/health"), null),
+    null
+  );
+  assert.equal(
+    resolveSelfRelayUrl(new Request("https://relay.example.com/health"), null),
+    null
+  );
+  assert.equal(
+    resolveSelfRelayUrl(
+      new Request("https://freertc-relay.example-account.workers.dev/health"),
+      "https://relay.example.com"
+    ),
+    "wss://relay.example.com/ws"
+  );
 });
