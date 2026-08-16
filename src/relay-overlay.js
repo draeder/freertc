@@ -253,17 +253,25 @@ async function postRpc(relayUrl, path, body) {
 
 async function acceptLookupResponse(context, response, targetId, records) {
   if (!response?.ok) return [];
-  const receivedNodes = [];
   const responseNodes = Array.isArray(response.nodes) ? response.nodes : [];
-  for (const node of [response.node, ...responseNodes]) {
-    if (await acceptNodeRecord(context, node)) receivedNodes.push(node);
-  }
+  const uniqueNodes = Array.from(new Map(
+    [response.node, ...responseNodes]
+      .filter((node) => typeof node?.node_id === 'string')
+      .map((node) => [node.node_id, node]),
+  ).values());
+  const acceptedNodes = await Promise.all(uniqueNodes.map(async (node) => (
+    await acceptNodeRecord(context, node) ? node : null
+  )));
+
   const responseRecords = Array.isArray(response.records) ? response.records : [];
-  for (const record of responseRecords) {
-    if (record?.key !== targetId || !await storeProviderRecord(context, record)) continue;
-    records.set(`${record.kind}:${record.node_id}`, record);
+  const acceptedRecords = await Promise.all(responseRecords.map(async (record) => {
+    if (record?.key !== targetId || !await storeProviderRecord(context, record)) return null;
+    return record;
+  }));
+  for (const record of acceptedRecords) {
+    if (record) records.set(`${record.kind}:${record.node_id}`, record);
   }
-  return receivedNodes;
+  return acceptedNodes.filter(Boolean);
 }
 
 async function iterativeLookup(context, targetId, wantRecords = false) {
@@ -288,8 +296,10 @@ async function iterativeLookup(context, targetId, wantRecords = false) {
       want_records: wantRecords,
       requester: context.nodeRecord,
     })));
-    for (const response of responses) {
-      const received = await acceptLookupResponse(context, response, targetId, records);
+    const receivedGroups = await Promise.all(
+      responses.map((response) => acceptLookupResponse(context, response, targetId, records)),
+    );
+    for (const received of receivedGroups) {
       for (const node of received) known.set(node.node_id, node);
     }
   }
