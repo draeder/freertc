@@ -27,12 +27,14 @@ const MAX_LOOKUP_RECORDS = 64;
 const MAX_PROVIDER_RELAYS = 8;
 const MAX_RPC_BODY_BYTES = 128 * 1024;
 const RPC_TIMEOUT_MS = 3_000;
+const BOOTSTRAP_REFRESH_INTERVAL_MS = 5_000;
 const PROVIDER_PUBLISH_INTERVAL_MS = 20_000;
 const PROVIDER_RECORD_TTL_MS = 45_000;
 const MAX_RECENT_PROVIDER_PUBLISHES = 20_000;
 
 const identityPromises = new WeakMap();
 const joinPromises = new WeakMap();
+const recentBootstrapJoins = new WeakMap();
 const recentProviderPublishes = new Map();
 
 function markProviderPublish(key, now) {
@@ -315,14 +317,38 @@ async function joinBootstrap(context) {
     requester: context.nodeRecord,
   })));
   const records = new Map();
+  let joined = 0;
   for (const response of responses) {
+    if (response?.ok) joined += 1;
     await acceptLookupResponse(context, response, context.identity.nodeId, records);
   }
+  return { bootstrapUrls, joined };
 }
 
 async function ensureRoutingContacts(context) {
+  const bootstrapKey = configuredBootstrapUrls(context.env)
+    .filter((url) => url !== context.selfUrl)
+    .sort()
+    .join("\n");
+  const recentJoin = recentBootstrapJoins.get(context.env);
+  if (recentJoin?.bootstrapKey === bootstrapKey &&
+      Date.now() - recentJoin.completedAt < BOOTSTRAP_REFRESH_INTERVAL_MS) {
+    return;
+  }
+
   if (!joinPromises.has(context.env)) {
-    const join = joinBootstrap(context).finally(() => joinPromises.delete(context.env));
+    const join = joinBootstrap(context)
+      .then(({ bootstrapUrls, joined }) => {
+        // Do not cache a failed bootstrap attempt. An isolated relay retries on
+        // the very next operation instead of inheriting a recovery backoff.
+        if (bootstrapUrls.length === 0 || joined > 0) {
+          recentBootstrapJoins.set(context.env, {
+            bootstrapKey,
+            completedAt: Date.now(),
+          });
+        }
+      })
+      .finally(() => joinPromises.delete(context.env));
     joinPromises.set(context.env, join);
   }
   await joinPromises.get(context.env);
@@ -345,7 +371,7 @@ export async function heartbeatKademlia(env, selfUrl, options = {}) {
   const context = await overlayContext(env, selfUrl, options);
   if (!context) return { enabled: false };
   await cleanupExpiredOverlay(context);
-  await joinBootstrap(context);
+  await ensureRoutingContacts(context);
   await iterativeLookup(context, context.identity.nodeId, false);
   return { enabled: true, node_id: context.identity.nodeId };
 }
