@@ -2,13 +2,92 @@
 const BACKOFF_BASE_MS = 1000
 const BACKOFF_MAX_MS = 30000
 const BACKOFF_FACTOR = 1.5
-const DATA_PING_MS = 3000
-const DATA_PONG_TIMEOUT_MS = 12000
+const DATA_PING_MS = 1000
+const DATA_PONG_TIMEOUT_MS = 4000
 const SIGNAL_PING_MS = 1000
-const RELAY_RETRY_INTERVAL_MS = 2000
+const SIGNAL_PONG_TIMEOUT_MS = 4000
+const OFFER_RETRY_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000, 8000, 8000]
 const ANSWER_BURST_COOLDOWN_MS = 3000
 const ANSWER_BURST_DELAYS_MS = [200, 800, 2000]
 const SDP_DEDUP_WINDOW_MS = 15000
+
+/**
+ * Remove a previously owned signaling identity without announcing it again.
+ * This is intended for reload recovery when the departing document's unload
+ * handlers did not get enough time to send their normal withdrawal.
+ */
+export function withdrawSignalingIdentity(options = {}) {
+  const {
+    peerId,
+    networkId,
+    roomId: configuredRoomId,
+    sessionId: legacyRoomId,
+    signalUrl,
+    reason = 'previous_identity_cleanup',
+  } = options
+  const roomId = configuredRoomId || legacyRoomId || networkId
+
+  if (!peerId || !networkId || !roomId || !signalUrl) {
+    throw new Error('peerId, networkId, roomId, and signalUrl are required')
+  }
+
+  let socket = null
+  let timeoutTimer = null
+  let finished = false
+
+  const finish = () => {
+    if (finished) return
+    finished = true
+    clearTimeout(timeoutTimer)
+    timeoutTimer = null
+    if (!socket) return
+    socket.onopen = null
+    socket.onmessage = null
+    socket.onerror = null
+    socket.onclose = null
+    try {
+      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+        socket.close(1000, 'identity_withdrawn')
+      }
+    } catch { /* best effort */ }
+  }
+
+  try {
+    const wsUrl = new URL(signalUrl, typeof location !== 'undefined' ? location.href : undefined)
+    if (!wsUrl.searchParams.get('networkId')) wsUrl.searchParams.set('networkId', networkId)
+    if (!wsUrl.searchParams.get('room')) wsUrl.searchParams.set('room', roomId)
+
+    socket = new WebSocket(wsUrl.toString())
+    socket.onopen = () => {
+      try {
+        const bytes = new Uint8Array(8)
+        const webCrypto = globalThis.window?.crypto ?? globalThis.crypto
+        webCrypto.getRandomValues(bytes)
+        socket.send(JSON.stringify({
+          psp_version: '1.0',
+          type: 'withdraw',
+          network: networkId,
+          from: peerId,
+          to: null,
+          session_id: roomId,
+          message_id: Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join(''),
+          timestamp: Date.now(),
+          ttl_ms: null,
+          reply_to: null,
+          body: { reason },
+        }))
+      } catch { /* best effort */ }
+      finish()
+    }
+    socket.onerror = finish
+    socket.onclose = finish
+    timeoutTimer = setTimeout(finish, 5000)
+  } catch {
+    finish()
+  }
+
+  return { close: finish }
+}
 
 const DEFAULT_ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -16,10 +95,6 @@ const DEFAULT_ICE_SERVERS = [
   { urls: 'stun:stun2.l.google.com:19302' },
   { urls: 'stun:stun3.l.google.com:19302' },
   { urls: 'stun:stun4.l.google.com:19302' },
-  { urls: 'stun:global.stun.twilio.com:3478' },
-]
-
-const ALT_ICE_SERVERS = [
   { urls: 'stun:global.stun.twilio.com:3478' },
   { urls: 'stun:stun.cloudflare.com:3478' },
   { urls: 'stun:stun.nextcloud.com:443' },
@@ -33,6 +108,7 @@ export function createSignalingClient(options = {}) {
     sessionId: legacyRoomId,
     signalUrl,
     iceServers: configuredIceServers,
+    trickleIce = true,
     capabilities = {},
     auth,
     autoConnect = true,
@@ -89,9 +165,12 @@ export function createSignalingClient(options = {}) {
   let peerId = initialPeerId
   let registered = false
   let backoffMs = BACKOFF_BASE_MS
+  let reconnectAttempts = 0
   let reconnectTimer = null
   let advertiseHeartbeatTimer = null
   let keepaliveTimer = null
+  let lastSignalPongAt = Date.now()
+  let lastSignalPingSentAt = 0
   let intentionalClose = false
   let stoppedByUser = false
   let onConnectionStateChangeCb = onConnectionStateChange
@@ -132,20 +211,18 @@ export function createSignalingClient(options = {}) {
 
   // Pending ICE candidate queues — keyed by peerId.
   const pendingCandidates = new Map()
-  // Serialize incoming offer processing per remote peer.
+  // Serialize every remote SDP mutation per peer. Browsers may deliver an
+  // offer and one or more answers in the same task after a tab resumes; letting
+  // those setRemoteDescription calls overlap can leave the peer permanently in
+  // "apply in flight".
   const offerProcessingQueues = new Map()
   // Track scheduled answer retransmit bursts per remote peer.
   const answerBurstTimers = new Map()
-  // Ensure only one remote answer is being applied at a time per peer.
-  const answerApplyInFlight = new Map()
   // Keep the newest answer if it arrives before local state is ready.
   const pendingAnswers = new Map()
   // Track recent offer/answer SDPs per peer to avoid duplicate processing storms.
   const recentOfferSdp = new Map()
   const recentAnswerSdp = new Map()
-  // One-time alternate STUN fallback when default profile yields no candidates.
-  const altStunFallbackTried = new Set()
-
   const preferredIceServers = Array.isArray(configuredIceServers) && configuredIceServers.length > 0
     ? configuredIceServers
     : DEFAULT_ICE_SERVERS
@@ -160,6 +237,28 @@ export function createSignalingClient(options = {}) {
     try {
       onNegotiationFailure?.({ ...details, ts: Date.now() })
     } catch {}
+  }
+
+  function enqueuePeerNegotiation(remotePeerId, operation) {
+    const previous = offerProcessingQueues.get(remotePeerId) ?? Promise.resolve()
+    const queued = previous
+      .catch(() => {})
+      .then(operation)
+    offerProcessingQueues.set(remotePeerId, queued)
+    queued.finally(() => {
+      if (offerProcessingQueues.get(remotePeerId) === queued) {
+        offerProcessingQueues.delete(remotePeerId)
+      }
+    }).catch(() => {})
+    return queued
+  }
+
+  function clearOfferRetryTimer(pc) {
+    if (!pc) return
+    if (pc.__offerRetryTimer) {
+      clearTimeout(pc.__offerRetryTimer)
+      pc.__offerRetryTimer = null
+    }
   }
 
   function getOrCreateSessionId() {
@@ -210,7 +309,7 @@ export function createSignalingClient(options = {}) {
     for (const delayMs of ANSWER_BURST_DELAYS_MS) {
       const timerId = setTimeout(() => {
         const current = mesh.connections.get(remotePeerId)
-        if (!current) return
+        if (!current || current.connection !== pc) return
         if (
           pc.signalingState === 'closed' ||
           pc.connectionState === 'connected' ||
@@ -309,6 +408,8 @@ export function createSignalingClient(options = {}) {
   function stopKeepalive() {
     clearInterval(keepaliveTimer)
     keepaliveTimer = null
+    lastSignalPingSentAt = 0
+    lastSignalPongAt = Date.now()
   }
 
   function startAdvertiseHeartbeat() {
@@ -327,17 +428,33 @@ export function createSignalingClient(options = {}) {
     stopKeepalive()
     keepaliveTimer = setInterval(() => {
       if (!registered) return
+      if (typeof document !== 'undefined' && document.hidden) {
+        lastSignalPingSentAt = 0
+        lastSignalPongAt = Date.now()
+        return
+      }
+      const pingInFlight = lastSignalPingSentAt > lastSignalPongAt
+      if (pingInFlight) {
+        if (Date.now() - lastSignalPingSentAt >= SIGNAL_PONG_TIMEOUT_MS) {
+          log('[signal] keepalive timed out; reconnecting immediately')
+          try { ws?.close(4000, 'keepalive_timeout') } catch {}
+        }
+        return
+      }
       send(pspEnvelope('ping', { body: { nonce: generateMessageId() } }))
+      lastSignalPingSentAt = Date.now()
     }, SIGNAL_PING_MS)
   }
 
   function scheduleReconnect(openSocket, closeCode) {
     if (closeCode === 1000 || stoppedByUser) return
-    log(`[signal] reconnecting in ${backoffMs}ms`)
+    const delayMs = reconnectAttempts === 0 ? 0 : backoffMs
+    log(delayMs === 0 ? '[signal] reconnecting immediately' : `[signal] reconnecting in ${delayMs}ms`)
     reconnectTimer = setTimeout(() => {
       openSocket()
-    }, backoffMs)
-    backoffMs = Math.min(backoffMs * BACKOFF_FACTOR, BACKOFF_MAX_MS)
+    }, delayMs)
+    reconnectAttempts += 1
+    if (delayMs > 0) backoffMs = Math.min(backoffMs * BACKOFF_FACTOR, BACKOFF_MAX_MS)
   }
 
   function closeAllPeerConnections() {
@@ -346,8 +463,8 @@ export function createSignalingClient(options = {}) {
         entry.connection?.close()
       } catch {}
       clearAnswerBurst(remotePeerId)
-      answerApplyInFlight.delete(remotePeerId)
       offerProcessingQueues.delete(remotePeerId)
+      pendingAnswers.delete(remotePeerId)
       onConnectionStateChangeCb?.({ peerId: remotePeerId, state: 'closed', ts: Date.now() })
     }
   }
@@ -367,10 +484,26 @@ export function createSignalingClient(options = {}) {
       lastPongAt = Date.now()
     }
 
+    function closeBrokenChannel(reason) {
+      const currentEntry = mesh.connections.get(remotePeerId)
+      const ownsCurrentEntry = currentEntry?.connection === pc && currentEntry.channel === channel
+      log(`[webrtc] ${reason} to ${remotePeerId}; closing peer connection`)
+      clearInterval(keepaliveTimerId)
+      keepaliveTimerId = null
+      try { channel.close() } catch {}
+      try { pc.close() } catch {}
+      if (ownsCurrentEntry) mesh.markDead(remotePeerId)
+    }
+
     const entry = mesh.connections.get(remotePeerId)
-    if (entry) entry.channel = channel
+    if (entry?.connection === pc) entry.channel = channel
 
     channel.onopen = () => {
+      const currentEntry = mesh.connections.get(remotePeerId)
+      if (currentEntry?.connection !== pc || currentEntry.channel !== channel) {
+        try { channel.close() } catch {}
+        return
+      }
       log(`[webrtc] data channel open to ${remotePeerId}`)
       lastPongAt = Date.now()
       _acquireWakeLock()
@@ -381,13 +514,22 @@ export function createSignalingClient(options = {}) {
       }
 
       const openEntry = mesh.connections.get(remotePeerId)
-      if (openEntry) {
+      if (openEntry?.connection === pc) {
         openEntry.channel = channel
         openEntry.lastSeen = Date.now()
       }
+      // RTCPeerConnection "connected" may precede data-channel readiness.
+      // Emit again at the exact usable boundary so callers can send immediately.
+      onConnectionStateChangeCb?.({ peerId: remotePeerId, state: 'connected', ts: Date.now() })
 
       clearInterval(keepaliveTimerId)
       keepaliveTimerId = setInterval(() => {
+        const currentEntry = mesh.connections.get(remotePeerId)
+        if (currentEntry?.connection !== pc || currentEntry.channel !== channel) {
+          clearInterval(keepaliveTimerId)
+          keepaliveTimerId = null
+          return
+        }
         if (channel.readyState !== 'open') return
 
         // Browsers throttle timers in hidden tabs — don't falsely time out.
@@ -399,30 +541,27 @@ export function createSignalingClient(options = {}) {
 
         // Only consider a timeout if we sent a ping that hasn't been answered.
         const pingInFlight = lastPingSentAt > lastPongAt
-        if (pingInFlight && Date.now() - lastPingSentAt > DATA_PONG_TIMEOUT_MS) {
-          log(`[webrtc] data channel timeout to ${remotePeerId}; closing peer connection`)
-          clearInterval(keepaliveTimerId)
-          keepaliveTimerId = null
-          try {
-            channel.close()
-          } catch {}
-          try {
-            pc.close()
-          } catch {}
-          mesh.markDead(remotePeerId)
+        if (pingInFlight && Date.now() - lastPingSentAt >= DATA_PONG_TIMEOUT_MS) {
+          closeBrokenChannel('data channel timeout')
           return
         }
+
+        // Keep one outstanding ping. Replacing its timestamp on every tick
+        // made a silent channel impossible to time out.
+        if (pingInFlight) return
 
         try {
           channel.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
           lastPingSentAt = Date.now()
         } catch {
-          // Ignore transient send errors.
+          closeBrokenChannel('data channel keepalive send failed')
         }
       }, DATA_PING_MS)
     }
 
     channel.onmessage = (event) => {
+      const currentEntry = mesh.connections.get(remotePeerId)
+      if (currentEntry?.connection !== pc || currentEntry.channel !== channel) return
       let msg
       try {
         msg = JSON.parse(event.data)
@@ -435,7 +574,7 @@ export function createSignalingClient(options = {}) {
         try {
           channel.send(JSON.stringify({ type: 'pong', ts: Date.now() }))
         } catch {
-          // Ignore send failure.
+          closeBrokenChannel('data channel pong send failed')
         }
         return
       }
@@ -457,7 +596,10 @@ export function createSignalingClient(options = {}) {
         document.removeEventListener('visibilitychange', onVisible)
       }
       const closedEntry = mesh.connections.get(remotePeerId)
-      if (closedEntry?.channel === channel) closedEntry.channel = null
+      if (closedEntry?.connection === pc && closedEntry.channel === channel) {
+        closedEntry.channel = null
+        onConnectionStateChangeCb?.({ peerId: remotePeerId, state: 'closed', ts: Date.now() })
+      }
       // Release the wake lock if no more open data channels remain.
       const anyOpen = [...mesh.connections.values()].some(
         (e) => e.channel?.readyState === 'open'
@@ -466,8 +608,11 @@ export function createSignalingClient(options = {}) {
     }
 
     channel.onerror = (evt) => {
+      const currentEntry = mesh.connections.get(remotePeerId)
+      if (currentEntry?.connection !== pc || currentEntry.channel !== channel) return
       const msg = evt?.error?.message ?? evt?.error ?? evt?.message ?? String(evt)
       log(`[webrtc] data channel error to ${remotePeerId}: ${msg}`)
+      onConnectionStateChangeCb?.({ peerId: remotePeerId, state: 'failed', ts: Date.now() })
     }
   }
 
@@ -498,9 +643,10 @@ export function createSignalingClient(options = {}) {
     onConnectionStateChangeCb?.({ peerId: remotePeerId, state: 'connecting', ts: Date.now() })
 
     pc.onicecandidate = (event) => {
+      const current = mesh.connections.get(remotePeerId)
+      if (current?.connection !== pc) return
       if (event.candidate) {
-        const entry = mesh.connections.get(remotePeerId)
-        if (entry) entry.localCandidateCount = (entry.localCandidateCount ?? 0) + 1
+        current.localCandidateCount = (current.localCandidateCount ?? 0) + 1
         log(`[webrtc] local candidate to ${remotePeerId}`)
         sendRelay('ice_candidate', {
           candidate: {
@@ -515,6 +661,7 @@ export function createSignalingClient(options = {}) {
     }
 
     pc.onicecandidateerror = (event) => {
+      if (mesh.connections.get(remotePeerId)?.connection !== pc) return
       const code = event?.errorCode ?? 'unknown'
       const text = event?.errorText ?? 'unknown'
       const url = event?.url ?? 'n/a'
@@ -522,33 +669,26 @@ export function createSignalingClient(options = {}) {
     }
 
     pc.onconnectionstatechange = () => {
-      log(`[webrtc] connection to ${remotePeerId}: ${pc.connectionState}`)
+      if (pc.connectionState === 'closed') clearOfferRetryTimer(pc)
       const entry = mesh.connections.get(remotePeerId)
-      if (entry) {
-        entry.state = pc.connectionState
-        entry.lastSeen = Date.now()
-      }
+      if (entry?.connection !== pc) return
+      log(`[webrtc] connection to ${remotePeerId}: ${pc.connectionState}`)
+      entry.state = pc.connectionState
+      entry.lastSeen = Date.now()
       onConnectionStateChangeCb?.({ peerId: remotePeerId, state: pc.connectionState, ts: Date.now() })
 
       if (pc.connectionState === 'connected') {
         mesh.markLive(remotePeerId)
         clearAnswerBurst(remotePeerId)
       } else if (pc.connectionState === 'disconnected') {
-        const entry = mesh.connections.get(remotePeerId)
-        if (entry) entry.state = 'recovering'
+        entry.state = 'recovering'
       } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
         mesh.markDead(remotePeerId)
-      }
-
-      if (pc.connectionState === 'closed') {
-        if (pc.__offerRetryTimer) {
-          clearInterval(pc.__offerRetryTimer)
-          pc.__offerRetryTimer = null
-        }
       }
     }
 
     pc.oniceconnectionstatechange = () => {
+      if (mesh.connections.get(remotePeerId)?.connection !== pc) return
       log(`[webrtc] ice to ${remotePeerId}: ${pc.iceConnectionState}`)
       if (pc.iceConnectionState === 'failed') {
         mesh.markDead(remotePeerId)
@@ -556,10 +696,15 @@ export function createSignalingClient(options = {}) {
     }
 
     pc.onicegatheringstatechange = () => {
+      if (mesh.connections.get(remotePeerId)?.connection !== pc) return
       log(`[webrtc] ice gathering to ${remotePeerId}: ${pc.iceGatheringState}`)
     }
 
     pc.ondatachannel = (event) => {
+      if (mesh.connections.get(remotePeerId)?.connection !== pc) {
+        try { event.channel?.close?.() } catch {}
+        return
+      }
       attachDataChannelHandlers(event.channel, remotePeerId, pc)
     }
 
@@ -567,6 +712,13 @@ export function createSignalingClient(options = {}) {
   }
 
   async function initiateWebRTCConnection(toPeerId, iceServers = null) {
+    return enqueuePeerNegotiation(
+      toPeerId,
+      () => initiateWebRTCConnectionLocked(toPeerId, iceServers),
+    )
+  }
+
+  async function initiateWebRTCConnectionLocked(toPeerId, iceServers = null) {
     const priorEntry = mesh.connections.get(toPeerId)
     const prior = priorEntry?.connection
 
@@ -598,75 +750,38 @@ export function createSignalingClient(options = {}) {
 
     // If an answer arrived before we reached have-local-offer, apply it now.
     const pendingAnswer = pendingAnswers.get(toPeerId)
-    if (
-      pendingAnswer?.sdp &&
-      pendingAnswer?.sessionId === activeSessionId &&
-      pc.signalingState === 'have-local-offer'
-    ) {
-      try {
-        await pc.setRemoteDescription({ type: 'answer', sdp: pendingAnswer.sdp })
-        const entry = mesh.connections.get(toPeerId)
-        if (entry) entry.lastAppliedAnswerSdp = pendingAnswer.sdp
-        recentAnswerSdp.set(toPeerId, { sdp: pendingAnswer.sdp, ts: Date.now() })
-        pendingAnswers.delete(toPeerId)
-        if (pc.__offerRetryTimer) {
-          clearInterval(pc.__offerRetryTimer)
-          pc.__offerRetryTimer = null
-        }
-        log(`[webrtc] applied queued answer from ${toPeerId}`)
-
-        // Flush queued ICE candidates that may have arrived before answer apply.
-        const queued = pendingCandidates.get(toPeerId) ?? []
-        pendingCandidates.delete(toPeerId)
-        for (const candidate of queued) {
-          await pc.addIceCandidate(candidate).catch(() => {})
-        }
-      } catch (err) {
-        log(`[webrtc] failed applying queued answer from ${toPeerId}: ${err}`)
+    if (pendingAnswer?.sdp && pendingAnswer?.sessionId === activeSessionId) {
+      const current = mesh.connections.get(toPeerId)?.connection
+      if (current === pc && pc.signalingState === 'have-local-offer') {
+        await applyIncomingAnswer(toPeerId, pendingAnswer.sdp, pendingAnswer.sessionId)
       }
     }
-    await waitForIceGatheringComplete(pc)
+    if (!trickleIce) await waitForIceGatheringComplete(pc)
 
-    relaySignal(toPeerId, 'offer', { sdp: pc.localDescription?.sdp ?? offer.sdp, trickle_ice: true })
+    relaySignal(toPeerId, 'offer', {
+      sdp: pc.localDescription?.sdp ?? offer.sdp,
+      trickle_ice: Boolean(trickleIce),
+    })
 
-    // If default profile yields zero candidates, try one alternate STUN profile.
-    const candidateHealthTimer = setTimeout(() => {
-      const entry = mesh.connections.get(toPeerId)
-      const localCount = entry?.localCandidateCount ?? 0
-      if (localCount > 0) return
-      if (pc.remoteDescription) return
-      if (pc.signalingState !== 'have-local-offer') return
-      const alreadyTried = altStunFallbackTried.has(toPeerId)
-      if (alreadyTried) return
-      altStunFallbackTried.add(toPeerId)
-      log(`[webrtc] no local ICE candidates for ${toPeerId}; retrying with alternate STUN profile`)
-      try { pc.close() } catch {}
-      mesh.connections.delete(toPeerId)
-      clearInterval(retryTimer)
-      initiateWebRTCConnection(toPeerId, ALT_ICE_SERVERS)
-    }, 5000)
-
-    let retries = 0
-    const MAX_OFFER_RETRIES = 15 // 15 × 2s = 30s max, better with ping-queued relay
-    const retryTimer = setInterval(() => {
+    let retryIndex = 0
+    const retryOffer = () => {
+      pc.__offerRetryTimer = null
+      if (mesh.connections.get(toPeerId)?.connection !== pc) return
       if (pc.signalingState === 'closed' || pc.remoteDescription) {
-        clearInterval(retryTimer)
-        clearTimeout(candidateHealthTimer)
+        clearOfferRetryTimer(pc)
         return
       }
       if (pc.signalingState !== 'have-local-offer') {
-        clearInterval(retryTimer)
-        clearTimeout(candidateHealthTimer)
+        clearOfferRetryTimer(pc)
         return
       }
-      if (retries >= MAX_OFFER_RETRIES) {
-        clearInterval(retryTimer)
-        clearTimeout(candidateHealthTimer)
-        log(`[webrtc] offer to ${toPeerId} timed out after ${MAX_OFFER_RETRIES} retries; giving up`)
+      if (retryIndex >= OFFER_RETRY_DELAYS_MS.length) {
+        clearOfferRetryTimer(pc)
+        log(`[webrtc] offer to ${toPeerId} timed out after ${retryIndex} retries; giving up`)
         notifyNegotiationFailure({
           peerId: toPeerId,
           reason: 'offer_retries_exhausted',
-          retryCount: retries,
+          retryCount: retryIndex,
           signalingState: pc.signalingState,
           connectionState: pc.connectionState,
         })
@@ -674,19 +789,24 @@ export function createSignalingClient(options = {}) {
         mesh.markDead(toPeerId)
         return
       }
-      retries += 1
-      relaySignal(toPeerId, 'offer', { sdp: pc.localDescription?.sdp ?? offer.sdp, trickle_ice: true })
-    }, RELAY_RETRY_INTERVAL_MS)
+      retryIndex += 1
+      relaySignal(toPeerId, 'offer', {
+        sdp: pc.localDescription?.sdp ?? offer.sdp,
+        trickle_ice: Boolean(trickleIce),
+      })
+      const nextDelayMs = OFFER_RETRY_DELAYS_MS[Math.min(
+        retryIndex,
+        OFFER_RETRY_DELAYS_MS.length - 1,
+      )]
+      pc.__offerRetryTimer = setTimeout(retryOffer, nextDelayMs)
+    }
 
-    pc.__offerRetryTimer = retryTimer
+    pc.__offerRetryTimer = setTimeout(retryOffer, OFFER_RETRY_DELAYS_MS[retryIndex])
     return pc
   }
 
   async function handleIncomingOffer(fromPeerId, offer) {
-    let queue = offerProcessingQueues.get(fromPeerId) ?? Promise.resolve()
-
-    queue = queue
-      .then(async () => {
+    return enqueuePeerNegotiation(fromPeerId, async () => {
         const sendRelay = (type, body) => {
           relaySignal(fromPeerId, type, body)
         }
@@ -718,7 +838,6 @@ export function createSignalingClient(options = {}) {
           mesh.connections.delete(fromPeerId)
           clearAnswerBurst(fromPeerId)
           pendingCandidates.delete(fromPeerId)
-          offerProcessingQueues.delete(fromPeerId)
         }
 
         const freshEntry = mesh.connections.get(fromPeerId)
@@ -761,6 +880,27 @@ export function createSignalingClient(options = {}) {
         }
 
         if (pc.signalingState === 'closed') return
+
+        const offerCollision = pc.signalingState !== 'stable'
+        if (offerCollision) {
+          // Both peers derive opposite roles from the stable peer IDs. The
+          // lexically later peer is polite and rolls back; the earlier peer
+          // keeps its local offer. Exactly one offer therefore wins glare.
+          const polite = String(peerId) > String(fromPeerId)
+          if (!polite) {
+            log(`[webrtc] ignoring colliding offer from ${fromPeerId} (impolite peer)`)
+            return
+          }
+          if (pc.signalingState !== 'have-local-offer') {
+            log(`[webrtc] ignoring colliding offer from ${fromPeerId} (state=${pc.signalingState})`)
+            return
+          }
+          clearOfferRetryTimer(pc)
+          pendingAnswers.delete(fromPeerId)
+          await pc.setLocalDescription({ type: 'rollback' })
+          log(`[webrtc] rolled back local offer for ${fromPeerId} (polite peer)`)
+        }
+
         await pc.setRemoteDescription(offer)
 
         if (entry) {
@@ -776,21 +916,78 @@ export function createSignalingClient(options = {}) {
         const answer = await pc.createAnswer()
         if (pc.signalingState === 'closed') return
         await pc.setLocalDescription(answer)
-        await waitForIceGatheringComplete(pc)
+        if (!trickleIce) await waitForIceGatheringComplete(pc)
         const finalAnswerSdp = pc.localDescription?.sdp ?? answer.sdp
         if (entry) {
-          entry.lastLocalAnswer = { sdp: finalAnswerSdp }
+          entry.lastLocalAnswer = {
+            sdp: finalAnswerSdp,
+            trickle_ice: Boolean(trickleIce),
+          }
         }
         if (incomingOfferSdp) {
           recentOfferSdp.set(fromPeerId, { sdp: incomingOfferSdp, ts: Date.now() })
         }
-        startAnswerBurst(fromPeerId, pc, sendRelay, { sdp: finalAnswerSdp }, true)
-      })
-      .catch((err) => {
+        startAnswerBurst(fromPeerId, pc, sendRelay, {
+          sdp: finalAnswerSdp,
+          trickle_ice: Boolean(trickleIce),
+        }, true)
+      }).catch((err) => {
         log(`[webrtc] handleIncomingOffer failed: ${err}`)
       })
+  }
 
-    offerProcessingQueues.set(fromPeerId, queue)
+  async function applyIncomingAnswer(fromPeerId, incomingAnswerSdp, sessionId) {
+    const conn = mesh.connections.get(fromPeerId)
+    if (!conn?.connection) {
+      pendingAnswers.set(fromPeerId, { sdp: incomingAnswerSdp, sessionId, ts: Date.now() })
+      log(`[webrtc] queued answer from ${fromPeerId} (no connection yet)`)
+      return
+    }
+
+    const expectedSessionId = roomId
+    if (expectedSessionId && sessionId && sessionId !== expectedSessionId) {
+      log(`[webrtc] ignoring answer from ${fromPeerId} (stale session)`)
+      return
+    }
+
+    const now = Date.now()
+    const recent = recentAnswerSdp.get(fromPeerId)
+    if (recent?.sdp === incomingAnswerSdp && now - recent.ts < SDP_DEDUP_WINDOW_MS) {
+      log(`[webrtc] ignoring duplicate answer from ${fromPeerId} (dedup window)`)
+      return
+    }
+    if (conn.lastAppliedAnswerSdp === incomingAnswerSdp) {
+      log(`[webrtc] ignoring duplicate answer from ${fromPeerId} (already applied)`)
+      return
+    }
+
+    const pc = conn.connection
+    if (pc.signalingState !== 'have-local-offer') {
+      log(`[webrtc] ignoring answer from ${fromPeerId} (state=${pc.signalingState})`)
+      return
+    }
+
+    await pc.setRemoteDescription({ type: 'answer', sdp: incomingAnswerSdp })
+    log(`[webrtc] applied answer from ${fromPeerId}`)
+    conn.lastAppliedAnswerSdp = incomingAnswerSdp
+    recentAnswerSdp.set(fromPeerId, { sdp: incomingAnswerSdp, ts: Date.now() })
+    pendingAnswers.delete(fromPeerId)
+    clearOfferRetryTimer(pc)
+
+    const queued = pendingCandidates.get(fromPeerId) ?? []
+    pendingCandidates.delete(fromPeerId)
+    for (const candidate of queued) {
+      await pc.addIceCandidate(candidate).catch(() => {})
+    }
+  }
+
+  async function handleIncomingAnswer(fromPeerId, incomingAnswerSdp, sessionId) {
+    return enqueuePeerNegotiation(
+      fromPeerId,
+      () => applyIncomingAnswer(fromPeerId, incomingAnswerSdp, sessionId),
+    ).catch((err) => {
+      log(`[webrtc] setRemoteDescription(answer) failed: ${err}`)
+    })
   }
 
   async function handleSignalingMessage(rawMsg) {
@@ -827,67 +1024,8 @@ export function createSignalingClient(options = {}) {
         break
 
       case 'answer':
-        if (conn?.connection) {
-          const incomingAnswerSdp = msg.body?.sdp ?? null
-          if (!incomingAnswerSdp) break
-          const expectedSessionId = roomId
-          if (expectedSessionId && msg.session_id && msg.session_id !== expectedSessionId) {
-            log(`[webrtc] ignoring answer from ${fromPeerId} (stale session)`)
-            break
-          }
-          const now = Date.now()
-          const recent = recentAnswerSdp.get(fromPeerId)
-          if (
-            incomingAnswerSdp &&
-            recent?.sdp === incomingAnswerSdp &&
-            now - recent.ts < SDP_DEDUP_WINDOW_MS
-          ) {
-            log(`[webrtc] ignoring duplicate answer from ${fromPeerId} (dedup window)`)
-            break
-          }
-          if (incomingAnswerSdp && conn.lastAppliedAnswerSdp === incomingAnswerSdp) {
-            log(`[webrtc] ignoring duplicate answer from ${fromPeerId} (already applied)`)
-            break
-          }
-          if (answerApplyInFlight.get(fromPeerId)) {
-            pendingAnswers.set(fromPeerId, { sdp: incomingAnswerSdp, sessionId: msg.session_id ?? null, ts: Date.now() })
-            log(`[webrtc] ignoring answer from ${fromPeerId} (apply in flight)`)
-            break
-          }
-          if (conn.connection.signalingState !== 'have-local-offer') {
-            pendingAnswers.set(fromPeerId, { sdp: incomingAnswerSdp, sessionId: msg.session_id ?? null, ts: Date.now() })
-            log(`[webrtc] ignoring answer from ${fromPeerId} (state=${conn.connection.signalingState})`)
-            break
-          }
-          answerApplyInFlight.set(fromPeerId, true)
-          conn.connection
-            .setRemoteDescription({ type: 'answer', sdp: incomingAnswerSdp })
-            .then(async () => {
-              log(`[webrtc] applied answer from ${fromPeerId}`)
-              if (incomingAnswerSdp) {
-                conn.lastAppliedAnswerSdp = incomingAnswerSdp
-                recentAnswerSdp.set(fromPeerId, { sdp: incomingAnswerSdp, ts: Date.now() })
-              }
-              pendingAnswers.delete(fromPeerId)
-              if (conn.connection.__offerRetryTimer) {
-                clearInterval(conn.connection.__offerRetryTimer)
-                conn.connection.__offerRetryTimer = null
-              }
-
-              const queued = pendingCandidates.get(fromPeerId) ?? []
-              pendingCandidates.delete(fromPeerId)
-              for (const candidate of queued) {
-                await conn.connection.addIceCandidate(candidate).catch(() => {})
-              }
-            })
-            .catch((err) => { log(`[webrtc] setRemoteDescription(answer) failed: ${err}`) })
-            .finally(() => { answerApplyInFlight.delete(fromPeerId) })
-        } else {
-          const incomingAnswerSdp = msg.body?.sdp ?? null
-          if (incomingAnswerSdp) {
-            pendingAnswers.set(fromPeerId, { sdp: incomingAnswerSdp, sessionId: msg.session_id ?? null, ts: Date.now() })
-            log(`[webrtc] queued answer from ${fromPeerId} (no connection yet)`)
-          }
+        if (msg.body?.sdp) {
+          handleIncomingAnswer(fromPeerId, msg.body.sdp, msg.session_id ?? null)
         }
         break
 
@@ -930,31 +1068,11 @@ export function createSignalingClient(options = {}) {
         break
 
       case 'renegotiate': {
-        const pc = conn?.connection
-        if (!pc || pc.signalingState === 'closed') break
-        ;(async () => {
-          try {
-            // Glare: we already sent an offer — roll it back so we can accept theirs.
-            if (pc.signalingState === 'have-local-offer') {
-              await pc.setLocalDescription({ type: 'rollback' })
-            }
-            if (pc.signalingState !== 'stable') {
-              log(`[webrtc] renegotiate ignored — unexpected state: ${pc.signalingState}`)
-              return
-            }
-            await pc.setRemoteDescription({ type: 'offer', sdp: msg.body.sdp })
-            const answer = await pc.createAnswer()
-            await pc.setLocalDescription(answer)
-            await waitForIceGatheringComplete(pc)
-            relaySignal(fromPeerId, 'answer', { sdp: pc.localDescription?.sdp ?? answer.sdp })
-            if (conn) {
-              conn.lastLocalAnswer = { sdp: pc.localDescription?.sdp ?? answer.sdp }
-              conn.lastRemoteOfferSdp = msg.body.sdp
-            }
-          } catch (err) {
+        if (msg.body?.sdp) {
+          handleIncomingOffer(fromPeerId, { type: 'offer', sdp: msg.body.sdp }).catch((err) => {
             log(`[webrtc] renegotiate failed: ${err}`)
-          }
-        })()
+          })
+        }
         break
       }
     }
@@ -989,7 +1107,7 @@ export function createSignalingClient(options = {}) {
           peerId:       p.peer_id,
           networkId:    p.network ?? networkId,
           capabilities: p.hints ?? {},
-          advertisedAt: p.last_seen ?? Date.now(),
+          advertisedAt: p.last_seen ?? p.timestamp ?? Date.now(),
           advisory:     true,
           localSeenAt:  Date.now(),
         }))
@@ -1008,7 +1126,8 @@ export function createSignalingClient(options = {}) {
         break
 
       case 'pong':
-        // Keepalive response; intentionally silent.
+        lastSignalPongAt = Date.now()
+        lastSignalPingSentAt = 0
         break
 
       case 'error':
@@ -1050,6 +1169,9 @@ export function createSignalingClient(options = {}) {
       intentionalClose = false
       setStatus('connected')
       backoffMs = BACKOFF_BASE_MS
+      reconnectAttempts = 0
+      lastSignalPongAt = Date.now()
+      lastSignalPingSentAt = 0
 
       send(pspEnvelope('announce', {
         ttl_ms: 30000,
@@ -1072,6 +1194,10 @@ export function createSignalingClient(options = {}) {
         log('[signal] received non-JSON message')
         return
       }
+      // Any valid relay message proves that the socket is alive, even if a
+      // particular relay version does not emit explicit pong frames.
+      lastSignalPongAt = Date.now()
+      lastSignalPingSentAt = 0
       handleMessage(msg)
     }
 
@@ -1116,15 +1242,22 @@ export function createSignalingClient(options = {}) {
     client.disconnect()
   }
 
-  function handleFreeze() {
-    // Page Lifecycle API: tab is about to be frozen (CPU-suspended).
-    // Proactively send a withdraw so the server removes this peer before the
-    // WebSocket is force-closed by the OS.
-    if (registered && ws?.readyState === WebSocket.OPEN) {
-      try {
-        send(pspEnvelope('withdraw', { body: { reason: 'tab_freeze' } }))
-      } catch { /* ignore */ }
+  const pageHideHandler = (event) => {
+    // A persisted pagehide is entering the back/forward cache rather than
+    // being destroyed. Keep the identity announced and let pageshow rebuild
+    // the transport if the browser closes it while the document is cached.
+    if (event?.persisted) {
+      handleFreeze()
+      return
     }
+    client.disconnect()
+  }
+
+  function handleFreeze() {
+    // A frozen page is suspended, not departed. Withdrawing here made relay
+    // membership oscillate whenever Safari or a mobile browser throttled a
+    // background tab. Actual teardown still withdraws through pagehide,
+    // beforeunload, unload, and disconnect.
     // Mark all connected peers as recovering so they are re-verified on resume.
     for (const entry of mesh.connections.values()) {
       if (entry.state === 'connected') entry.state = 'recovering'
@@ -1142,6 +1275,7 @@ export function createSignalingClient(options = {}) {
     clearTimeout(reconnectTimer)
     reconnectTimer = null
     backoffMs = BACKOFF_BASE_MS
+    reconnectAttempts = 0
   }
 
   function handleSuspendRestore() {
@@ -1244,12 +1378,14 @@ export function createSignalingClient(options = {}) {
       for (const remotePeerId of answerBurstTimers.keys()) {
         clearAnswerBurst(remotePeerId)
       }
-      answerApplyInFlight.clear()
+      pendingAnswers.clear()
       registered = false
       _releaseWakeLock()
 
       if (typeof window !== 'undefined') {
         window.removeEventListener('beforeunload', unloadHandler)
+        window.removeEventListener('pagehide', pageHideHandler)
+        window.removeEventListener('unload', unloadHandler)
         window.removeEventListener('pageshow', handlePageShow)
       }
 
@@ -1307,6 +1443,9 @@ export function createSignalingClient(options = {}) {
 
   if (typeof window !== 'undefined') {
     window.addEventListener('beforeunload', unloadHandler, { once: true })
+    // pagehide is the reliable teardown event in Safari and on mobile.
+    window.addEventListener('pagehide', pageHideHandler)
+    window.addEventListener('unload', unloadHandler, { once: true })
     // bfcache: restore from back/forward cache.
     window.addEventListener('pageshow', handlePageShow)
   }
