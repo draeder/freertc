@@ -251,12 +251,13 @@ async function postRpc(relayUrl, path, body) {
   }
 }
 
-async function acceptLookupResponse(context, response, targetId, records) {
+async function acceptLookupResponse(context, response, targetId, records, knownNodeIds = null) {
   if (!response?.ok) return [];
   const responseNodes = Array.isArray(response.nodes) ? response.nodes : [];
   const uniqueNodes = Array.from(new Map(
     [response.node, ...responseNodes]
       .filter((node) => typeof node?.node_id === 'string')
+      .filter((node) => !knownNodeIds?.has(node.node_id))
       .map((node) => [node.node_id, node]),
   ).values());
   const acceptedNodes = await Promise.all(uniqueNodes.map(async (node) => (
@@ -296,8 +297,15 @@ async function iterativeLookup(context, targetId, wantRecords = false) {
       want_records: wantRecords,
       requester: context.nodeRecord,
     })));
+    const knownNodeIds = new Set(known.keys());
     const receivedGroups = await Promise.all(
-      responses.map((response) => acceptLookupResponse(context, response, targetId, records)),
+      responses.map((response) => acceptLookupResponse(
+        context,
+        response,
+        targetId,
+        records,
+        knownNodeIds,
+      )),
     );
     for (const received of receivedGroups) {
       for (const node of received) known.set(node.node_id, node);
