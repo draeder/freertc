@@ -698,10 +698,16 @@ export function createSignalingClient(options = {}) {
     }
 
     pc.oniceconnectionstatechange = () => {
-      if (mesh.connections.get(remotePeerId)?.connection !== pc) return
+      const entry = mesh.connections.get(remotePeerId)
+      if (entry?.connection !== pc) return
       log(`[webrtc] ice to ${remotePeerId}: ${pc.iceConnectionState}`)
+      entry.lastSeen = Date.now()
       if (pc.iceConnectionState === 'failed') {
         mesh.markDead(remotePeerId)
+        onConnectionStateChangeCb?.({ peerId: remotePeerId, state: 'failed', ts: Date.now() })
+      } else if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'closed') {
+        entry.state = pc.iceConnectionState
+        onConnectionStateChangeCb?.({ peerId: remotePeerId, state: pc.iceConnectionState, ts: Date.now() })
       }
     }
 

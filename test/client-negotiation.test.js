@@ -792,6 +792,14 @@ test('late events from a replaced transport cannot close its replacement', async
     assert.equal(current.connection, replacement)
     assert.equal(current.state, 'connecting')
     assert.equal(states.filter((event) => event.state === 'closed').length, 0)
+
+    // Safari can report ICE failure without promptly updating
+    // RTCPeerConnection.connectionState. Surface that terminal state directly
+    // so consumers do not wait for their outer connection timeout.
+    replacement.iceConnectionState = 'failed'
+    replacement.oniceconnectionstatechange()
+    assert.equal(current.state, 'dead')
+    assert.equal(states.filter((event) => event.state === 'failed').length, 1)
   } finally {
     client?.disconnect()
     globalThis.WebSocket = originalWebSocket
