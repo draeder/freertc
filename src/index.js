@@ -309,15 +309,22 @@ async function queryRelayForPeers(relayUrl, network, room, requesterPeerId) {
 }
 
 // Forward a PSP message through a remote relay's HTTP endpoint.
-async function forwardToRelay(relayUrl, message, selfRelayId) {
+export async function forwardToRelay(relayUrl, message, selfRelayId) {
   try {
     const base = relayHttpBase(relayUrl);
-    await fetch(`${base}/api/v1/relay`, {
+    const response = await fetch(`${base}/api/v1/relay`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message, via: selfRelayId || "relay-bridge" })
     });
-  } catch {}
+    // Cloudflare counts unread response bodies as active outbound requests.
+    // Offer/answer/ICE bursts can otherwise exhaust that limit and deadlock
+    // the WebSocket request that is forwarding the negotiation.
+    await response.arrayBuffer();
+    return response.ok;
+  } catch {
+    return false;
+  }
 }
 
 // ===================== D1 Relay Registry =====================
