@@ -328,9 +328,9 @@ async function ensureRoutingContacts(context) {
   await joinPromises.get(context.env);
 }
 
-async function replicateProviderRecord(context, record) {
+async function replicateProviderRecord(context, record, wantRecords = false) {
   await storeProviderRecord(context, record);
-  const lookup = await iterativeLookup(context, record.key, false);
+  const lookup = await iterativeLookup(context, record.key, wantRecords);
   const closest = selectClosestNodes([...lookup.nodes, context.nodeRecord], record.key, DEFAULT_REPLICATION_FACTOR);
   await Promise.all(closest
     .filter((node) => node.node_id !== context.identity.nodeId)
@@ -338,6 +338,7 @@ async function replicateProviderRecord(context, record) {
       requester: context.nodeRecord,
       record,
     })));
+  return lookup;
 }
 
 export async function heartbeatKademlia(env, selfUrl, options = {}) {
@@ -376,7 +377,15 @@ export async function publishPeerProviderRecords(env, selfUrl, network, room, pe
       key: await peerRoutingKey(network, room, peerId),
     }),
   ]);
-  await Promise.all([replicateProviderRecord(context, scopeRecord), replicateProviderRecord(context, peerRecord)]);
+  const [scopeLookup] = await Promise.all([
+    replicateProviderRecord(context, scopeRecord, Boolean(options.returnScopeProviders)),
+    replicateProviderRecord(context, peerRecord),
+  ]);
+  if (options.returnScopeProviders) {
+    const records = [scopeRecord, ...scopeLookup.records]
+      .filter((record) => record.kind === SCOPE_PROVIDER_RECORD_KIND && record.key === scopeRecord.key);
+    return rankProviderRecords(records, MAX_PROVIDER_RELAYS);
+  }
   return true;
 }
 

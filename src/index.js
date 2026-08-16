@@ -308,7 +308,15 @@ async function queryRelayForPeers(relayUrl, network, room, requesterPeerId) {
   }
 }
 
-async function findFederatedPeers(env, selfRelayUrl, network, room, requesterPeerId, connections = 0) {
+async function findFederatedPeers(
+  env,
+  selfRelayUrl,
+  network,
+  room,
+  requesterPeerId,
+  connections = 0,
+  publishedScopeProviders = null,
+) {
   const localPeers = env.DB
     ? await findPeers(env.DB, network, room, requesterPeerId)
     : [];
@@ -317,13 +325,15 @@ async function findFederatedPeers(env, selfRelayUrl, network, room, requesterPee
 
   let remoteUrls;
   if (isKademliaEnabled(env)) {
-    const providers = await lookupScopeProviders(
-      env,
-      selfRelayUrl,
-      network,
-      room,
-      { connections },
-    );
+    const providers = Array.isArray(publishedScopeProviders)
+      ? publishedScopeProviders
+      : await lookupScopeProviders(
+        env,
+        selfRelayUrl,
+        network,
+        room,
+        { connections },
+      );
     remoteUrls = [...new Set(providers.map((provider) => provider.url))]
       .filter((relayUrl) => relayUrl !== selfRelayUrl);
   } else {
@@ -761,13 +771,13 @@ async function handleClientMessage(
 
       if (selfRelayUrl && isKademliaEnabled(env)) {
         ctx.waitUntil((async () => {
-          await publishPeerProviderRecords(
+          const scopeProviders = await publishPeerProviderRecords(
             env,
             selfRelayUrl,
             network,
             room,
             peerId,
-            { connections: livePeers.size },
+            { connections: livePeers.size, returnScopeProviders: true },
           );
           if (isHeartbeat) return;
 
@@ -782,6 +792,7 @@ async function handleClientMessage(
             room,
             peerId,
             livePeers.size,
+            scopeProviders,
           );
           try {
             sendPeerList(socket, network, room, peers, peerId, relayPeerId);

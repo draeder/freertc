@@ -212,9 +212,11 @@ test('two relays join, replicate, and resolve signed scope and peer providers', 
     const heartbeat = await heartbeatKademlia(envA, urlA);
     assert.equal(heartbeat.enabled, true);
 
-    await publishPeerProviderRecords(envA, urlA, 'network-z', 'room-z', 'peer-z', {
+    const publishedScopeProviders = await publishPeerProviderRecords(envA, urlA, 'network-z', 'room-z', 'peer-z', {
       connections: 125,
+      returnScopeProviders: true,
     });
+    assert.deepEqual(publishedScopeProviders.map((record) => record.url), [urlA]);
 
     const [scopeProviders, peerProviders] = await Promise.all([
       lookupScopeProviders(envB, urlB, 'network-z', 'room-z'),
