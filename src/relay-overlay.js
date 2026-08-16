@@ -321,7 +321,6 @@ async function joinBootstrap(context) {
 }
 
 async function ensureRoutingContacts(context) {
-  if ((await listActiveNodeRecords(context)).length > 0) return;
   if (!joinPromises.has(context.env)) {
     const join = joinBootstrap(context).finally(() => joinPromises.delete(context.env));
     joinPromises.set(context.env, join);

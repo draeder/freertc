@@ -227,3 +227,58 @@ test('two relays join, replicate, and resolve signed scope and peer providers', 
     globalThis.fetch = originalFetch;
   }
 });
+
+test('lookup refreshes configured bootstraps even when a stale routing contact exists', async () => {
+  const [pairA, pairB, pairC] = await Promise.all([
+    generateRandomPair(),
+    generateRandomPair(),
+    generateRandomPair(),
+  ]);
+  const urlA = 'wss://relay-a.example/ws';
+  const urlB = 'wss://relay-b.example/ws';
+  const urlC = 'wss://relay-c.example/ws';
+  const envA = {
+    DB: new MemoryD1(),
+    RELAY_SIGNING_PUBLIC_KEY: pairA.pub,
+    RELAY_SIGNING_PRIVATE_KEY: pairA.priv,
+    KADEMLIA_BOOTSTRAP_URLS: urlC,
+  };
+  const envB = {
+    DB: new MemoryD1(),
+    RELAY_SIGNING_PUBLIC_KEY: pairB.pub,
+    RELAY_SIGNING_PRIVATE_KEY: pairB.priv,
+  };
+  const envC = {
+    DB: new MemoryD1(),
+    RELAY_SIGNING_PUBLIC_KEY: pairC.pub,
+    RELAY_SIGNING_PRIVATE_KEY: pairC.priv,
+  };
+  const relays = new Map([
+    ['relay-a.example', { env: envA, selfUrl: urlA }],
+    ['relay-b.example', { env: envB, selfUrl: urlB }],
+    ['relay-c.example', { env: envC, selfUrl: urlC }],
+  ]);
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    const target = relays.get(new URL(request.url).hostname);
+    if (!target) return new Response('not found', { status: 404 });
+    return handleKademliaRequest(request, target.env, { selfUrl: target.selfUrl });
+  };
+
+  try {
+    // Seed A with a valid but unhelpful contact. A must not treat this as proof
+    // that its configured bootstrap is already represented in its routing table.
+    await heartbeatKademlia(envA, urlA);
+    assert.equal(envA.DB.nodes.size, 1);
+
+    await publishPeerProviderRecords(envB, urlB, 'network-z', 'room-z', 'peer-z');
+    envA.KADEMLIA_BOOTSTRAP_URLS = urlB;
+
+    const providers = await lookupScopeProviders(envA, urlA, 'network-z', 'room-z');
+    assert.deepEqual(providers.map((record) => record.url), [urlB]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
