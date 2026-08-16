@@ -502,3 +502,227 @@ test('late events from a replaced transport cannot close its replacement', async
     globalThis.RTCPeerConnection = originalRTCPeerConnection
   }
 })
+
+test('unreachable ICE server URLs are quarantined generically without adding RTP media', async () => {
+  const originalWebSocket = globalThis.WebSocket
+  const originalRTCPeerConnection = globalThis.RTCPeerConnection
+  const sockets = []
+  const peerConnections = []
+  const logs = []
+  let transceiverCalls = 0
+
+  class FakeWebSocket {
+    static CONNECTING = 0
+    static OPEN = 1
+    static CLOSED = 3
+
+    constructor() {
+      this.readyState = FakeWebSocket.CONNECTING
+      sockets.push(this)
+    }
+    send() {}
+    open() {
+      this.readyState = FakeWebSocket.OPEN
+      this.onopen?.()
+    }
+    receive(message) { this.onmessage?.({ data: JSON.stringify(message) }) }
+    close(code = 1000) {
+      this.readyState = FakeWebSocket.CLOSED
+      this.onclose?.({ code })
+    }
+  }
+
+  class FakeDataChannel {
+    constructor() { this.readyState = 'connecting' }
+    send() {}
+    close() { this.readyState = 'closed' }
+  }
+
+  class IceRTCPeerConnection {
+    constructor(configuration) {
+      this.configuration = structuredClone(configuration)
+      this.signalingState = 'stable'
+      this.connectionState = 'new'
+      this.iceConnectionState = 'new'
+      this.iceGatheringState = 'complete'
+      this.localDescription = null
+      this.remoteDescription = null
+      peerConnections.push(this)
+    }
+    addTransceiver() { transceiverCalls += 1 }
+    createDataChannel() { return new FakeDataChannel() }
+    async createOffer() { return { type: 'offer', sdp: `offer:${peerConnections.indexOf(this)}` } }
+    async setLocalDescription(description) {
+      this.localDescription = description
+      this.signalingState = 'have-local-offer'
+    }
+    getConfiguration() { return structuredClone(this.configuration) }
+    setConfiguration(configuration) { this.configuration = structuredClone(configuration) }
+    close() {
+      this.signalingState = 'closed'
+      this.connectionState = 'closed'
+    }
+  }
+
+  globalThis.WebSocket = FakeWebSocket
+  globalThis.RTCPeerConnection = IceRTCPeerConnection
+  let client
+  try {
+    client = createSignalingClient({
+      peerId: 'local-peer',
+      networkId: 'test-network',
+      roomId: 'test-room',
+      signalUrl: 'wss://signal.example/ws',
+      iceServers: [{ urls: ['stun:failed.example:3478', 'stun:healthy.example:3478'] }],
+      autoConnect: false,
+      onLog: (message) => logs.push(message),
+    })
+    client.connect()
+    sockets[0].open()
+    sockets[0].receive({ type: 'ack', body: { status: 'ok' } })
+
+    await client.initiateConnection('remote-a')
+    peerConnections[0].onicecandidateerror({
+      errorCode: 701,
+      errorText: 'server unreachable',
+      url: 'stun:failed.example:3478',
+    })
+    peerConnections[0].onicecandidateerror({
+      errorCode: 701,
+      errorText: 'server unreachable',
+      url: 'stun:failed.example:3478',
+    })
+    await client.initiateConnection('remote-b')
+
+    assert.equal(transceiverCalls, 0)
+    assert.deepEqual(peerConnections[0].configuration.iceServers, [
+      { urls: ['stun:healthy.example:3478'] },
+    ])
+    assert.deepEqual(peerConnections[1].configuration.iceServers, [
+      { urls: ['stun:healthy.example:3478'] },
+    ])
+    assert.equal(logs.filter((line) => line.includes('ICE server unavailable')).length, 1)
+  } finally {
+    client?.disconnect()
+    globalThis.WebSocket = originalWebSocket
+    globalThis.RTCPeerConnection = originalRTCPeerConnection
+  }
+})
+
+test('RTP extension remaps retry on a fresh data-only connection', async () => {
+  const originalWebSocket = globalThis.WebSocket
+  const originalRTCPeerConnection = globalThis.RTCPeerConnection
+  const sockets = []
+  const peerConnections = []
+  const logs = []
+  let injectRemapError = true
+
+  class FakeWebSocket {
+    static CONNECTING = 0
+    static OPEN = 1
+    static CLOSED = 3
+
+    constructor() {
+      this.readyState = FakeWebSocket.CONNECTING
+      this.sent = []
+      sockets.push(this)
+    }
+    send(value) { this.sent.push(JSON.parse(value)) }
+    open() {
+      this.readyState = FakeWebSocket.OPEN
+      this.onopen?.()
+    }
+    receive(message) { this.onmessage?.({ data: JSON.stringify(message) }) }
+    close(code = 1000) {
+      this.readyState = FakeWebSocket.CLOSED
+      this.onclose?.({ code })
+    }
+  }
+
+  class FakeDataChannel {
+    constructor() { this.readyState = 'connecting' }
+    send() {}
+    close() { this.readyState = 'closed' }
+  }
+
+  class RemapRTCPeerConnection {
+    constructor() {
+      this.signalingState = 'stable'
+      this.connectionState = 'new'
+      this.iceConnectionState = 'new'
+      this.iceGatheringState = 'complete'
+      this.localDescription = null
+      this.remoteDescription = null
+      peerConnections.push(this)
+    }
+    createDataChannel() { return new FakeDataChannel() }
+    async setRemoteDescription(description) {
+      if (injectRemapError) {
+        injectRemapError = false
+        const error = new Error('Remote description attempted to remap RTP extension id 3')
+        error.name = 'InvalidAccessError'
+        throw error
+      }
+      this.remoteDescription = description
+      this.signalingState = 'have-remote-offer'
+    }
+    async createAnswer() { return { type: 'answer', sdp: `answer:${peerConnections.indexOf(this)}` } }
+    async setLocalDescription(description) {
+      this.localDescription = description
+      this.signalingState = 'stable'
+    }
+    async addIceCandidate() {}
+    close() {
+      this.signalingState = 'closed'
+      this.connectionState = 'closed'
+    }
+  }
+
+  globalThis.WebSocket = FakeWebSocket
+  globalThis.RTCPeerConnection = RemapRTCPeerConnection
+  let client
+  try {
+    client = createSignalingClient({
+      peerId: 'local-peer',
+      networkId: 'test-network',
+      roomId: 'test-room',
+      signalUrl: 'wss://signal.example/ws',
+      autoConnect: false,
+      onLog: (message) => logs.push(message),
+    })
+    client.connect()
+    sockets[0].open()
+    sockets[0].receive({ type: 'ack', body: { status: 'ok' } })
+
+    sockets[0].receive({
+      type: 'offer',
+      from: 'remote-peer',
+      session_id: 'test-room',
+      body: { sdp: 'offer:first' },
+    })
+    await nextTurn()
+
+    assert.equal(peerConnections.length, 2)
+    assert.equal(peerConnections[0].signalingState, 'closed')
+    assert.equal(peerConnections[1].remoteDescription?.sdp, 'offer:first')
+    assert.ok(logs.some((line) => line.includes('fresh connection after RTP extension remap')))
+    assert.ok(logs.every((line) => !line.includes('handleIncomingOffer failed')))
+
+    sockets[0].receive({
+      type: 'offer',
+      from: 'remote-peer',
+      session_id: 'test-room',
+      body: { sdp: 'offer:replacement' },
+    })
+    await nextTurn()
+
+    assert.equal(peerConnections.length, 3)
+    assert.equal(peerConnections[1].signalingState, 'closed')
+    assert.equal(peerConnections[2].remoteDescription?.sdp, 'offer:replacement')
+    assert.ok(logs.some((line) => line.includes('replaced stale connection for new offer')))
+  } finally {
+    client?.disconnect()
+    globalThis.WebSocket = originalWebSocket
+    globalThis.RTCPeerConnection = originalRTCPeerConnection
+  }
+})

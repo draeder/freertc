@@ -10,6 +10,8 @@ const RTC_CONFIG = {
     { urls: "stun:global.stun.twilio.com:3478" }
   ]
 };
+const ICE_SERVER_FAILURE_COOLDOWN_MS = 5 * 60_000;
+const unavailableIceServerUrls = new Map();
 const SHARED_IDS_KEY = "freertc.scopes.v2";
 const UI_PREFS_KEY = "freertc.ui.prefs.v1";
 const DATA_PING_MS = 3000;
@@ -21,6 +23,41 @@ function newId(prefix = "msg") {
 
 function now() {
   return Date.now();
+}
+
+function normalizeIceServerUrl(url) {
+  return String(url || "").trim().toLowerCase();
+}
+
+function activeRtcConfig() {
+  const timestamp = now();
+  for (const [url, retryAt] of unavailableIceServerUrls) {
+    if (retryAt <= timestamp) unavailableIceServerUrls.delete(url);
+  }
+  return {
+    ...RTC_CONFIG,
+    iceServers: RTC_CONFIG.iceServers.flatMap((server) => {
+      const configuredUrls = Array.isArray(server?.urls) ? server.urls : [server?.urls];
+      const availableUrls = configuredUrls.filter((url) => {
+        const normalized = normalizeIceServerUrl(url);
+        return normalized && !unavailableIceServerUrls.has(normalized);
+      });
+      if (availableUrls.length === 0) return [];
+      return [{
+        ...server,
+        urls: Array.isArray(server.urls) ? availableUrls : availableUrls[0]
+      }];
+    })
+  };
+}
+
+function quarantineIceServerUrl(url) {
+  const normalized = normalizeIceServerUrl(url);
+  if (!normalized) return false;
+  const timestamp = now();
+  const alreadyUnavailable = (unavailableIceServerUrls.get(normalized) || 0) > timestamp;
+  unavailableIceServerUrls.set(normalized, timestamp + ICE_SERVER_FAILURE_COOLDOWN_MS);
+  return !alreadyUnavailable;
 }
 
 async function waitForIceGatheringComplete(pc, timeoutMs = 4000) {
@@ -1799,13 +1836,7 @@ createApp({
         return link.pc;
       }
 
-      const peerPc = new RTCPeerConnection(RTC_CONFIG);
-      // Firefox can gather candidates more reliably with at least one media transceiver.
-      try {
-        peerPc.addTransceiver("audio", { direction: "recvonly" });
-      } catch {
-        // Ignore browser support differences.
-      }
+      const peerPc = new RTCPeerConnection(activeRtcConfig());
       link.pc = peerPc;
       link.rtcState = peerPc.connectionState;
       link.phase = "ready";
@@ -1852,7 +1883,23 @@ createApp({
       peerPc.onicecandidateerror = (event) => {
         const code = event?.errorCode ?? "unknown";
         const text = event?.errorText ?? "unknown";
-        pushLog("rtc:ice-error", `${peerId} ice candidate error code=${code} text=${text}`);
+        const url = event?.url ?? "n/a";
+        if (Number(code) === 701 && normalizeIceServerUrl(url)) {
+          const firstFailure = quarantineIceServerUrl(url);
+          try {
+            peerPc.setConfiguration({
+              ...peerPc.getConfiguration(),
+              iceServers: activeRtcConfig().iceServers
+            });
+          } catch {
+            // The filtered configuration will be used by the next connection.
+          }
+          if (firstFailure) {
+            pushLog("rtc:ice-error", `ICE server unavailable code=701 text=${text} url=${url}; quarantined for 300s`);
+          }
+          return;
+        }
+        pushLog("rtc:ice-error", `${peerId} ice candidate error code=${code} text=${text} url=${url}`);
       };
 
       peerPc.ondatachannel = (event) => {
@@ -2368,7 +2415,12 @@ createApp({
       // Responder received the offer, stop waiting timeout (PSP Section 11.2)
       link.offerWaitTime = 0;
 
-      const peerPc = ensurePeerConnection(peerId);
+      let peerPc = ensurePeerConnection(peerId);
+      if (peerPc.remoteDescription?.sdp && peerPc.remoteDescription.sdp !== message.body.sdp) {
+        closeMeshLink(peerId);
+        peerPc = ensurePeerConnection(peerId);
+        pushLog("rtc", `Replaced stale connection for new offer from ${peerId}`);
+      }
       if (!["stable", "have-local-offer"].includes(peerPc.signalingState)) {
         pushLog("rtc", `Ignored stale offer from ${peerId} while in ${peerPc.signalingState}`);
         return;
@@ -2394,10 +2446,26 @@ createApp({
       try {
         await peerPc.setRemoteDescription({ type: "offer", sdp: message.body.sdp });
       } catch (error) {
-        pushLog("rtc:error", error?.message || `failed to apply offer from ${peerId}`);
-        markPeerFailed(peerId, "offer-apply-failed");
+        const messageText = String(error?.message || error || "");
+        const isRtpExtensionRemap = error?.name === "InvalidAccessError"
+          && /remap RTP extension id/i.test(messageText);
+        if (!isRtpExtensionRemap) {
+          pushLog("rtc:error", messageText || `failed to apply offer from ${peerId}`);
+          markPeerFailed(peerId, "offer-apply-failed");
+          closeMeshLink(peerId);
+          return;
+        }
         closeMeshLink(peerId);
-        return;
+        peerPc = ensurePeerConnection(peerId);
+        pushLog("rtc", `Retrying offer from ${peerId} on fresh connection after RTP extension remap`);
+        try {
+          await peerPc.setRemoteDescription({ type: "offer", sdp: message.body.sdp });
+        } catch (retryError) {
+          pushLog("rtc:error", retryError?.message || `failed to apply offer from ${peerId}`);
+          markPeerFailed(peerId, "offer-apply-failed");
+          closeMeshLink(peerId);
+          return;
+        }
       }
 
       await flushPendingIceCandidates(peerId, link);

@@ -10,6 +10,7 @@ const OFFER_RETRY_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000, 8000, 8000]
 const ANSWER_BURST_COOLDOWN_MS = 3000
 const ANSWER_BURST_DELAYS_MS = [200, 800, 2000]
 const SDP_DEDUP_WINDOW_MS = 15000
+const ICE_SERVER_FAILURE_COOLDOWN_MS = 5 * 60_000
 
 /**
  * Remove a previously owned signaling identity without announcing it again.
@@ -223,14 +224,52 @@ export function createSignalingClient(options = {}) {
   // Track recent offer/answer SDPs per peer to avoid duplicate processing storms.
   const recentOfferSdp = new Map()
   const recentAnswerSdp = new Map()
+  // A 701 error means no local host candidate could reach one specific ICE
+  // server URL. Quarantine URLs independently so one dead STUN/TURN endpoint
+  // cannot keep failing every new peer connection while healthy URLs remain.
+  const unavailableIceServerUrls = new Map()
   const preferredIceServers = Array.isArray(configuredIceServers) && configuredIceServers.length > 0
     ? configuredIceServers
     : DEFAULT_ICE_SERVERS
 
+  function normalizeIceServerUrl(url) {
+    return String(url || '').trim().toLowerCase()
+  }
+
+  function filterUnavailableIceServers(iceServers) {
+    const now = Date.now()
+    for (const [url, retryAt] of unavailableIceServerUrls) {
+      if (retryAt <= now) unavailableIceServerUrls.delete(url)
+    }
+
+    return iceServers.flatMap((server) => {
+      const configuredUrls = Array.isArray(server?.urls) ? server.urls : [server?.urls]
+      const availableUrls = configuredUrls.filter((url) => {
+        const normalized = normalizeIceServerUrl(url)
+        return normalized && !unavailableIceServerUrls.has(normalized)
+      })
+      if (availableUrls.length === 0) return []
+      return [{
+        ...server,
+        urls: Array.isArray(server.urls) ? availableUrls : availableUrls[0],
+      }]
+    })
+  }
+
   function resolveIceServers(overrideIceServers = null) {
-    return Array.isArray(overrideIceServers) && overrideIceServers.length > 0
+    const iceServers = Array.isArray(overrideIceServers) && overrideIceServers.length > 0
       ? overrideIceServers
       : preferredIceServers
+    return filterUnavailableIceServers(iceServers)
+  }
+
+  function quarantineIceServerUrl(url) {
+    const normalized = normalizeIceServerUrl(url)
+    if (!normalized) return false
+    const now = Date.now()
+    const alreadyUnavailable = (unavailableIceServerUrls.get(normalized) ?? 0) > now
+    unavailableIceServerUrls.set(normalized, now + ICE_SERVER_FAILURE_COOLDOWN_MS)
+    return !alreadyUnavailable
   }
 
   function notifyNegotiationFailure(details) {
@@ -623,9 +662,6 @@ export function createSignalingClient(options = {}) {
       iceCandidatePoolSize: 4,
     })
 
-    // Helps some browser stacks gather candidates more reliably for data-channel-only sessions.
-    try { pc.addTransceiver('audio', { direction: 'recvonly' }) } catch {}
-
     mesh.connections.set(remotePeerId, {
       connection: pc,
       channel: null,
@@ -661,10 +697,28 @@ export function createSignalingClient(options = {}) {
     }
 
     pc.onicecandidateerror = (event) => {
-      if (mesh.connections.get(remotePeerId)?.connection !== pc) return
+      const current = mesh.connections.get(remotePeerId)
+      if (current?.connection !== pc) return
       const code = event?.errorCode ?? 'unknown'
       const text = event?.errorText ?? 'unknown'
       const url = event?.url ?? 'n/a'
+      if (Number(code) === 701 && normalizeIceServerUrl(url)) {
+        const firstFailure = quarantineIceServerUrl(url)
+        const availableIceServers = resolveIceServers(current.iceServers)
+        current.iceServers = availableIceServers
+        try {
+          if (typeof pc.getConfiguration === 'function' && typeof pc.setConfiguration === 'function') {
+            pc.setConfiguration({
+              ...pc.getConfiguration(),
+              iceServers: availableIceServers,
+            })
+          }
+        } catch { /* the filtered set will be used by the next connection */ }
+        if (firstFailure) {
+          log(`[webrtc] ICE server unavailable: code=701 text=${text} url=${url}; quarantined for 300s`)
+        }
+        return
+      }
       log(`[webrtc] ice candidate error to ${remotePeerId}: code=${code} text=${text} url=${url}`)
     }
 
@@ -841,12 +895,12 @@ export function createSignalingClient(options = {}) {
         }
 
         const freshEntry = mesh.connections.get(fromPeerId)
-        const pc =
+        let pc =
           freshEntry?.connection && freshEntry.connection.signalingState !== 'closed'
             ? freshEntry.connection
-            : createPeerConnection(fromPeerId, freshEntry?.iceServers ?? resolveIceServers(), sendRelay)
+            : createPeerConnection(fromPeerId, resolveIceServers(freshEntry?.iceServers), sendRelay)
 
-        const entry = mesh.connections.get(fromPeerId)
+        let entry = mesh.connections.get(fromPeerId)
         const incomingOfferSdp = offer?.sdp ?? null
         const cachedAnswer = entry?.lastLocalAnswer ?? null
         const currentRemoteOfferSdp = entry?.lastRemoteOfferSdp ?? pc.remoteDescription?.sdp ?? null
@@ -879,6 +933,22 @@ export function createSignalingClient(options = {}) {
           return
         }
 
+        if (
+          incomingOfferSdp &&
+          pc.remoteDescription &&
+          currentRemoteOfferSdp &&
+          currentRemoteOfferSdp !== incomingOfferSdp
+        ) {
+          const replacementIceServers = resolveIceServers(entry?.iceServers)
+          clearOfferRetryTimer(pc)
+          try { pc.close() } catch {}
+          mesh.connections.delete(fromPeerId)
+          clearAnswerBurst(fromPeerId)
+          pc = createPeerConnection(fromPeerId, replacementIceServers, sendRelay)
+          entry = mesh.connections.get(fromPeerId)
+          log(`[webrtc] replaced stale connection for new offer from ${fromPeerId}`)
+        }
+
         if (pc.signalingState === 'closed') return
 
         const offerCollision = pc.signalingState !== 'stable'
@@ -901,7 +971,26 @@ export function createSignalingClient(options = {}) {
           log(`[webrtc] rolled back local offer for ${fromPeerId} (polite peer)`)
         }
 
-        await pc.setRemoteDescription(offer)
+        try {
+          await pc.setRemoteDescription(offer)
+        } catch (error) {
+          const message = String(error?.message || error || '')
+          const isRtpExtensionRemap = error?.name === 'InvalidAccessError'
+            && /remap RTP extension id/i.test(message)
+          if (!isRtpExtensionRemap) throw error
+
+          const replacementIceServers = resolveIceServers(entry?.iceServers)
+          clearOfferRetryTimer(pc)
+          try { pc.close() } catch {}
+          if (mesh.connections.get(fromPeerId)?.connection === pc) {
+            mesh.connections.delete(fromPeerId)
+          }
+          clearAnswerBurst(fromPeerId)
+          pc = createPeerConnection(fromPeerId, replacementIceServers, sendRelay)
+          entry = mesh.connections.get(fromPeerId)
+          log(`[webrtc] retrying offer from ${fromPeerId} on fresh connection after RTP extension remap`)
+          await pc.setRemoteDescription(offer)
+        }
 
         if (entry) {
           entry.lastRemoteOfferSdp = incomingOfferSdp
