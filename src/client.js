@@ -6,7 +6,10 @@ const DATA_PING_MS = 1000
 const DATA_PONG_TIMEOUT_MS = 4000
 const SIGNAL_PING_MS = 1000
 const SIGNAL_PONG_TIMEOUT_MS = 4000
-const OFFER_RETRY_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000, 8000, 8000]
+// A relay-backed offer normally reaches the destination on its next one-second
+// signaling heartbeat. Five total sends over 2.85s cover that delivery window
+// without pinning an isolated peer to one unreachable candidate for 31.85s.
+const OFFER_RETRY_DELAYS_MS = [100, 250, 500, 1000]
 const ANSWER_BURST_COOLDOWN_MS = 3000
 const ANSWER_BURST_DELAYS_MS = [200, 800, 2000]
 const SDP_DEDUP_WINDOW_MS = 15000

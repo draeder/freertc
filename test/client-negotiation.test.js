@@ -498,6 +498,100 @@ test('recovery reset clears offer backoff and retransmits immediately', async (t
   }
 })
 
+test('an unreachable offer fails over in under three seconds', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const originalWebSocket = globalThis.WebSocket
+  const originalRTCPeerConnection = globalThis.RTCPeerConnection
+  const sockets = []
+  const failures = []
+
+  class FakeWebSocket {
+    static CONNECTING = 0
+    static OPEN = 1
+    static CLOSED = 3
+
+    constructor() {
+      this.readyState = FakeWebSocket.CONNECTING
+      this.sent = []
+      sockets.push(this)
+    }
+    send(value) { this.sent.push(JSON.parse(value)) }
+    open() {
+      this.readyState = FakeWebSocket.OPEN
+      this.onopen?.()
+    }
+    receive(message) { this.onmessage?.({ data: JSON.stringify(message) }) }
+    close(code = 1000) {
+      this.readyState = FakeWebSocket.CLOSED
+      this.onclose?.({ code })
+    }
+  }
+
+  class FakeDataChannel {
+    constructor() { this.readyState = 'connecting' }
+    send() {}
+    close() { this.readyState = 'closed' }
+  }
+
+  class FakeRTCPeerConnection {
+    constructor() {
+      this.signalingState = 'stable'
+      this.connectionState = 'new'
+      this.iceConnectionState = 'new'
+      this.iceGatheringState = 'complete'
+      this.localDescription = null
+      this.remoteDescription = null
+    }
+    createDataChannel() { return new FakeDataChannel() }
+    async createOffer() { return { type: 'offer', sdp: 'offer:local' } }
+    async setLocalDescription(description) {
+      this.localDescription = description
+      this.signalingState = 'have-local-offer'
+    }
+    close() {
+      this.signalingState = 'closed'
+      this.connectionState = 'closed'
+    }
+  }
+
+  globalThis.WebSocket = FakeWebSocket
+  globalThis.RTCPeerConnection = FakeRTCPeerConnection
+  let client
+  try {
+    client = createSignalingClient({
+      peerId: 'local-peer',
+      networkId: 'test-network',
+      roomId: 'test-room',
+      signalUrl: 'wss://signal.example/ws',
+      autoConnect: false,
+      onNegotiationFailure: (details) => failures.push(details),
+    })
+    client.connect()
+    sockets[0].open()
+    sockets[0].receive({ type: 'ack', body: { status: 'ok' } })
+    await client.initiateConnection('unreachable-peer')
+
+    const offers = () => sockets[0].sent.filter((message) => message.type === 'offer').length
+    assert.equal(offers(), 1)
+    t.mock.timers.tick(100)
+    t.mock.timers.tick(250)
+    t.mock.timers.tick(500)
+    t.mock.timers.tick(1_000)
+    t.mock.timers.tick(999)
+    assert.equal(failures.length, 0)
+    assert.equal(offers(), 5)
+    t.mock.timers.tick(1)
+    assert.equal(failures.length, 1)
+    assert.equal(failures[0].peerId, 'unreachable-peer')
+    assert.equal(failures[0].reason, 'offer_retries_exhausted')
+    assert.equal(client.mesh.connections.get('unreachable-peer')?.state, 'dead')
+  } finally {
+    client?.disconnect()
+    globalThis.WebSocket = originalWebSocket
+    globalThis.RTCPeerConnection = originalRTCPeerConnection
+  }
+})
+
 test('a silent data channel is closed after one unanswered ping deadline', async (t) => {
   t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] })
   const originalWebSocket = globalThis.WebSocket
