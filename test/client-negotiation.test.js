@@ -191,6 +191,113 @@ test('offer/answer bursts are serialized and simultaneous offers have one winner
   assert.ok(polite.logs.every((line) => !line.includes('apply in flight')))
 })
 
+test('an isolated peer queues an answer until its local offer is ready', async () => {
+  const originalWebSocket = globalThis.WebSocket
+  const originalRTCPeerConnection = globalThis.RTCPeerConnection
+  const sockets = []
+  const peerConnections = []
+  const logs = []
+
+  class FakeWebSocket {
+    static CONNECTING = 0
+    static OPEN = 1
+    static CLOSED = 3
+
+    constructor() {
+      this.readyState = FakeWebSocket.CONNECTING
+      this.sent = []
+      sockets.push(this)
+    }
+    send(value) { this.sent.push(JSON.parse(value)) }
+    open() {
+      this.readyState = FakeWebSocket.OPEN
+      this.onopen?.()
+    }
+    receive(message) { this.onmessage?.({ data: JSON.stringify(message) }) }
+    close(code = 1000) {
+      this.readyState = FakeWebSocket.CLOSED
+      this.onclose?.({ code })
+    }
+  }
+
+  class FakeDataChannel {
+    constructor() { this.readyState = 'connecting' }
+    send() {}
+    close() { this.readyState = 'closed' }
+  }
+
+  class FakeRTCPeerConnection {
+    constructor() {
+      this.signalingState = 'stable'
+      this.connectionState = 'new'
+      this.iceConnectionState = 'new'
+      this.iceGatheringState = 'complete'
+      this.localDescription = null
+      this.remoteDescription = null
+      peerConnections.push(this)
+    }
+    createDataChannel() { return new FakeDataChannel() }
+    async createOffer() { return { type: 'offer', sdp: 'offer:local' } }
+    async setLocalDescription(description) {
+      this.localDescription = description
+      this.signalingState = 'have-local-offer'
+    }
+    async setRemoteDescription(description) {
+      this.remoteDescription = description
+      this.signalingState = 'stable'
+    }
+    async addIceCandidate() {}
+    close() {
+      this.signalingState = 'closed'
+      this.connectionState = 'closed'
+    }
+  }
+
+  globalThis.WebSocket = FakeWebSocket
+  globalThis.RTCPeerConnection = FakeRTCPeerConnection
+  let client
+  try {
+    client = createSignalingClient({
+      peerId: 'local-peer',
+      networkId: 'test-network',
+      roomId: 'test-room',
+      signalUrl: 'wss://signal.example/ws',
+      autoConnect: false,
+      onLog: (message) => logs.push(message),
+    })
+    client.connect()
+    sockets[0].open()
+    sockets[0].receive({ type: 'ack', body: { status: 'ok' } })
+    await client.initiateConnection('isolated-peer')
+
+    const pc = peerConnections[0]
+    pc.signalingState = 'stable'
+    sockets[0].receive({
+      type: 'answer',
+      from: 'isolated-peer',
+      session_id: 'test-room',
+      body: { sdp: 'answer:isolated-peer' },
+    })
+    await nextTurn()
+
+    assert.ok(logs.some((line) => line.includes('queued answer from isolated-peer') && line.includes('peer isolated')))
+    assert.ok(logs.every((line) => !line.includes('ignoring answer from isolated-peer')))
+    assert.equal(pc.remoteDescription, null)
+
+    pc.signalingState = 'have-local-offer'
+    pc.onsignalingstatechange?.()
+    await nextTurn()
+
+    assert.equal(pc.remoteDescription?.type, 'answer')
+    assert.equal(pc.remoteDescription?.sdp, 'answer:isolated-peer')
+    assert.ok(logs.some((line) => line.includes('applied answer from isolated-peer')))
+  } finally {
+    client?.disconnect()
+    globalThis.WebSocket = originalWebSocket
+    globalThis.RTCPeerConnection = originalRTCPeerConnection
+  }
+})
+
 test('trickle ICE sends the initial offer without waiting for candidate gathering', async () => {
   const originalWebSocket = globalThis.WebSocket
   const originalRTCPeerConnection = globalThis.RTCPeerConnection
@@ -503,7 +610,7 @@ test('late events from a replaced transport cannot close its replacement', async
   }
 })
 
-test('unreachable ICE server URLs are quarantined generically without adding RTP media', async () => {
+test('700-level ICE candidate diagnostics never alter current or future ICE configuration', async () => {
   const originalWebSocket = globalThis.WebSocket
   const originalRTCPeerConnection = globalThis.RTCPeerConnection
   const sockets = []
@@ -592,16 +699,22 @@ test('unreachable ICE server URLs are quarantined generically without adding RTP
       errorText: 'server unreachable',
       url: 'stun:failed.example:3478',
     })
+    peerConnections[0].onicecandidateerror({
+      errorCode: 799,
+      errorText: 'browser-specific candidate diagnostic',
+      url: 'stun:healthy.example:3478',
+    })
     await client.initiateConnection('remote-b')
 
     assert.equal(transceiverCalls, 0)
     assert.deepEqual(peerConnections[0].configuration.iceServers, [
-      { urls: ['stun:healthy.example:3478'] },
+      { urls: ['stun:failed.example:3478', 'stun:healthy.example:3478'] },
     ])
     assert.deepEqual(peerConnections[1].configuration.iceServers, [
-      { urls: ['stun:healthy.example:3478'] },
+      { urls: ['stun:failed.example:3478', 'stun:healthy.example:3478'] },
     ])
-    assert.equal(logs.filter((line) => line.includes('ICE server unavailable')).length, 1)
+    assert.equal(logs.filter((line) => line.includes('non-fatal ICE candidate diagnostic')).length, 3)
+    assert.equal(logs.some((line) => line.includes('quarantined')), false)
   } finally {
     client?.disconnect()
     globalThis.WebSocket = originalWebSocket

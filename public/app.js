@@ -10,8 +10,6 @@ const RTC_CONFIG = {
     { urls: "stun:global.stun.twilio.com:3478" }
   ]
 };
-const ICE_SERVER_FAILURE_COOLDOWN_MS = 5 * 60_000;
-const unavailableIceServerUrls = new Map();
 const SHARED_IDS_KEY = "freertc.scopes.v2";
 const UI_PREFS_KEY = "freertc.ui.prefs.v1";
 const DATA_PING_MS = 3000;
@@ -25,39 +23,11 @@ function now() {
   return Date.now();
 }
 
-function normalizeIceServerUrl(url) {
-  return String(url || "").trim().toLowerCase();
-}
-
 function activeRtcConfig() {
-  const timestamp = now();
-  for (const [url, retryAt] of unavailableIceServerUrls) {
-    if (retryAt <= timestamp) unavailableIceServerUrls.delete(url);
-  }
   return {
     ...RTC_CONFIG,
-    iceServers: RTC_CONFIG.iceServers.flatMap((server) => {
-      const configuredUrls = Array.isArray(server?.urls) ? server.urls : [server?.urls];
-      const availableUrls = configuredUrls.filter((url) => {
-        const normalized = normalizeIceServerUrl(url);
-        return normalized && !unavailableIceServerUrls.has(normalized);
-      });
-      if (availableUrls.length === 0) return [];
-      return [{
-        ...server,
-        urls: Array.isArray(server.urls) ? availableUrls : availableUrls[0]
-      }];
-    })
+    iceServers: RTC_CONFIG.iceServers
   };
-}
-
-function quarantineIceServerUrl(url) {
-  const normalized = normalizeIceServerUrl(url);
-  if (!normalized) return false;
-  const timestamp = now();
-  const alreadyUnavailable = (unavailableIceServerUrls.get(normalized) || 0) > timestamp;
-  unavailableIceServerUrls.set(normalized, timestamp + ICE_SERVER_FAILURE_COOLDOWN_MS);
-  return !alreadyUnavailable;
 }
 
 async function waitForIceGatheringComplete(pc, timeoutMs = 4000) {
@@ -584,6 +554,8 @@ createApp({
           offerWaitTime: 0,  // Tracks when responder started waiting for offer
           answerWaitTime: 0,  // Tracks when initiator started waiting for answer
           pendingCandidates: [],
+          pendingAnswer: null,
+          pendingAnswerPc: null,
           lastSignalAt: now()
         };
         meshLinks.set(peerId, link);
@@ -1884,22 +1856,23 @@ createApp({
         const code = event?.errorCode ?? "unknown";
         const text = event?.errorText ?? "unknown";
         const url = event?.url ?? "n/a";
-        if (Number(code) === 701 && normalizeIceServerUrl(url)) {
-          const firstFailure = quarantineIceServerUrl(url);
-          try {
-            peerPc.setConfiguration({
-              ...peerPc.getConfiguration(),
-              iceServers: activeRtcConfig().iceServers
-            });
-          } catch {
-            // The filtered configuration will be used by the next connection.
-          }
-          if (firstFailure) {
-            pushLog("rtc:ice-error", `ICE server unavailable code=701 text=${text} url=${url}; quarantined for 300s`);
-          }
+        const numericCode = Number(code);
+        if (Number.isInteger(numericCode) && numericCode >= 700 && numericCode < 800) {
+          pushLog("rtc:ice", `${peerId} non-fatal ICE candidate diagnostic code=${code} text=${text} url=${url}`);
           return;
         }
         pushLog("rtc:ice-error", `${peerId} ice candidate error code=${code} text=${text} url=${url}`);
+      };
+
+      peerPc.onsignalingstatechange = () => {
+        if (link.pc !== peerPc || peerPc.signalingState !== "have-local-offer") {
+          return;
+        }
+        const pendingAnswer = link.pendingAnswer;
+        if (!pendingAnswer || (link.pendingAnswerPc && link.pendingAnswerPc !== peerPc)) {
+          return;
+        }
+        void onAnswer(pendingAnswer);
       };
 
       peerPc.ondatachannel = (event) => {
@@ -2496,8 +2469,8 @@ createApp({
       if (peerId === fromPeer.value) {
         return;
       }
-      const link = getMeshLink(peerId, false);
-      if (!link?.pc || link.phase === "connected") {
+      const link = getMeshLink(peerId);
+      if (link.phase === "connected") {
         return;
       }
 
@@ -2510,11 +2483,26 @@ createApp({
         return;
       }
 
-      if (link.pc.signalingState !== "have-local-offer") {
-        pushLog("rtc", `Ignored stale answer from ${peerId} while in ${link.pc.signalingState}`);
+      if (!link.pc) {
+        link.pendingAnswer = message;
+        link.pendingAnswerPc = null;
+        pushLog("rtc", `Queued answer from isolated peer ${peerId} until a local offer is ready`);
         return;
       }
 
+      if (link.pc.signalingState !== "have-local-offer") {
+        if (!link.dc || link.dc.readyState !== "open") {
+          link.pendingAnswer = message;
+          link.pendingAnswerPc = link.pc;
+          pushLog("rtc", `Queued answer from isolated peer ${peerId} while in ${link.pc.signalingState}`);
+          return;
+        }
+        pushLog("rtc", `Ignored stale answer from connected peer ${peerId} while in ${link.pc.signalingState}`);
+        return;
+      }
+
+      link.pendingAnswer = null;
+      link.pendingAnswerPc = null;
       try {
         await link.pc.setRemoteDescription({ type: "answer", sdp: message.body.sdp });
       } catch (error) {

@@ -10,7 +10,6 @@ const OFFER_RETRY_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000, 8000, 8000]
 const ANSWER_BURST_COOLDOWN_MS = 3000
 const ANSWER_BURST_DELAYS_MS = [200, 800, 2000]
 const SDP_DEDUP_WINDOW_MS = 15000
-const ICE_SERVER_FAILURE_COOLDOWN_MS = 5 * 60_000
 
 /**
  * Remove a previously owned signaling identity without announcing it again.
@@ -224,52 +223,14 @@ export function createSignalingClient(options = {}) {
   // Track recent offer/answer SDPs per peer to avoid duplicate processing storms.
   const recentOfferSdp = new Map()
   const recentAnswerSdp = new Map()
-  // A 701 error means no local host candidate could reach one specific ICE
-  // server URL. Quarantine URLs independently so one dead STUN/TURN endpoint
-  // cannot keep failing every new peer connection while healthy URLs remain.
-  const unavailableIceServerUrls = new Map()
   const preferredIceServers = Array.isArray(configuredIceServers) && configuredIceServers.length > 0
     ? configuredIceServers
     : DEFAULT_ICE_SERVERS
 
-  function normalizeIceServerUrl(url) {
-    return String(url || '').trim().toLowerCase()
-  }
-
-  function filterUnavailableIceServers(iceServers) {
-    const now = Date.now()
-    for (const [url, retryAt] of unavailableIceServerUrls) {
-      if (retryAt <= now) unavailableIceServerUrls.delete(url)
-    }
-
-    return iceServers.flatMap((server) => {
-      const configuredUrls = Array.isArray(server?.urls) ? server.urls : [server?.urls]
-      const availableUrls = configuredUrls.filter((url) => {
-        const normalized = normalizeIceServerUrl(url)
-        return normalized && !unavailableIceServerUrls.has(normalized)
-      })
-      if (availableUrls.length === 0) return []
-      return [{
-        ...server,
-        urls: Array.isArray(server.urls) ? availableUrls : availableUrls[0],
-      }]
-    })
-  }
-
   function resolveIceServers(overrideIceServers = null) {
-    const iceServers = Array.isArray(overrideIceServers) && overrideIceServers.length > 0
+    return Array.isArray(overrideIceServers) && overrideIceServers.length > 0
       ? overrideIceServers
       : preferredIceServers
-    return filterUnavailableIceServers(iceServers)
-  }
-
-  function quarantineIceServerUrl(url) {
-    const normalized = normalizeIceServerUrl(url)
-    if (!normalized) return false
-    const now = Date.now()
-    const alreadyUnavailable = (unavailableIceServerUrls.get(normalized) ?? 0) > now
-    unavailableIceServerUrls.set(normalized, now + ICE_SERVER_FAILURE_COOLDOWN_MS)
-    return !alreadyUnavailable
   }
 
   function notifyNegotiationFailure(details) {
@@ -702,21 +663,13 @@ export function createSignalingClient(options = {}) {
       const code = event?.errorCode ?? 'unknown'
       const text = event?.errorText ?? 'unknown'
       const url = event?.url ?? 'n/a'
-      if (Number(code) === 701 && normalizeIceServerUrl(url)) {
-        const firstFailure = quarantineIceServerUrl(url)
-        const availableIceServers = resolveIceServers(current.iceServers)
-        current.iceServers = availableIceServers
-        try {
-          if (typeof pc.getConfiguration === 'function' && typeof pc.setConfiguration === 'function') {
-            pc.setConfiguration({
-              ...pc.getConfiguration(),
-              iceServers: availableIceServers,
-            })
-          }
-        } catch { /* the filtered set will be used by the next connection */ }
-        if (firstFailure) {
-          log(`[webrtc] ICE server unavailable: code=701 text=${text} url=${url}; quarantined for 300s`)
-        }
+      const numericCode = Number(code)
+      if (Number.isInteger(numericCode) && numericCode >= 700 && numericCode < 800) {
+        // Browsers emit 7xx candidate diagnostics for individual URL/interface
+        // combinations even while other candidates from the same ICE server
+        // remain usable. They must never mutate ICE configuration or transport
+        // state; the browser's ICE agent remains the sole authority here.
+        log(`[webrtc] non-fatal ICE candidate diagnostic to ${remotePeerId}: code=${code} text=${text} url=${url}`)
         return
       }
       log(`[webrtc] ice candidate error to ${remotePeerId}: code=${code} text=${text} url=${url}`)
@@ -752,6 +705,18 @@ export function createSignalingClient(options = {}) {
     pc.onicegatheringstatechange = () => {
       if (mesh.connections.get(remotePeerId)?.connection !== pc) return
       log(`[webrtc] ice gathering to ${remotePeerId}: ${pc.iceGatheringState}`)
+    }
+
+    pc.onsignalingstatechange = () => {
+      const current = mesh.connections.get(remotePeerId)
+      if (current?.connection !== pc || pc.signalingState !== 'have-local-offer') return
+      const pending = pendingAnswers.get(remotePeerId)
+      if (!pending?.sdp || (pending.connection && pending.connection !== pc)) return
+      Promise.resolve().then(() => {
+        const latest = pendingAnswers.get(remotePeerId)
+        if (!latest?.sdp || (latest.connection && latest.connection !== pc)) return
+        handleIncomingAnswer(remotePeerId, latest.sdp, latest.sessionId)
+      }).catch(() => {})
     }
 
     pc.ondatachannel = (event) => {
@@ -804,7 +769,11 @@ export function createSignalingClient(options = {}) {
 
     // If an answer arrived before we reached have-local-offer, apply it now.
     const pendingAnswer = pendingAnswers.get(toPeerId)
-    if (pendingAnswer?.sdp && pendingAnswer?.sessionId === activeSessionId) {
+    if (
+      pendingAnswer?.sdp
+      && pendingAnswer?.sessionId === activeSessionId
+      && (!pendingAnswer.connection || pendingAnswer.connection === pc)
+    ) {
       const current = mesh.connections.get(toPeerId)?.connection
       if (current === pc && pc.signalingState === 'have-local-offer') {
         await applyIncomingAnswer(toPeerId, pendingAnswer.sdp, pendingAnswer.sessionId)
@@ -1026,33 +995,49 @@ export function createSignalingClient(options = {}) {
   }
 
   async function applyIncomingAnswer(fromPeerId, incomingAnswerSdp, sessionId) {
-    const conn = mesh.connections.get(fromPeerId)
-    if (!conn?.connection) {
-      pendingAnswers.set(fromPeerId, { sdp: incomingAnswerSdp, sessionId, ts: Date.now() })
-      log(`[webrtc] queued answer from ${fromPeerId} (no connection yet)`)
-      return
-    }
-
     const expectedSessionId = roomId
     if (expectedSessionId && sessionId && sessionId !== expectedSessionId) {
       log(`[webrtc] ignoring answer from ${fromPeerId} (stale session)`)
       return
     }
 
+    const conn = mesh.connections.get(fromPeerId)
+    if (!conn?.connection) {
+      pendingAnswers.set(fromPeerId, {
+        sdp: incomingAnswerSdp,
+        sessionId,
+        ts: Date.now(),
+        connection: null,
+      })
+      log(`[webrtc] queued answer from ${fromPeerId} (no connection yet)`)
+      return
+    }
+
     const now = Date.now()
     const recent = recentAnswerSdp.get(fromPeerId)
     if (recent?.sdp === incomingAnswerSdp && now - recent.ts < SDP_DEDUP_WINDOW_MS) {
-      log(`[webrtc] ignoring duplicate answer from ${fromPeerId} (dedup window)`)
+      log(`[webrtc] duplicate answer from ${fromPeerId} already applied (dedup window)`)
       return
     }
     if (conn.lastAppliedAnswerSdp === incomingAnswerSdp) {
-      log(`[webrtc] ignoring duplicate answer from ${fromPeerId} (already applied)`)
+      log(`[webrtc] duplicate answer from ${fromPeerId} already applied`)
       return
     }
 
     const pc = conn.connection
     if (pc.signalingState !== 'have-local-offer') {
-      log(`[webrtc] ignoring answer from ${fromPeerId} (state=${pc.signalingState})`)
+      const peerIsIsolated = conn.channel?.readyState !== 'open'
+      if (peerIsIsolated) {
+        pendingAnswers.set(fromPeerId, {
+          sdp: incomingAnswerSdp,
+          sessionId,
+          ts: Date.now(),
+          connection: pc,
+        })
+        log(`[webrtc] queued answer from ${fromPeerId} (state=${pc.signalingState}; peer isolated)`)
+        return
+      }
+      log(`[webrtc] ignoring stale answer from connected peer ${fromPeerId} (state=${pc.signalingState})`)
       return
     }
 
