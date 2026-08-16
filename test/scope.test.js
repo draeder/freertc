@@ -3,11 +3,61 @@ import test from "node:test";
 
 import {
   createRegistrationAck,
+  discoverJoiningPeer,
   peerScopeKey,
   resolveSelfRelayUrl,
   scopeKey,
   validEnvelope
 } from "../src/index.js";
+
+test("joining-peer discovery starts before publication completes", async () => {
+  let finishPublication;
+  let publicationFinished = false;
+  const events = [];
+  const publication = new Promise((resolve) => {
+    finishPublication = () => {
+      publicationFinished = true;
+      resolve([{ url: "wss://relay-b.example/ws" }]);
+    };
+  });
+
+  const task = discoverJoiningPeer({
+    discover: async () => {
+      events.push("discover");
+      return [{ peer_id: "peer-a" }];
+    },
+    publish: () => {
+      events.push("publish");
+      return publication;
+    },
+    send: (peers) => events.push(`send:${peers[0].peer_id}`),
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ["discover", "publish", "send:peer-a"]);
+  assert.equal(publicationFinished, false);
+  finishPublication();
+  assert.deepEqual(await task, [{ peer_id: "peer-a" }]);
+});
+
+test("an empty eager lookup uses publication results without a timer", async () => {
+  const providers = [{ url: "wss://relay-b.example/ws" }];
+  const discoveries = [];
+  const sent = [];
+
+  const peers = await discoverJoiningPeer({
+    discover: async (publishedProviders) => {
+      discoveries.push(publishedProviders);
+      return publishedProviders ? [{ peer_id: "peer-b" }] : [];
+    },
+    publish: async () => providers,
+    send: (nextPeers) => sent.push(nextPeers),
+  });
+
+  assert.deepEqual(discoveries, [undefined, providers]);
+  assert.deepEqual(sent, [[{ peer_id: "peer-b" }]]);
+  assert.deepEqual(peers, [{ peer_id: "peer-b" }]);
+});
 
 const envelope = {
   psp_version: "1.0",

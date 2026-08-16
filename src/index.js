@@ -351,6 +351,23 @@ async function findFederatedPeers(
     .filter((peer) => peer.peer_id !== requesterPeerId);
 }
 
+async function discoverJoiningPeer({ discover, publish, send }) {
+  const eagerDiscovery = discover();
+  const publication = publish();
+  const eagerPeers = await eagerDiscovery;
+
+  if (eagerPeers.length > 0) {
+    send(eagerPeers);
+    await publication;
+    return eagerPeers;
+  }
+
+  const publishedScopeProviders = await publication;
+  const peers = await discover(publishedScopeProviders);
+  if (peers.length > 0) send(peers);
+  return peers;
+}
+
 // Forward a PSP message through a remote relay's HTTP endpoint.
 export async function forwardToRelay(relayUrl, message, selfRelayId) {
   try {
@@ -771,33 +788,46 @@ async function handleClientMessage(
 
       if (selfRelayUrl && isKademliaEnabled(env)) {
         ctx.waitUntil((async () => {
-          const scopeProviders = await publishPeerProviderRecords(
-            env,
-            selfRelayUrl,
-            network,
-            room,
-            peerId,
-            { connections: livePeers.size, returnScopeProviders: true },
-          );
-          if (isHeartbeat) return;
+          if (isHeartbeat) {
+            await publishPeerProviderRecords(
+              env,
+              selfRelayUrl,
+              network,
+              room,
+              peerId,
+              { connections: livePeers.size },
+            );
+            return;
+          }
 
-          // The initial client discovery can race its provider publication and
-          // return empty on every relay. Push a fresh federated snapshot as soon
-          // as publication completes so connection setup is event-driven instead
-          // of waiting for PeerPigeon's 15-second health interval.
-          const peers = await findFederatedPeers(
-            env,
-            selfRelayUrl,
-            network,
-            room,
-            peerId,
-            livePeers.size,
-            scopeProviders,
-          );
-          try {
-            sendPeerList(socket, network, room, peers, peerId, relayPeerId);
-          } catch {}
-        })().catch((err) => console.error("[KAD] Provider publish failed:", err?.message)));
+          // Query the established overlay immediately while publishing this
+          // peer's provider records in parallel. Discovery must not sit behind
+          // the publication round trip for a peer that is already isolated.
+          await discoverJoiningPeer({
+            discover: (scopeProviders) => findFederatedPeers(
+              env,
+              selfRelayUrl,
+              network,
+              room,
+              peerId,
+              livePeers.size,
+              scopeProviders,
+            ),
+            publish: () => publishPeerProviderRecords(
+              env,
+              selfRelayUrl,
+              network,
+              room,
+              peerId,
+              { connections: livePeers.size, returnScopeProviders: true },
+            ),
+            send: (peers) => {
+              try {
+                sendPeerList(socket, network, room, peers, peerId, relayPeerId);
+              } catch {}
+            },
+          });
+        })().catch((err) => console.error("[KAD] Announce discovery failed:", err?.message)));
       }
 
       // Registration is complete only after the relay has accepted the
@@ -949,6 +979,7 @@ function validEnvelope(msg) {
 
 export {
   createRegistrationAck,
+  discoverJoiningPeer,
   normalizeRoom,
   peerScopeKey,
   resolveRelayPeerId,
