@@ -308,6 +308,39 @@ async function queryRelayForPeers(relayUrl, network, room, requesterPeerId) {
   }
 }
 
+async function findFederatedPeers(env, selfRelayUrl, network, room, requesterPeerId, connections = 0) {
+  const localPeers = env.DB
+    ? await findPeers(env.DB, network, room, requesterPeerId)
+    : [];
+
+  if (!selfRelayUrl || !env.DB) return localPeers;
+
+  let remoteUrls;
+  if (isKademliaEnabled(env)) {
+    const providers = await lookupScopeProviders(
+      env,
+      selfRelayUrl,
+      network,
+      room,
+      { connections },
+    );
+    remoteUrls = [...new Set(providers.map((provider) => provider.url))]
+      .filter((relayUrl) => relayUrl !== selfRelayUrl);
+  } else {
+    const allRelays = await listRelays(env.DB);
+    remoteUrls = allRelays.map((relay) => relay.url).filter((relayUrl) => relayUrl !== selfRelayUrl);
+  }
+
+  const remotePeers = remoteUrls.length
+    ? (await Promise.all(
+      remoteUrls.map((relayUrl) => queryRelayForPeers(relayUrl, network, room, requesterPeerId)),
+    )).flat()
+    : [];
+
+  return mergeDiscoveredPeers(localPeers, remotePeers)
+    .filter((peer) => peer.peer_id !== requesterPeerId);
+}
+
 // Forward a PSP message through a remote relay's HTTP endpoint.
 export async function forwardToRelay(relayUrl, message, selfRelayId) {
   try {
@@ -720,20 +753,40 @@ async function handleClientMessage(
     livePeers.set(peerKey, { peerId, network, room, socket, lastSeen: Date.now() });
 
     if (type === "announce") {
+      const isHeartbeat = prevPeerKey === peerKey;
       if (db) {
         await upsertAnnouncement(db, message);
         await deliverQueuedRelayMessages(db, socket, network, room, peerId);
       }
 
       if (selfRelayUrl && isKademliaEnabled(env)) {
-        ctx.waitUntil(publishPeerProviderRecords(
-          env,
-          selfRelayUrl,
-          network,
-          room,
-          peerId,
-          { connections: livePeers.size },
-        ).catch((err) => console.error("[KAD] Provider publish failed:", err?.message)));
+        ctx.waitUntil((async () => {
+          await publishPeerProviderRecords(
+            env,
+            selfRelayUrl,
+            network,
+            room,
+            peerId,
+            { connections: livePeers.size },
+          );
+          if (isHeartbeat) return;
+
+          // The initial client discovery can race its provider publication and
+          // return empty on every relay. Push a fresh federated snapshot as soon
+          // as publication completes so connection setup is event-driven instead
+          // of waiting for PeerPigeon's 15-second health interval.
+          const peers = await findFederatedPeers(
+            env,
+            selfRelayUrl,
+            network,
+            room,
+            peerId,
+            livePeers.size,
+          );
+          try {
+            sendPeerList(socket, network, room, peers, peerId, relayPeerId);
+          } catch {}
+        })().catch((err) => console.error("[KAD] Provider publish failed:", err?.message)));
       }
 
       // Registration is complete only after the relay has accepted the
@@ -746,7 +799,6 @@ async function handleClientMessage(
       // Only broadcast peer_list when the peer is newly joining, not on heartbeat re-announces.
       // prevPeerKey === peerKey means same peer on the same socket sending a periodic keep-alive;
       // no topology change occurred, so no need to push a new list to everyone.
-      const isHeartbeat = prevPeerKey === peerKey;
       if (!isHeartbeat && db) {
         console.log(`[NET] Broadcasting peer_list for network=${network} room=${room} after new announce from ${peerId}`);
         broadcastPeerList(db, network, room, relayPeerId).catch((err) => console.error(`[Broadcast error]`, err?.message));
@@ -762,43 +814,12 @@ async function handleClientMessage(
       }
 
     } else if (type === "discover") {
-      let localPeers = [];
-      if (db) {
-        localPeers = await findPeers(db, network, room, peerId);
-      }
-
-      let remotePeers = [];
-      if (selfRelayUrl && env.DB) {
-        let remoteUrls;
-        if (isKademliaEnabled(env)) {
-          const providers = await lookupScopeProviders(
-            env,
-            selfRelayUrl,
-            network,
-            room,
-            { connections: livePeers.size },
-          );
-          remoteUrls = [...new Set(providers.map((provider) => provider.url))]
-            .filter((relayUrl) => relayUrl !== selfRelayUrl);
-        } else {
-          const allRelays = await listRelays(env.DB);
-          remoteUrls = allRelays.map(r => r.url).filter(u => u !== selfRelayUrl);
-        }
-
-        if (remoteUrls.length) {
-          const results = await Promise.all(
-            remoteUrls.map(u => queryRelayForPeers(u, network, room, peerId))
-          );
-          remotePeers = results.flat();
-        }
-      }
-
       try {
         sendPeerList(
           socket,
           network,
           room,
-          mergeDiscoveredPeers(localPeers, remotePeers).filter(peer => peer.peer_id !== peerId),
+          await findFederatedPeers(env, selfRelayUrl, network, room, peerId, livePeers.size),
           peerId,
           relayPeerId
         );
