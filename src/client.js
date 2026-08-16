@@ -824,6 +824,21 @@ export function createSignalingClient(options = {}) {
       pc.__offerRetryTimer = setTimeout(retryOffer, nextDelayMs)
     }
 
+    pc.__resetOfferRetryBackoff = () => {
+      clearOfferRetryTimer(pc)
+      if (mesh.connections.get(toPeerId)?.connection !== pc) return
+      if (
+        pc.signalingState !== 'have-local-offer'
+        || pc.remoteDescription
+      ) return
+      retryIndex = 0
+      relaySignal(toPeerId, 'offer', {
+        sdp: pc.localDescription?.sdp ?? offer.sdp,
+        trickle_ice: Boolean(trickleIce),
+      })
+      pc.__offerRetryTimer = setTimeout(retryOffer, OFFER_RETRY_DELAYS_MS[0])
+    }
+
     pc.__offerRetryTimer = setTimeout(retryOffer, OFFER_RETRY_DELAYS_MS[retryIndex])
     return pc
   }
@@ -1435,6 +1450,19 @@ export function createSignalingClient(options = {}) {
         ttl_ms: 30000,
         body: { instance_id: networkId, capabilities: nextCapabilities, hints: { wants_peers: true } },
       }))
+    },
+
+    resetRecoveryBackoffs() {
+      resetReconnectBackoff()
+      recentOfferSdp.clear()
+      recentAnswerSdp.clear()
+      for (const [remotePeerId, entry] of mesh.connections.entries()) {
+        clearAnswerBurst(remotePeerId)
+        entry.lastAnswerBurstAt = 0
+        entry.lastAnswerSentAt = 0
+        entry.connection?.__resetOfferRetryBackoff?.()
+      }
+      log('[signal] recovery backoffs cleared')
     },
 
     disconnect() {

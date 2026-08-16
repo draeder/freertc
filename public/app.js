@@ -2650,6 +2650,9 @@ createApp({
 
     function handleTabVisible() {
       if (typeof document !== "undefined" && document.hidden) return;
+      failedPeerCooldowns.clear();
+      byeCooldowns.clear();
+      lastDiscoverSyncAt = 0;
       // Re-acquire wake lock lost while hidden.
       const anyOpen = [...meshLinks.values()].some((l) => l.dc?.readyState === "open");
       if (anyOpen) acquireWakeLock();
@@ -2672,6 +2675,9 @@ createApp({
       if (manualDisconnect) return;
 
       pushLog("socket", "browser resumed — reconnecting immediately");
+      failedPeerCooldowns.clear();
+      byeCooldowns.clear();
+      lastDiscoverSyncAt = 0;
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;

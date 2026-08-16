@@ -403,6 +403,101 @@ test('trickle ICE sends the initial offer without waiting for candidate gatherin
   }
 })
 
+test('recovery reset clears offer backoff and retransmits immediately', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const originalWebSocket = globalThis.WebSocket
+  const originalRTCPeerConnection = globalThis.RTCPeerConnection
+  const sockets = []
+
+  class FakeWebSocket {
+    static CONNECTING = 0
+    static OPEN = 1
+    static CLOSED = 3
+
+    constructor() {
+      this.readyState = FakeWebSocket.CONNECTING
+      this.sent = []
+      sockets.push(this)
+    }
+    send(value) { this.sent.push(JSON.parse(value)) }
+    open() {
+      this.readyState = FakeWebSocket.OPEN
+      this.onopen?.()
+    }
+    receive(message) { this.onmessage?.({ data: JSON.stringify(message) }) }
+    close(code = 1000) {
+      this.readyState = FakeWebSocket.CLOSED
+      this.onclose?.({ code })
+    }
+  }
+
+  class FakeDataChannel {
+    constructor() { this.readyState = 'connecting' }
+    send() {}
+    close() { this.readyState = 'closed' }
+  }
+
+  class FakeRTCPeerConnection {
+    constructor() {
+      this.signalingState = 'stable'
+      this.connectionState = 'new'
+      this.iceConnectionState = 'new'
+      this.iceGatheringState = 'complete'
+      this.localDescription = null
+      this.remoteDescription = null
+    }
+    createDataChannel() { return new FakeDataChannel() }
+    async createOffer() { return { type: 'offer', sdp: 'offer:local' } }
+    async setLocalDescription(description) {
+      this.localDescription = description
+      this.signalingState = 'have-local-offer'
+    }
+    close() {
+      this.signalingState = 'closed'
+      this.connectionState = 'closed'
+    }
+  }
+
+  globalThis.WebSocket = FakeWebSocket
+  globalThis.RTCPeerConnection = FakeRTCPeerConnection
+  let client
+  try {
+    client = createSignalingClient({
+      peerId: 'local-peer',
+      networkId: 'test-network',
+      roomId: 'test-room',
+      signalUrl: 'wss://signal.example/ws',
+      autoConnect: false,
+    })
+    client.connect()
+    sockets[0].open()
+    sockets[0].receive({ type: 'ack', body: { status: 'ok' } })
+    await client.initiateConnection('remote-peer')
+
+    const offers = () => sockets[0].sent.filter((message) => message.type === 'offer').length
+    assert.equal(offers(), 1)
+    t.mock.timers.tick(100)
+    t.mock.timers.tick(250)
+    assert.equal(offers(), 3)
+
+    const entry = client.mesh.connections.get('remote-peer')
+    entry.lastAnswerBurstAt = 123
+    entry.lastAnswerSentAt = 456
+    client.resetRecoveryBackoffs()
+    assert.equal(offers(), 4)
+    assert.equal(entry.lastAnswerBurstAt, 0)
+    assert.equal(entry.lastAnswerSentAt, 0)
+
+    // The retry sequence starts at its shortest delay again after resume.
+    t.mock.timers.tick(100)
+    assert.equal(offers(), 5)
+  } finally {
+    client?.disconnect()
+    globalThis.WebSocket = originalWebSocket
+    globalThis.RTCPeerConnection = originalRTCPeerConnection
+  }
+})
+
 test('a silent data channel is closed after one unanswered ping deadline', async (t) => {
   t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] })
   const originalWebSocket = globalThis.WebSocket
