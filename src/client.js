@@ -1093,6 +1093,29 @@ export function createSignalingClient(options = {}) {
     })
   }
 
+  function closePeerConnection(remotePeerId, reason = 'local_close', notifyRemote = true) {
+    const id = String(remotePeerId || '').trim()
+    if (!id) return false
+    const entry = mesh.connections.get(id)
+
+    // Tell the other owner first so it cancels offer retries and cannot revive
+    // an edge that this side intentionally shed for capacity/topology reasons.
+    if (notifyRemote && registered) {
+      relaySignal(id, 'bye', { reason })
+    }
+
+    if (!entry) return false
+    mesh.connections.delete(id)
+    clearOfferRetryTimer(entry.connection)
+    clearAnswerBurst(id)
+    pendingCandidates.delete(id)
+    pendingAnswers.delete(id)
+    offerProcessingQueues.delete(id)
+    try { entry.channel?.close?.() } catch {}
+    try { entry.connection?.close?.() } catch {}
+    return true
+  }
+
   async function handleSignalingMessage(rawMsg) {
     const fromPeerId = rawMsg.from
     log(`[signal] incoming ${rawMsg.type} from ${fromPeerId}`)
@@ -1163,11 +1186,13 @@ export function createSignalingClient(options = {}) {
         break
 
       case 'bye':
-        if (conn?.connection) {
-          conn.connection.close()
-          mesh.connections.delete(fromPeerId)
-          mesh.markDead(fromPeerId)
-        }
+        closePeerConnection(fromPeerId, msg.body?.reason || 'remote_close', false)
+        onConnectionStateChangeCb?.({
+          peerId: fromPeerId,
+          state: 'closed',
+          reason: msg.body?.reason || 'remote_close',
+          ts: Date.now(),
+        })
         break
 
       case 'renegotiate': {
@@ -1510,6 +1535,10 @@ export function createSignalingClient(options = {}) {
 
     reconnectSignaling(reason = 'signaling_refresh') {
       return reconnectSignalingPreservingPeers(reason)
+    },
+
+    closePeerConnection(remotePeerId, reason = 'local_close') {
+      return closePeerConnection(remotePeerId, reason, true)
     },
 
     disconnect() {
