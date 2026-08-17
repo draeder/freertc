@@ -16,5 +16,13 @@
       // from matching an existing database and forces new D1 provisioning.
       "migrations_dir": "migrations"
     }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "RELAY_COORDINATOR", "class_name": "RelayCoordinator" }
+    ]
+  },
+  "migrations": [
+    { "tag": "relay-coordinator-v1", "new_sqlite_classes": ["RelayCoordinator"] }
   ]
 }

@@ -44,6 +44,9 @@ test("Deploy Button configuration provisions D1, migrations, and private relay i
     assert.match(config, /"GLOBAL_RELAY_URL"\s*:\s*"wss:\/\/peer\.ooo\/ws"/);
     assert.doesNotMatch(config, /"RELAY_URL"\s*:/);
     assert.match(config, /"migrations_dir"\s*:\s*"migrations"/);
+    assert.match(config, /"RELAY_COORDINATOR"/);
+    assert.match(config, /"class_name"\s*:\s*"RelayCoordinator"/);
+    assert.match(config, /"new_sqlite_classes"\s*:\s*\["RelayCoordinator"\]/);
     assert.doesNotMatch(config, /peer-ooo-worker-devtest|52acefe2/i);
   }
 

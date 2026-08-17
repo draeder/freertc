@@ -37,6 +37,12 @@ const KADEMLIA_FORWARD_LIMIT = 2;
 const livePeers = new Map(); // key: JSON [network, room, peerId]
 const networkSubscribers = new Map(); // key: JSON [network, room] -> Set of sockets
 
+function relayCoordinatorStub(env) {
+  const namespace = env?.RELAY_COORDINATOR;
+  if (!namespace?.idFromName || !namespace?.get) return null;
+  return namespace.get(namespace.idFromName("relay"));
+}
+
 function normalizeRoom(value) {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -87,6 +93,8 @@ export default {
       if (url.pathname !== "/ws") {
         return jsonResponse({ ok: false, error: "WebSocket endpoint is /ws" }, 404);
       }
+      const coordinator = relayCoordinatorStub(env);
+      if (coordinator) return coordinator.fetch(request);
       return handleWebSocket(request, env, ctx, selfRelayUrl);
     }
 
@@ -95,6 +103,8 @@ export default {
     }
 
     if (url.pathname === "/health") {
+      const coordinator = relayCoordinatorStub(env);
+      if (coordinator) return coordinator.fetch(request);
       return jsonResponse({
         ok: true,
         version: WORKER_VERSION,
@@ -136,6 +146,8 @@ export default {
 
     if (url.pathname === "/api/v1/relay") {
       if (request.method === "POST") {
+        const coordinator = relayCoordinatorStub(env);
+        if (coordinator) return coordinator.fetch(request);
         return handleRelayForward(request, env);
       }
       return jsonResponse({ ok: false, error: "Method not allowed" }, 405);
@@ -144,6 +156,46 @@ export default {
     return env.ASSETS?.fetch(request) ?? new Response("Not Found", { status: 404 });
   }
 };
+
+// Cloudflare may run an HTTP federation request in a different Worker isolate
+// from the destination WebSocket. A single Durable Object per relay owns both
+// entry points so a live peer can receive offers, answers, and ICE immediately
+// instead of waiting for its next ping to drain D1.
+export class RelayCoordinator {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    const upgrade = request.headers.get("Upgrade");
+    const selfRelayUrl = resolveSelfRelayUrl(request, this.env.RELAY_URL);
+
+    if (upgrade && upgrade.toLowerCase() === "websocket" && url.pathname === "/ws") {
+      return handleWebSocket(request, this.env, this.state, selfRelayUrl);
+    }
+    if (url.pathname === "/api/v1/relay" && request.method === "POST") {
+      return handleRelayForward(request, this.env);
+    }
+    if (url.pathname === "/health") {
+      return jsonResponse({
+        ok: true,
+        version: WORKER_VERSION,
+        protocol_version: PSP_VERSION,
+        peers: livePeers.size,
+        relay_url: selfRelayUrl,
+        relay_peer_id: resolveRelayPeerId(this.env.RELAY_PEER_ID, selfRelayUrl),
+        kademlia_enabled: isKademliaEnabled(this.env),
+        federation_hub: selfRelayUrl
+          ? normalizeRelayUrl(this.env.GLOBAL_RELAY_URL || DEFAULT_HUB_URL)
+          : null,
+        coordinated: true,
+      }, 200);
+    }
+    return jsonResponse({ ok: false, error: "Not Found" }, 404);
+  }
+}
 
 function jsonResponse(body, status = 200) {
   return new Response(JSON.stringify(body), {

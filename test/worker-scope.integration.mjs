@@ -57,9 +57,13 @@ const peerC = await connectPeer("cccccccccccccccc", "room-blue");
 try {
   peerA.messages.length = 0;
   peerA.socket.send(JSON.stringify(envelope("discover", peerA.peerId, peerA.room)));
-  await waitFor(() => peerA.messages.some((message) => message.type === "peer_list"));
+  await waitFor(() => peerA.messages.some((message) => (
+    message.type === "peer_list" && message.to === peerA.peerId
+  )));
 
-  const peerList = peerA.messages.find((message) => message.type === "peer_list");
+  const peerList = peerA.messages.find((message) => (
+    message.type === "peer_list" && message.to === peerA.peerId
+  ));
   const discoveredIds = (peerList.body?.peers || []).map((peer) => peer.peer_id);
   assert.deepEqual(discoveredIds, [peerC.peerId]);
 
@@ -70,12 +74,12 @@ try {
   assert.equal(peerB.messages.some((message) => message.type === "offer"), false);
 
   peerC.messages.length = 0;
+  const offerSentAt = performance.now();
   peerA.socket.send(JSON.stringify(envelope("offer", peerA.peerId, peerA.room, peerC.peerId, { sdp: "test" })));
-  // A local Worker cannot reuse another request's WebSocket object, so the
-  // relay safely queues the message. The destination's next scoped heartbeat
-  // drains that queue.
-  peerC.socket.send(JSON.stringify(envelope("ping", peerC.peerId, peerC.room, peerC.peerId)));
+  // The relay coordinator owns both WebSockets, so negotiation is delivered
+  // immediately without waiting for the destination to send another ping.
   await waitFor(() => peerC.messages.some((message) => message.type === "offer"));
+  assert.ok(performance.now() - offerSentAt < 1_000, 'coordinated offer delivery must remain sub-second');
   assert.equal(peerC.messages.find((message) => message.type === "offer")?.session_id, "room-blue");
 
   console.log("Worker scope isolation passed");

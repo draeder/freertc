@@ -31,11 +31,22 @@ const BOOTSTRAP_REFRESH_INTERVAL_MS = 5_000;
 const PROVIDER_PUBLISH_INTERVAL_MS = 20_000;
 const PROVIDER_RECORD_TTL_MS = 45_000;
 const MAX_RECENT_PROVIDER_PUBLISHES = 20_000;
+const PEER_PROVIDER_LOOKUP_CACHE_MS = 5_000;
+const MAX_RECENT_PEER_PROVIDER_LOOKUPS = 2_000;
 
 const identityPromises = new WeakMap();
 const joinPromises = new WeakMap();
 const recentBootstrapJoins = new WeakMap();
 const recentProviderPublishes = new Map();
+const recentPeerProviderLookups = new Map();
+
+function rememberPeerProviderLookup(key, entry) {
+  recentPeerProviderLookups.delete(key);
+  recentPeerProviderLookups.set(key, entry);
+  while (recentPeerProviderLookups.size > MAX_RECENT_PEER_PROVIDER_LOOKUPS) {
+    recentPeerProviderLookups.delete(recentPeerProviderLookups.keys().next().value);
+  }
+}
 
 function markProviderPublish(key, now) {
   const previous = Number(recentProviderPublishes.get(key) || 0);
@@ -451,7 +462,36 @@ export async function lookupScopeProviders(env, selfUrl, network, room, options 
 }
 
 export async function lookupPeerProviders(env, selfUrl, network, room, peerId, options = {}) {
-  return lookupProviders(env, selfUrl, await peerRoutingKey(network, room, peerId), PEER_PROVIDER_RECORD_KIND, options);
+  const routingKey = await peerRoutingKey(network, room, peerId);
+  const cacheKey = JSON.stringify([selfUrl, network, room, peerId]);
+  const now = Date.now();
+  const cached = recentPeerProviderLookups.get(cacheKey);
+  if (cached?.promise) return cached.promise;
+  if (cached?.records && cached.expiresAt > now) return cached.records;
+  if (cached) recentPeerProviderLookups.delete(cacheKey);
+
+  // One WebRTC offer commonly produces an offer plus a burst of ICE packets.
+  // They all target the same peer and must share one Kademlia lookup instead of
+  // launching an expensive overlay walk per packet. Empty results are not
+  // cached so a just-published provider can be found by the next packet.
+  const promise = lookupProviders(env, selfUrl, routingKey, PEER_PROVIDER_RECORD_KIND, options)
+    .then((records) => {
+      if (records.length > 0) {
+        rememberPeerProviderLookup(cacheKey, {
+          records,
+          expiresAt: Date.now() + PEER_PROVIDER_LOOKUP_CACHE_MS,
+        });
+      } else {
+        recentPeerProviderLookups.delete(cacheKey);
+      }
+      return records;
+    })
+    .catch((error) => {
+      recentPeerProviderLookups.delete(cacheKey);
+      throw error;
+    });
+  rememberPeerProviderLookup(cacheKey, { promise, expiresAt: now });
+  return promise;
 }
 
 export async function handleKademliaRequest(request, env, options = {}) {

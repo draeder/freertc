@@ -41,6 +41,15 @@
     }
   ],
 
+  "durable_objects": {
+    "bindings": [
+      { "name": "RELAY_COORDINATOR", "class_name": "RelayCoordinator" }
+    ]
+  },
+  "migrations": [
+    { "tag": "relay-coordinator-v1", "new_sqlite_classes": ["RelayCoordinator"] }
+  ],
+
   // ── Custom domain (OPTIONAL) ──────────────────────────────────────────────
   // If you have a domain on Cloudflare, uncomment and fill in:
   //
@@ -73,7 +82,12 @@
           "database_id": "YOUR_D1_DATABASE_ID",
           "migrations_dir": "migrations"
         }
-      ]
+      ],
+      "durable_objects": {
+        "bindings": [
+          { "name": "RELAY_COORDINATOR", "class_name": "RelayCoordinator" }
+        ]
+      }
     }
   }
 }

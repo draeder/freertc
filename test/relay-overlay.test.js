@@ -230,6 +230,57 @@ test('two relays join, replicate, and resolve signed scope and peer providers', 
   }
 });
 
+test('concurrent signal bursts share one peer-provider lookup', async () => {
+  const [pairA, pairB] = await Promise.all([generateRandomPair(), generateRandomPair()]);
+  const urlA = 'wss://relay-burst-a.example/ws';
+  const urlB = 'wss://relay-burst-b.example/ws';
+  const envA = {
+    DB: new MemoryD1(),
+    RELAY_SIGNING_PUBLIC_KEY: pairA.pub,
+    RELAY_SIGNING_PRIVATE_KEY: pairA.priv,
+    KADEMLIA_BOOTSTRAP_URLS: urlB,
+  };
+  const envB = {
+    DB: new MemoryD1(),
+    RELAY_SIGNING_PUBLIC_KEY: pairB.pub,
+    RELAY_SIGNING_PRIVATE_KEY: pairB.priv,
+  };
+  const relays = new Map([
+    ['relay-burst-a.example', { env: envA, selfUrl: urlA }],
+    ['relay-burst-b.example', { env: envB, selfUrl: urlB }],
+  ]);
+  const originalFetch = globalThis.fetch;
+  let findCalls = 0;
+
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    if (new URL(request.url).pathname === '/api/v1/kad/find') findCalls += 1;
+    const target = relays.get(new URL(request.url).hostname);
+    if (!target) return new Response('not found', { status: 404 });
+    return handleKademliaRequest(request, target.env, { selfUrl: target.selfUrl });
+  };
+
+  try {
+    await heartbeatKademlia(envA, urlA);
+    await publishPeerProviderRecords(envA, urlA, 'network-burst', 'room-burst', 'peer-burst');
+    findCalls = 0;
+
+    const results = await Promise.all(Array.from({ length: 12 }, () => (
+      lookupPeerProviders(envB, urlB, 'network-burst', 'room-burst', 'peer-burst')
+    )));
+    const afterBurst = findCalls;
+
+    assert.ok(results.every((records) => records.some((record) => record.url === urlA)));
+    assert.ok(afterBurst > 0);
+    assert.ok(afterBurst <= 2, `expected one coalesced lookup, received ${afterBurst} overlay requests`);
+
+    await lookupPeerProviders(envB, urlB, 'network-burst', 'room-burst', 'peer-burst');
+    assert.equal(findCalls, afterBurst);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('lookup refreshes configured bootstraps even when a stale routing contact exists', async () => {
   const [pairA, pairB, pairC] = await Promise.all([
     generateRandomPair(),
