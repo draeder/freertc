@@ -38,6 +38,26 @@ const PEER_RELAY_HINT_TTL_MS = 60_000;
 const livePeers = new Map(); // key: JSON [network, room, peerId]
 const networkSubscribers = new Map(); // key: JSON [network, room] -> Set of sockets
 const peerRelayHints = new Map(); // key: JSON [network, room, peerId] -> { url, expiresAt }
+let nextSocketGeneration = 0;
+
+export function claimLivePeer(livePeerMap, key, value) {
+  const current = livePeerMap.get(key);
+  if (
+    current?.socket !== value.socket
+    && Number(current?.socketGeneration ?? 0) > Number(value.socketGeneration ?? 0)
+  ) {
+    return false;
+  }
+  livePeerMap.set(key, value);
+  return true;
+}
+
+export function deleteLivePeerIfOwned(livePeerMap, key, socket) {
+  const current = livePeerMap.get(key);
+  if (!current || current.socket !== socket) return false;
+  livePeerMap.delete(key);
+  return true;
+}
 
 function relayCoordinatorStub(env) {
   const namespace = env?.RELAY_COORDINATOR;
@@ -769,6 +789,7 @@ async function cleanupExpired(db) {
 function handleWebSocket(request, env, ctx, selfRelayUrl) {
   const { 0: client, 1: server } = new WebSocketPair();
   const relayPeerId = resolveRelayPeerId(env.RELAY_PEER_ID, selfRelayUrl);
+  const socketGeneration = ++nextSocketGeneration;
 
   let peerKey = null;
   let network = null;
@@ -787,13 +808,15 @@ function handleWebSocket(request, env, ctx, selfRelayUrl) {
     const key = peerScopeKey(currentNetwork, currentRoom, currentPeerId);
     const subscriberScope = scopeKey(currentNetwork, currentRoom);
 
-    livePeers.delete(key);
+    const releasedLivePeer = deleteLivePeerIfOwned(livePeers, key, server);
     peerKey = null;
     peerId = null;
     network = null;
     room = null;
 
-    if (env.DB) {
+    // A replaced socket can close after its successor has already announced.
+    // Only the socket that still owns this peer ID may delete the shared lease.
+    if (env.DB && releasedLivePeer) {
       ctx.waitUntil(
         deleteAnnouncement(env.DB, currentNetwork, currentRoom, currentPeerId)
           .then(() => broadcastPeerList(env.DB, currentNetwork, currentRoom, relayPeerId))
@@ -812,6 +835,7 @@ function handleWebSocket(request, env, ctx, selfRelayUrl) {
         env,
         ctx,
         selfRelayUrl,
+        socketGeneration,
         peerKey,
         network,
         room
@@ -865,6 +889,7 @@ async function handleClientMessage(
   env,
   ctx,
   selfRelayUrl,
+  socketGeneration,
   prevPeerKey = null,
   prevNetwork = null,
   prevRoom = null
@@ -937,8 +962,20 @@ async function handleClientMessage(
       console.log(`[NET] Peer ${peerId} subscribed to network=${network} room=${room}`);
     }
 
-    // Track live peer
-    livePeers.set(peerKey, { peerId, network, room, socket, lastSeen: Date.now() });
+    // Reconnects reuse a peer ID. A late ping/close from the replaced socket
+    // must never reclaim or remove the newer socket's live route.
+    const ownsLivePeer = claimLivePeer(livePeers, peerKey, {
+      peerId,
+      network,
+      room,
+      socket,
+      socketGeneration,
+      lastSeen: Date.now(),
+    });
+    if (!ownsLivePeer) {
+      try { socket.close(4001, "replaced_socket"); } catch {}
+      return { peerKey, network, room, peerId };
+    }
 
     if (type === "announce") {
       const isHeartbeat = prevPeerKey === peerKey;
@@ -1007,11 +1044,11 @@ async function handleClientMessage(
       }
 
     } else if (type === "withdraw") {
-      if (db) {
+      const releasedLivePeer = deleteLivePeerIfOwned(livePeers, peerKey, socket);
+      if (db && releasedLivePeer) {
         await deleteAnnouncement(db, network, room, peerId);
       }
-      livePeers.delete(peerKey);
-      if (db) {
+      if (db && releasedLivePeer) {
         broadcastPeerList(db, network, room, relayPeerId).catch(() => {});
       }
 
@@ -1051,11 +1088,11 @@ async function handleClientMessage(
       }
 
     } else if (type === "bye") {
-      if (db) {
+      const releasedLivePeer = deleteLivePeerIfOwned(livePeers, peerKey, socket);
+      if (db && releasedLivePeer) {
         await deleteAnnouncement(db, network, room, peerId);
       }
-      livePeers.delete(peerKey);
-      if (db) {
+      if (db && releasedLivePeer) {
         broadcastPeerList(db, network, room, relayPeerId).catch(() => {});
       }
 

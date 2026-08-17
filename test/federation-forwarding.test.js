@@ -2,11 +2,37 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  claimLivePeer,
+  deleteLivePeerIfOwned,
   forwardFederatedMessage,
   forwardToRelay,
   getPeerRelayHint,
   rememberPeerRelayHint,
 } from '../src/index.js';
+
+test('a replaced WebSocket cannot reclaim or delete the newer live peer route', () => {
+  const key = '["network-a","room-a","peer-a"]';
+  const oldSocket = {};
+  const newSocket = {};
+  const peers = new Map();
+
+  assert.equal(claimLivePeer(peers, key, {
+    socket: oldSocket,
+    socketGeneration: 1,
+  }), true);
+  assert.equal(claimLivePeer(peers, key, {
+    socket: newSocket,
+    socketGeneration: 2,
+  }), true);
+  assert.equal(claimLivePeer(peers, key, {
+    socket: oldSocket,
+    socketGeneration: 1,
+  }), false);
+  assert.equal(deleteLivePeerIfOwned(peers, key, oldSocket), false);
+  assert.equal(peers.get(key).socket, newSocket);
+  assert.equal(deleteLivePeerIfOwned(peers, key, newSocket), true);
+  assert.equal(peers.has(key), false);
+});
 
 test('cross-relay forwarding consumes the HTTP response body', async () => {
   const originalFetch = globalThis.fetch;
