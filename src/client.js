@@ -1410,6 +1410,35 @@ export function createSignalingClient(options = {}) {
     openSocket()
   }
 
+  function reconnectSignalingPreservingPeers(reason = 'signaling_refresh') {
+    if (stoppedByUser) return false
+
+    log(`[signal] ${reason} — reconnecting signaling while preserving open peer channels`)
+    resetReconnectBackoff()
+
+    // WebRTC data channels do not depend on the signaling WebSocket after
+    // negotiation completes. Retire only the socket; disconnect() is a full
+    // client teardown and must never be used as a signaling health probe.
+    const staleSocket = ws
+    ws = null
+    if (staleSocket) {
+      staleSocket.onopen = null
+      staleSocket.onmessage = null
+      staleSocket.onerror = null
+      staleSocket.onclose = null
+      try {
+        staleSocket.close(4002, 'signaling_refresh')
+      } catch { /* ignore */ }
+    }
+
+    registered = false
+    stopAdvertiseHeartbeat()
+    stopKeepalive()
+    intentionalClose = false
+    openSocket()
+    return true
+  }
+
   function handleVisibilityChange() {
     if (typeof document === 'undefined' || document.hidden) return
     // Tab became visible (or resumed from freeze) — check if WebSocket dropped
@@ -1476,6 +1505,10 @@ export function createSignalingClient(options = {}) {
         entry.connection?.__resetOfferRetryBackoff?.()
       }
       log('[signal] recovery backoffs cleared')
+    },
+
+    reconnectSignaling(reason = 'signaling_refresh') {
+      return reconnectSignalingPreservingPeers(reason)
     },
 
     disconnect() {

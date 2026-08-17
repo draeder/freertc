@@ -17,9 +17,73 @@ test("the browser signaling client is exported as a package API", () => {
 
   assert.equal(client.peerId, "local-peer");
   assert.equal(typeof client.connect, "function");
+  assert.equal(typeof client.reconnectSignaling, "function");
   assert.equal(typeof client.initiateConnection, "function");
   assert.equal(typeof client.sendData, "function");
   client.disconnect();
+});
+
+test("signaling-only reconnect preserves healthy WebRTC peer channels", () => {
+  const originalWebSocket = globalThis.WebSocket;
+  const sockets = [];
+
+  class FakeWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSED = 3;
+
+    constructor() {
+      this.readyState = FakeWebSocket.CONNECTING;
+      this.sent = [];
+      sockets.push(this);
+    }
+
+    send(value) {
+      this.sent.push(JSON.parse(value));
+    }
+
+    open() {
+      this.readyState = FakeWebSocket.OPEN;
+      this.onopen?.();
+    }
+
+    close(code = 1000) {
+      this.readyState = FakeWebSocket.CLOSED;
+      this.closeCode = code;
+      this.onclose?.({ code });
+    }
+  }
+
+  globalThis.WebSocket = FakeWebSocket;
+  let client;
+  try {
+    client = createSignalingClient({
+      peerId: "local-peer",
+      networkId: "test-network",
+      roomId: "test-room",
+      signalUrl: "wss://signal.example/ws",
+      autoConnect: false,
+    });
+    client.connect();
+    sockets[0].open();
+
+    let peerConnectionClosed = false;
+    const peerEntry = {
+      state: "connected",
+      connection: { close() { peerConnectionClosed = true; } },
+      channel: { readyState: "open" },
+    };
+    client.mesh.connections.set("remote-peer", peerEntry);
+
+    assert.equal(client.reconnectSignaling("health check"), true);
+    assert.equal(sockets.length, 2);
+    assert.equal(sockets[0].closeCode, 4002);
+    assert.equal(peerConnectionClosed, false);
+    assert.equal(client.mesh.connections.get("remote-peer"), peerEntry);
+  } finally {
+    client?.disconnect();
+    globalThis.WebSocket = originalWebSocket;
+  }
 });
 
 test("page shutdown events withdraw the current signaling identity", () => {
