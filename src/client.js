@@ -614,6 +614,10 @@ export function createSignalingClient(options = {}) {
       const currentEntry = mesh.connections.get(remotePeerId)
       if (currentEntry?.connection !== pc || currentEntry.channel !== channel) return
       const msg = evt?.error?.message ?? evt?.error ?? evt?.message ?? String(evt)
+      // Closing an RTCDataChannel deliberately causes Safari/WebKit to emit an
+      // error event whose text says the close was user-initiated. It is teardown
+      // confirmation, not a transport failure, and must not feed recovery again.
+      if (/user-initiated abort|close called/i.test(String(msg))) return
       log(`[webrtc] data channel error to ${remotePeerId}: ${msg}`)
       onConnectionStateChangeCb?.({ peerId: remotePeerId, state: 'failed', ts: Date.now() })
     }

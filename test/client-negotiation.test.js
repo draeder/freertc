@@ -919,6 +919,96 @@ test('700-level ICE candidate diagnostics never alter current or future ICE conf
   }
 })
 
+test('a user-initiated data-channel close is teardown, not another transport failure', async () => {
+  const originalWebSocket = globalThis.WebSocket
+  const originalRTCPeerConnection = globalThis.RTCPeerConnection
+  const sockets = []
+  const channels = []
+  const logs = []
+  const states = []
+
+  class FakeWebSocket {
+    static CONNECTING = 0
+    static OPEN = 1
+    static CLOSED = 3
+
+    constructor() {
+      this.readyState = FakeWebSocket.CONNECTING
+      sockets.push(this)
+    }
+    send() {}
+    open() {
+      this.readyState = FakeWebSocket.OPEN
+      this.onopen?.()
+    }
+    receive(message) { this.onmessage?.({ data: JSON.stringify(message) }) }
+    close(code = 1000) {
+      this.readyState = FakeWebSocket.CLOSED
+      this.onclose?.({ code })
+    }
+  }
+
+  class FakeDataChannel {
+    constructor() {
+      this.readyState = 'connecting'
+      channels.push(this)
+    }
+    send() {}
+    close() { this.readyState = 'closed' }
+  }
+
+  class FakeRTCPeerConnection {
+    constructor() {
+      this.signalingState = 'stable'
+      this.connectionState = 'new'
+      this.iceConnectionState = 'new'
+      this.iceGatheringState = 'complete'
+      this.localDescription = null
+      this.remoteDescription = null
+    }
+    addTransceiver() {}
+    createDataChannel() { return new FakeDataChannel() }
+    async createOffer() { return { type: 'offer', sdp: 'offer' } }
+    async setLocalDescription(description) {
+      this.localDescription = description
+      this.signalingState = 'have-local-offer'
+    }
+    close() {
+      this.signalingState = 'closed'
+      this.connectionState = 'closed'
+      this.onconnectionstatechange?.()
+    }
+  }
+
+  globalThis.WebSocket = FakeWebSocket
+  globalThis.RTCPeerConnection = FakeRTCPeerConnection
+  let client
+  try {
+    client = createSignalingClient({
+      peerId: 'local-peer',
+      networkId: 'test-network',
+      roomId: 'test-room',
+      signalUrl: 'wss://signal.example/ws',
+      autoConnect: false,
+      onLog: (message) => logs.push(message),
+      onConnectionStateChange: (state) => states.push(state),
+    })
+    client.connect()
+    sockets[0].open()
+    sockets[0].receive({ type: 'ack', body: { status: 'ok' } })
+    await client.initiateConnection('remote-peer')
+
+    channels[0].onerror?.({ error: { message: 'User-Initiated Abort, reason=Close called' } })
+
+    assert.equal(logs.some((line) => line.includes('data channel error')), false)
+    assert.equal(states.some((state) => state.state === 'failed'), false)
+  } finally {
+    client?.disconnect()
+    globalThis.WebSocket = originalWebSocket
+    globalThis.RTCPeerConnection = originalRTCPeerConnection
+  }
+})
+
 test('RTP extension remaps retry on a fresh data-only connection', async () => {
   const originalWebSocket = globalThis.WebSocket
   const originalRTCPeerConnection = globalThis.RTCPeerConnection
