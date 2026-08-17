@@ -936,14 +936,15 @@ export function createSignalingClient(options = {}) {
           currentRemoteOfferSdp &&
           currentRemoteOfferSdp !== incomingOfferSdp
         ) {
-          const replacementIceServers = resolveIceServers(entry?.iceServers)
-          clearOfferRetryTimer(pc)
-          try { pc.close() } catch {}
-          mesh.connections.delete(fromPeerId)
-          clearAnswerBurst(fromPeerId)
-          pc = createPeerConnection(fromPeerId, replacementIceServers, sendRelay)
-          entry = mesh.connections.get(fromPeerId)
-          log(`[webrtc] replaced stale connection for new offer from ${fromPeerId}`)
+          // A new SDP is not proof that the current transport is stale. The
+          // other peer may have retried before this side's data-channel `open`
+          // event, or may be performing a normal ICE renegotiation. Closing a
+          // connected/connecting RTCPeerConnection here made both peers start
+          // over repeatedly. Apply the offer to the stable existing connection;
+          // explicit failed/closed states were already replaced above, and the
+          // RTP-extension error path below still performs a fresh retry when a
+          // browser genuinely cannot reuse this connection.
+          log(`[webrtc] applying renewed offer from ${fromPeerId} to existing connection`)
         }
 
         if (pc.signalingState === 'closed') return

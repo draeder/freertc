@@ -1116,10 +1116,10 @@ test('RTP extension remaps retry on a fresh data-only connection', async () => {
     })
     await nextTurn()
 
-    assert.equal(peerConnections.length, 3)
-    assert.equal(peerConnections[1].signalingState, 'closed')
-    assert.equal(peerConnections[2].remoteDescription?.sdp, 'offer:replacement')
-    assert.ok(logs.some((line) => line.includes('replaced stale connection for new offer')))
+    assert.equal(peerConnections.length, 2)
+    assert.notEqual(peerConnections[1].signalingState, 'closed')
+    assert.equal(peerConnections[1].remoteDescription?.sdp, 'offer:replacement')
+    assert.ok(logs.some((line) => line.includes('applying renewed offer')))
   } finally {
     client?.disconnect()
     globalThis.WebSocket = originalWebSocket
