@@ -33,9 +33,11 @@ const RELAY_EXPIRY_MS = 5 * 60_000;       // relay entry expires after 5 min wit
 const FEDERATION_INTERVAL_MS = 2 * 60_000; // re-heartbeat every 2 min per isolate
 const DEFAULT_HUB_URL = "wss://peer.ooo/ws"; // default bootstrap hub
 const KADEMLIA_FORWARD_LIMIT = 2;
+const PEER_RELAY_HINT_TTL_MS = 60_000;
 
 const livePeers = new Map(); // key: JSON [network, room, peerId]
 const networkSubscribers = new Map(); // key: JSON [network, room] -> Set of sockets
+const peerRelayHints = new Map(); // key: JSON [network, room, peerId] -> { url, expiresAt }
 
 function relayCoordinatorStub(env) {
   const namespace = env?.RELAY_COORDINATOR;
@@ -53,6 +55,27 @@ function scopeKey(network, room) {
 
 function peerScopeKey(network, room, peerId) {
   return JSON.stringify([network, room, peerId]);
+}
+
+export function rememberPeerRelayHint(network, room, peerId, relayUrl, now = Date.now()) {
+  const normalizedUrl = normalizeRelayUrl(relayUrl);
+  if (!network || !room || !peerId || !normalizedUrl || !/^wss?:\/\//.test(normalizedUrl)) return false;
+  peerRelayHints.set(peerScopeKey(network, room, peerId), {
+    url: normalizedUrl,
+    expiresAt: now + PEER_RELAY_HINT_TTL_MS,
+  });
+  return true;
+}
+
+export function getPeerRelayHint(network, room, peerId, now = Date.now()) {
+  const key = peerScopeKey(network, room, peerId);
+  const hint = peerRelayHints.get(key);
+  if (!hint) return null;
+  if (hint.expiresAt <= now) {
+    peerRelayHints.delete(key);
+    return null;
+  }
+  return hint.url;
 }
 
 let lastFederationMs = 0; // tracks last heartbeat time within this isolate
@@ -255,6 +278,12 @@ async function handleRelayForward(request, env) {
     return jsonResponse({ ok: false, error: "Missing destination peer" }, 400);
   }
   const room = normalizeRoom(message.session_id);
+  const viaRelayUrl = typeof body?.via === "string" && /^wss?:\/\//.test(body.via)
+    ? normalizeRelayUrl(body.via)
+    : null;
+  if (viaRelayUrl) {
+    rememberPeerRelayHint(message.network, room, message.from, viaRelayUrl);
+  }
   const liveKey = peerScopeKey(message.network, room, message.to);
   const live = livePeers.get(liveKey);
   if (live) {
@@ -399,8 +428,14 @@ async function findFederatedPeers(
     )).flat()
     : [];
 
-  return mergeDiscoveredPeers(localPeers, remotePeers)
+  const peers = mergeDiscoveredPeers(localPeers, remotePeers)
     .filter((peer) => peer.peer_id !== requesterPeerId);
+  for (const peer of peers) {
+    if (peer?.relay_url) {
+      rememberPeerRelayHint(network, room, peer.peer_id, peer.relay_url);
+    }
+  }
+  return peers;
 }
 
 async function discoverJoiningPeer({ discover, publish, send }) {
@@ -421,7 +456,7 @@ async function discoverJoiningPeer({ discover, publish, send }) {
 }
 
 // Forward a PSP message through a remote relay's HTTP endpoint.
-export async function forwardToRelay(relayUrl, message, selfRelayId) {
+async function forwardToRelayResult(relayUrl, message, selfRelayId) {
   try {
     const base = relayHttpBase(relayUrl);
     const response = await fetch(`${base}/api/v1/relay`, {
@@ -432,11 +467,85 @@ export async function forwardToRelay(relayUrl, message, selfRelayId) {
     // Cloudflare counts unread response bodies as active outbound requests.
     // Offer/answer/ICE bursts can otherwise exhaust that limit and deadlock
     // the WebSocket request that is forwarding the negotiation.
-    await response.arrayBuffer();
-    return response.ok;
+    const bytes = await response.arrayBuffer();
+    if (!response.ok) return "failed";
+    try {
+      const result = JSON.parse(new TextDecoder().decode(bytes));
+      if (result?.delivered === true) return "delivered";
+      if (result?.queued === true) return "queued";
+      if (result?.delivered === false) return "failed";
+    } catch {
+      // Legacy relay versions returned an empty success response.
+    }
+    return "delivered";
   } catch {
-    return false;
+    return "failed";
   }
+}
+
+export async function forwardToRelay(relayUrl, message, selfRelayId) {
+  return (await forwardToRelayResult(relayUrl, message, selfRelayId)) === "delivered";
+}
+
+export async function forwardFederatedMessage(
+  env,
+  selfRelayUrl,
+  network,
+  room,
+  message,
+  connections = 0,
+) {
+  const attempted = new Set();
+  const queued = new Set();
+  const hintedRelay = getPeerRelayHint(network, room, message.to);
+  if (hintedRelay && hintedRelay !== selfRelayUrl) {
+    attempted.add(hintedRelay);
+    const result = await forwardToRelayResult(hintedRelay, message, selfRelayUrl);
+    if (result === "delivered") return true;
+    if (result === "queued") queued.add(hintedRelay);
+  }
+
+  const kademliaEnabled = isKademliaEnabled(env);
+  let remoteUrls;
+  let providerUrls = new Set();
+  if (kademliaEnabled) {
+    const providers = await lookupPeerProviders(
+      env,
+      selfRelayUrl,
+      network,
+      room,
+      message.to,
+      { connections },
+    );
+    providerUrls = new Set(providers.map((provider) => provider.url));
+    remoteUrls = [...providerUrls]
+      .filter((relayUrl) => relayUrl !== selfRelayUrl && !attempted.has(relayUrl))
+      .slice(0, KADEMLIA_FORWARD_LIMIT);
+  } else {
+    remoteUrls = (await getPeerRelayUrls(env.DB, selfRelayUrl))
+      .filter((relayUrl) => !attempted.has(relayUrl));
+  }
+  // A queued result is authoritative only when Kademlia identifies that relay
+  // as a provider for the destination peer. A stale discovery hint must not
+  // prevent the provider lookup from finding a new live route.
+  if (kademliaEnabled) {
+    if ([...queued].some((relayUrl) => providerUrls.has(relayUrl))) return true;
+  }
+
+  if (!remoteUrls.length) return false;
+  const results = await Promise.all(remoteUrls.map(async (relayUrl) => ({
+    relayUrl,
+    result: await forwardToRelayResult(relayUrl, message, selfRelayUrl),
+  })));
+  const delivered = results.find(({ result }) => result === "delivered");
+  if (delivered) {
+    rememberPeerRelayHint(network, room, message.to, delivered.relayUrl);
+    return true;
+  }
+  if (kademliaEnabled && results.some(({ result }) => result === "queued")) {
+    return true;
+  }
+  return false;
 }
 
 // ===================== D1 Relay Registry =====================
@@ -969,42 +1078,31 @@ async function handleClientMessage(
         }
       }
 
-      if (!deliveredLive && db) {
-        await insertRelayMessage(db, message);
-        if (!live) {
-          console.log(`[RELAY] Peer ${message.to} offline, queued ${type} in DB`);
-        } else {
-          console.log(`[RELAY] Queued ${type} for ${message.to} after live delivery failure`);
-        }
-      } else if (!deliveredLive) {
-        console.warn(`[RELAY] Could not deliver ${type} to ${message.to}; persistence unavailable`);
-      }
-
       // If still not delivered locally, use the peer's Kademlia providers.
-      // Legacy deployments without relay signing keys retain registry fanout.
+      // A route learned during discovery or from the incoming federation hop
+      // is tried first, so offer/answer/ICE does not perform a fresh overlay
+      // walk in each direction. Kademlia remains the authoritative fallback.
       if (!deliveredLive && selfRelayUrl && env.DB) {
         ctx.waitUntil((async () => {
-          const selfRelayId = relayPeerId;
-          let remoteUrls;
-          if (isKademliaEnabled(env)) {
-            const providers = await lookupPeerProviders(
-              env,
-              selfRelayUrl,
-              network,
-              room,
-              message.to,
-              { connections: livePeers.size },
-            );
-            remoteUrls = [...new Set(providers.map((provider) => provider.url))]
-              .filter((relayUrl) => relayUrl !== selfRelayUrl)
-              .slice(0, KADEMLIA_FORWARD_LIMIT);
-          } else {
-            remoteUrls = await getPeerRelayUrls(env.DB, selfRelayUrl);
+          const deliveredRemote = await forwardFederatedMessage(
+            env,
+            selfRelayUrl,
+            network,
+            room,
+            message,
+            livePeers.size,
+          );
+          if (deliveredRemote) {
+            console.log(`[FED] Routed ${type} to peer relay for ${message.to}`);
+            return;
           }
-          if (!remoteUrls.length) return;
-          console.log(`[FED] Forwarding ${type} to ${remoteUrls.length} peer relay(s) for ${message.to}`);
-          await Promise.all(remoteUrls.map(u => forwardToRelay(u, message, selfRelayId)));
+          await insertRelayMessage(db, message);
+          console.log(`[RELAY] Peer ${message.to} unavailable across federation, queued ${type} in DB`);
         })());
+      } else if (!deliveredLive && db) {
+        await insertRelayMessage(db, message);
+      } else if (!deliveredLive) {
+        console.warn(`[RELAY] Could not deliver ${type} to ${message.to}; persistence unavailable`);
       }
     }
 
