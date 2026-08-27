@@ -533,7 +533,15 @@ export function createSignalingClient(options = {}) {
           keepaliveTimerId = null
           return
         }
-        if (channel.readyState !== 'open') return
+        if (channel.readyState !== 'open') {
+          // WebKit can move a channel to 'closing' without ever firing
+          // onclose — a zombie that skipping here kept alive forever: no
+          // ping, no timeout, never marked dead, while every send into it
+          // spammed 'Error sending string through RTCDataChannel'. A
+          // channel that is not open IS broken; execute it on the spot.
+          closeBrokenChannel(`data channel ${channel.readyState}`)
+          return
+        }
 
         // Browsers throttle timers in hidden tabs — don't falsely time out.
         if (typeof document !== 'undefined' && document.hidden) {
