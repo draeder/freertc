@@ -9,6 +9,19 @@ const DATA_PONG_TIMEOUT_MS = 4000
 // pre-suspend pong and every state field still claims health, so an
 // expiry on the proof is what stops the resume-time send burst.
 const DATA_PROOF_FRESH_MS = DATA_PING_MS + DATA_PONG_TIMEOUT_MS + 5000
+// SCTP max-message-size is negotiated and small in WebKit: Safari advertises
+// 64 KiB where Chromium advertises 256 KiB, and a send over the remote's
+// limit fails — in Safari silently, as an uncatchable console error, on a
+// perfectly healthy channel. Gossip anti-entropy digests measured 205 KiB in
+// production. Every string payload above the threshold therefore travels as
+// ordered chunk frames and is reassembled on receive; 8 KiB raw slices keep
+// each JSON-escaped frame safely under the proven 16 KiB interop ceiling.
+const DATA_CHUNK_SLICE = 8192
+const DATA_CHUNK_THRESHOLD = 15000
+const DATA_CHUNK_FRAME = '~fc'
+const DATA_CHUNK_MAX_FRAMES = 4096
+const DATA_CHUNK_STALE_MS = 30000
+let dataChunkCounter = 0
 const SIGNAL_PING_MS = 1000
 const SIGNAL_PONG_TIMEOUT_MS = 4000
 // A relay-backed offer normally reaches the destination on its next one-second
@@ -653,6 +666,32 @@ export function createSignalingClient(options = {}) {
       }
     }
 
+    // Reassembly state for chunked payloads on this channel. Bounded: a
+    // stale or oversized transfer is dropped, never grown forever.
+    const chunkTransfers = new Map()
+    const reassembleChunk = (msg) => {
+      const total = Number(msg.n)
+      const seq = Number(msg.s)
+      const id = String(msg.i ?? '')
+      if (!id || !Number.isInteger(total) || !Number.isInteger(seq)
+        || total < 1 || total > DATA_CHUNK_MAX_FRAMES || seq < 0 || seq >= total) return null
+      const now = Date.now()
+      for (const [key, transfer] of chunkTransfers) {
+        if (now - transfer.startedAt > DATA_CHUNK_STALE_MS) chunkTransfers.delete(key)
+      }
+      let transfer = chunkTransfers.get(id)
+      if (!transfer) {
+        transfer = { startedAt: now, total, received: 0, parts: new Array(total) }
+        chunkTransfers.set(id, transfer)
+      }
+      if (transfer.total !== total || transfer.parts[seq] !== undefined) return null
+      transfer.parts[seq] = String(msg.d ?? '')
+      transfer.received++
+      if (transfer.received < transfer.total) return null
+      chunkTransfers.delete(id)
+      return transfer.parts.join('')
+    }
+
     channel.onmessage = (event) => {
       const currentEntry = mesh.connections.get(remotePeerId)
       if (currentEntry?.connection !== pc || currentEntry.channel !== channel) return
@@ -662,6 +701,15 @@ export function createSignalingClient(options = {}) {
       } catch {
         proveOutbound()
         onDataMessage?.({ peerId: remotePeerId, data: event.data })
+        return
+      }
+
+      if (msg?.t === DATA_CHUNK_FRAME) {
+        const full = reassembleChunk(msg)
+        if (full !== null) {
+          proveOutbound()
+          onDataMessage?.({ peerId: remotePeerId, data: full })
+        }
         return
       }
 
@@ -1754,6 +1802,21 @@ export function createSignalingClient(options = {}) {
         error.transient = !outboundDead
           && (unproven || state === 'connecting' || state === 'disconnected' || state === 'new')
         throw error
+      }
+
+      if (typeof data === 'string' && data.length > DATA_CHUNK_THRESHOLD) {
+        const id = `${Date.now().toString(36)}-${(dataChunkCounter++).toString(36)}`
+        const total = Math.ceil(data.length / DATA_CHUNK_SLICE)
+        for (let seq = 0; seq < total; seq++) {
+          target.channel.send(JSON.stringify({
+            t: DATA_CHUNK_FRAME,
+            i: id,
+            s: seq,
+            n: total,
+            d: data.slice(seq * DATA_CHUNK_SLICE, (seq + 1) * DATA_CHUNK_SLICE),
+          }))
+        }
+        return target
       }
 
       target.channel.send(data)
