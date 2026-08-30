@@ -132,6 +132,20 @@ export default {
       }
     }
 
+    if (request.method === "OPTIONS" && url.pathname.startsWith("/api/")) {
+      // Browsers preflight cross-origin API calls; a 405 here made Safari
+      // report the whole request as blocked by access control.
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Accept",
+          "Access-Control-Max-Age": "86400",
+        },
+      });
+    }
+
     if (upgrade && upgrade.toLowerCase() === "websocket") {
       if (url.pathname !== "/ws") {
         return jsonResponse({ ok: false, error: "WebSocket endpoint is /ws" }, 404);
