@@ -520,6 +520,13 @@ export function createSignalingClient(options = {}) {
       if (openEntry?.connection === pc) {
         openEntry.channel = channel
         openEntry.lastSeen = Date.now()
+        // Round-trip bookkeeping, mirrored onto the entry so sendData can
+        // refuse a channel whose outbound direction is unproven. SCTP can
+        // die one-way: messages keep ARRIVING while every send fails as
+        // WebKit's async console error — readyState and connectionState
+        // both keep lying, so a returned pong is the only send-side truth.
+        openEntry.lastPongAt = Date.now()
+        openEntry.lastPingSentAt = 0
       }
       // RTCPeerConnection "connected" may precede data-channel readiness.
       // Emit again at the exact usable boundary so callers can send immediately.
@@ -555,6 +562,10 @@ export function createSignalingClient(options = {}) {
         }
 
         // Browsers throttle timers in hidden tabs — don't falsely time out.
+        // The fake pong here only pacifies THIS timer; the entry mirrors are
+        // left honest so ping-on-receive still proves outbound in hidden
+        // tabs, where a one-way-dead channel used to live forever while
+        // every reactive gossip reply failed.
         if (typeof document !== 'undefined' && document.hidden) {
           lastPingSentAt = 0
           lastPongAt = Date.now()
@@ -575,10 +586,37 @@ export function createSignalingClient(options = {}) {
         try {
           channel.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
           lastPingSentAt = Date.now()
+          if (currentEntry.lastPingSentAt <= currentEntry.lastPongAt) {
+            currentEntry.lastPingSentAt = lastPingSentAt
+          }
         } catch {
           closeBrokenChannel('data channel keepalive send failed')
         }
       }, DATA_PING_MS)
+    }
+
+    // Outbound proof, driven by INCOMING traffic so it works even in hidden
+    // tabs where interval timers are throttled into uselessness: a message
+    // arriving on a channel whose outbound is not recently pong-proven
+    // sends a ping; a ping that stays unanswered past the pong timeout
+    // while messages keep arriving is a one-way-dead channel — execute it.
+    const proveOutbound = () => {
+      const currentEntry = mesh.connections.get(remotePeerId)
+      if (currentEntry?.connection !== pc || currentEntry.channel !== channel) return
+      const now = Date.now()
+      const pingOutstanding = currentEntry.lastPingSentAt > currentEntry.lastPongAt
+      if (pingOutstanding && now - currentEntry.lastPingSentAt >= DATA_PONG_TIMEOUT_MS) {
+        closeBrokenChannel('data channel outbound timeout')
+        return
+      }
+      if (!pingOutstanding && now - currentEntry.lastPongAt > DATA_PING_MS) {
+        try {
+          channel.send(JSON.stringify({ type: 'ping', ts: now }))
+          currentEntry.lastPingSentAt = now
+        } catch {
+          closeBrokenChannel('data channel keepalive send failed')
+        }
+      }
     }
 
     channel.onmessage = (event) => {
@@ -588,6 +626,7 @@ export function createSignalingClient(options = {}) {
       try {
         msg = JSON.parse(event.data)
       } catch {
+        proveOutbound()
         onDataMessage?.({ peerId: remotePeerId, data: event.data })
         return
       }
@@ -604,8 +643,15 @@ export function createSignalingClient(options = {}) {
       if (msg?.type === 'pong') {
         lastPongAt = Date.now()
         lastPingSentAt = 0
+        const pongEntry = mesh.connections.get(remotePeerId)
+        if (pongEntry?.connection === pc && pongEntry.channel === channel) {
+          pongEntry.lastPongAt = lastPongAt
+          pongEntry.lastPingSentAt = 0
+        }
         return
       }
+
+      proveOutbound()
 
       onDataMessage?.({ peerId: remotePeerId, data: event.data })
     }
@@ -1617,7 +1663,13 @@ export function createSignalingClient(options = {}) {
       const channelIsLive = (entry) => {
         if (entry?.channel?.readyState !== 'open') return false
         const state = entry.connection?.connectionState
-        return state === undefined || state === 'connected'
+        if (state !== undefined && state !== 'connected') return false
+        // SCTP dies one-way: readyState and connectionState both keep
+        // claiming health while every send silently fails. A ping that has
+        // gone unanswered past the pong timeout is proof the outbound
+        // direction is gone, whatever the states claim.
+        return !(entry.lastPingSentAt > entry.lastPongAt
+          && Date.now() - entry.lastPingSentAt >= DATA_PONG_TIMEOUT_MS)
       }
 
       let target = null
@@ -1638,8 +1690,13 @@ export function createSignalingClient(options = {}) {
       }
       if (!channelIsLive(target)) {
         const state = target.connection?.connectionState
-        const error = new Error(`WebRTC connection is ${state}`)
-        error.transient = state === 'connecting' || state === 'disconnected' || state === 'new'
+        const outboundDead = target.lastPingSentAt > target.lastPongAt
+          && Date.now() - target.lastPingSentAt >= DATA_PONG_TIMEOUT_MS
+        const error = new Error(outboundDead
+          ? 'WebRTC channel outbound is unproven past the pong timeout'
+          : `WebRTC connection is ${state}`)
+        error.transient = !outboundDead
+          && (state === 'connecting' || state === 'disconnected' || state === 'new')
         throw error
       }
 
