@@ -21,6 +21,14 @@ const DATA_CHUNK_THRESHOLD = 15000
 const DATA_CHUNK_FRAME = '~fc'
 const DATA_CHUNK_MAX_FRAMES = 4096
 const DATA_CHUNK_STALE_MS = 30000
+// A hidden tab cannot answer pings promptly — Safari throttles its JS — so
+// the 4s pong verdict executed every edge to a napping tab, and each thaw
+// redialed and burst into the corpses. A tab that is about to nap says so;
+// peers PARK that edge: no sends, no pings, no execution, until a wake frame
+// or any traffic revives it. A park older than the cap falls back to normal
+// verdicts so a tab that never returns still gets cleaned up.
+const DATA_DORMANT_FRAME = '~dormant'
+const DATA_DORMANT_MAX_MS = 30 * 60000
 let dataChunkCounter = 0
 const SIGNAL_PING_MS = 1000
 const SIGNAL_PONG_TIMEOUT_MS = 4000
@@ -502,7 +510,17 @@ export function createSignalingClient(options = {}) {
     // fresh pong within one round trip and starts the execution clock on
     // a dead one.
     function onVisible() {
-      if (typeof document === 'undefined' || document.hidden) return
+      if (typeof document === 'undefined') return
+      if (document.hidden) {
+        // Going dormant: tell the peer BEFORE the freeze lands so it parks
+        // this edge instead of executing it at the pong timeout.
+        try {
+          if (channel.readyState === 'open') {
+            channel.send(JSON.stringify({ type: DATA_DORMANT_FRAME }))
+          }
+        } catch { /* the peer's timeout still covers a lost announcement */ }
+        return
+      }
       lastPongAt = 0
       const visibleEntry = mesh.connections.get(remotePeerId)
       const owned = visibleEntry?.connection === pc && visibleEntry.channel === channel
@@ -596,6 +614,16 @@ export function createSignalingClient(options = {}) {
           closeBrokenChannel(`data channel ${channel.readyState}`)
           return
         }
+        if (currentEntry.dormantAt) {
+          if (Date.now() - currentEntry.dormantAt < DATA_DORMANT_MAX_MS) {
+            // Parked: the peer announced a nap. No pings, no verdicts —
+            // pacify the in-flight bookkeeping so nothing ages while parked.
+            lastPingSentAt = 0
+            lastPongAt = Date.now()
+            return
+          }
+          currentEntry.dormantAt = 0
+        }
         if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
           // The inverse zombie: the channel still reports 'open' but the
           // connection under it is dead, so every send fails as the same
@@ -650,6 +678,7 @@ export function createSignalingClient(options = {}) {
     const proveOutbound = () => {
       const currentEntry = mesh.connections.get(remotePeerId)
       if (currentEntry?.connection !== pc || currentEntry.channel !== channel) return
+      if (currentEntry.dormantAt) return
       const now = Date.now()
       const pingOutstanding = currentEntry.lastPingSentAt > currentEntry.lastPongAt
       if (pingOutstanding && now - currentEntry.lastPingSentAt >= DATA_PONG_TIMEOUT_MS) {
@@ -695,12 +724,23 @@ export function createSignalingClient(options = {}) {
     channel.onmessage = (event) => {
       const currentEntry = mesh.connections.get(remotePeerId)
       if (currentEntry?.connection !== pc || currentEntry.channel !== channel) return
+      if (currentEntry.dormantAt && String(event.data).indexOf(DATA_DORMANT_FRAME) === -1) {
+        currentEntry.dormantAt = 0
+      }
       let msg
       try {
         msg = JSON.parse(event.data)
       } catch {
         proveOutbound()
         onDataMessage?.({ peerId: remotePeerId, data: event.data })
+        return
+      }
+
+      if (msg?.type === DATA_DORMANT_FRAME) {
+        const dormantEntry = mesh.connections.get(remotePeerId)
+        if (dormantEntry?.connection === pc && dormantEntry.channel === channel) {
+          dormantEntry.dormantAt = Date.now()
+        }
         return
       }
 
@@ -1744,6 +1784,7 @@ export function createSignalingClient(options = {}) {
       // the peer; terminal states throw plain so callers release it.
       const channelIsLive = (entry) => {
         if (entry?.channel?.readyState !== 'open') return false
+        if (entry.dormantAt && Date.now() - entry.dormantAt < DATA_DORMANT_MAX_MS) return false
         if (!entry.connection) return false
         const state = entry.connection.connectionState
         if (state !== undefined && state !== 'connected') return false
@@ -1774,6 +1815,11 @@ export function createSignalingClient(options = {}) {
 
       if (!target?.channel || target.channel.readyState !== 'open') {
         throw new Error('WebRTC not yet connected')
+      }
+      if (target.dormantAt && Date.now() - target.dormantAt < DATA_DORMANT_MAX_MS) {
+        const error = new Error('Peer is dormant (hidden tab)')
+        error.transient = true
+        throw error
       }
       if (!channelIsLive(target)) {
         const now = Date.now()
