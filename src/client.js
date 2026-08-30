@@ -4,6 +4,11 @@ const BACKOFF_MAX_MS = 30000
 const BACKOFF_FACTOR = 1.5
 const DATA_PING_MS = 1000
 const DATA_PONG_TIMEOUT_MS = 4000
+// A pong is proof of a working outbound direction — but only a RECENT one.
+// After a machine suspends and resumes, every frozen channel still holds its
+// pre-suspend pong and every state field still claims health, so an
+// expiry on the proof is what stops the resume-time send burst.
+const DATA_PROOF_FRESH_MS = DATA_PING_MS + DATA_PONG_TIMEOUT_MS + 5000
 const SIGNAL_PING_MS = 1000
 const SIGNAL_PONG_TIMEOUT_MS = 4000
 // A relay-backed offer normally reaches the destination on its next one-second
@@ -477,14 +482,29 @@ export function createSignalingClient(options = {}) {
     let lastPongAt    = Date.now()
     let lastPingSentAt = 0   // 0 = no ping in flight
 
-    // Reset the pong clock the moment the tab becomes visible so the
-    // throttled-timer gap doesn't look like a timeout.
+    // The moment the tab becomes visible, PROBE the channel instead of
+    // assuming it survived: faking a fresh pong here stamped every
+    // suspend-killed channel as healthy, so the resume-time gossip burst
+    // sent straight into corpses. A real ping gives a healthy channel a
+    // fresh pong within one round trip and starts the execution clock on
+    // a dead one.
     function onVisible() {
       if (typeof document === 'undefined' || document.hidden) return
-      // Any ping that was sent while the tab was hidden can't have been
-      // answered; don't count that gap as a missed pong.
-      lastPingSentAt = 0
-      lastPongAt = Date.now()
+      lastPongAt = 0
+      const visibleEntry = mesh.connections.get(remotePeerId)
+      const owned = visibleEntry?.connection === pc && visibleEntry.channel === channel
+      try {
+        if (channel.readyState === 'open') {
+          channel.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
+          lastPingSentAt = Date.now()
+          if (owned) {
+            visibleEntry.lastPongAt = 0
+            visibleEntry.lastPingSentAt = lastPingSentAt
+          }
+        }
+      } catch {
+        closeBrokenChannel('data channel resume probe failed')
+      }
     }
 
     function closeBrokenChannel(reason) {
@@ -1685,9 +1705,10 @@ export function createSignalingClient(options = {}) {
         // only trusted signal is the pong round trip: a channel is live
         // once its first pong has landed, and stops being live when a
         // ping goes unanswered past the pong timeout.
-        if (!(entry.lastPongAt > 0)) return false
+        const now = Date.now()
+        if (!(entry.lastPongAt > 0) || now - entry.lastPongAt >= DATA_PROOF_FRESH_MS) return false
         return !(entry.lastPingSentAt > entry.lastPongAt
-          && Date.now() - entry.lastPingSentAt >= DATA_PONG_TIMEOUT_MS)
+          && now - entry.lastPingSentAt >= DATA_PONG_TIMEOUT_MS)
       }
 
       let target = null
@@ -1707,20 +1728,29 @@ export function createSignalingClient(options = {}) {
         throw new Error('WebRTC not yet connected')
       }
       if (!channelIsLive(target)) {
+        const now = Date.now()
         const state = target.connection?.connectionState
-        const unproven = !(target.lastPongAt > 0)
-        const pingAge = target.lastPingSentAt > (target.lastPongAt ?? 0)
-          ? Date.now() - target.lastPingSentAt
-          : 0
-        const outboundDead = pingAge >= DATA_PONG_TIMEOUT_MS
+        const unproven = !(target.lastPongAt > 0) || now - target.lastPongAt >= DATA_PROOF_FRESH_MS
+        const pingOutstanding = target.lastPingSentAt > (target.lastPongAt ?? 0)
+        const outboundDead = pingOutstanding && now - target.lastPingSentAt >= DATA_PONG_TIMEOUT_MS
+        // A refusal for a stale proof arms its own re-proof: a healthy
+        // channel pongs within one round trip and the next send passes; a
+        // dead one lets this ping age into the execution verdict. Without
+        // this, a quiet channel could stay refused forever.
+        if (unproven && !pingOutstanding && target.channel?.readyState === 'open') {
+          try {
+            target.channel.send(JSON.stringify({ type: 'ping', ts: now }))
+            target.lastPingSentAt = now
+          } catch { /* the keepalive verdict handles it */ }
+        }
         const error = new Error(outboundDead
           ? 'WebRTC channel failed its pong proof'
           : unproven
-            ? 'WebRTC channel is awaiting its first pong'
+            ? 'WebRTC channel is awaiting a fresh pong'
             : `WebRTC connection is ${state}`)
-        // Awaiting-first-pong resolves within one round trip — retry.
-        // A failed proof or a bad connection state is the edge telling
-        // the truth about being gone.
+        // Awaiting-a-pong resolves within one round trip — retry. A failed
+        // proof or a bad connection state is the edge telling the truth
+        // about being gone.
         error.transient = !outboundDead
           && (unproven || state === 'connecting' || state === 'disconnected' || state === 'new')
         throw error
