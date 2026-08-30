@@ -542,12 +542,14 @@ export function createSignalingClient(options = {}) {
           closeBrokenChannel(`data channel ${channel.readyState}`)
           return
         }
-        if (pc.connectionState === 'failed' || pc.connectionState === 'closed'
-          || pc.connectionState === 'disconnected') {
+        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
           // The inverse zombie: the channel still reports 'open' but the
           // connection under it is dead, so every send fails as the same
-          // uncatchable async console error. The connection's word beats
-          // the channel's; execute this one on the spot too.
+          // uncatchable async console error. Only TERMINAL states execute
+          // here — 'disconnected' is usually a transient ICE blip that
+          // recovers on its own, and executing it turned every blip into a
+          // teardown-and-redial flap; a blip that persists still dies
+          // through the ping timeout below.
           closeBrokenChannel(`connection ${pc.connectionState}`)
           return
         }
@@ -1604,15 +1606,18 @@ export function createSignalingClient(options = {}) {
     },
 
     sendData(data, preferredPeerId) {
-      // A channel can keep reporting 'open' after its connection has died —
-      // WebKit then fails the send with an async console error no catch can
-      // see, so a readyState guard alone still sends into corpses. A send is
-      // only attempted over a live connection; a dead one throws, which is
-      // the synchronous signal callers use to release the peer.
+      // A channel can keep reporting 'open' while its connection is anything
+      // but 'connected' — connecting during renegotiation, disconnected on an
+      // ICE blip, failed after one. WebKit fails every such send with an
+      // async console error no catch can see, so the gate must be POSITIVE:
+      // send only over a connection that says 'connected' (or one whose
+      // implementation has no connectionState at all). Transient states
+      // throw an error marked transient so callers retry without executing
+      // the peer; terminal states throw plain so callers release it.
       const channelIsLive = (entry) => {
         if (entry?.channel?.readyState !== 'open') return false
         const state = entry.connection?.connectionState
-        return state !== 'failed' && state !== 'closed' && state !== 'disconnected'
+        return state === undefined || state === 'connected'
       }
 
       let target = null
@@ -1632,7 +1637,10 @@ export function createSignalingClient(options = {}) {
         throw new Error('WebRTC not yet connected')
       }
       if (!channelIsLive(target)) {
-        throw new Error(`WebRTC connection is ${target.connection?.connectionState}`)
+        const state = target.connection?.connectionState
+        const error = new Error(`WebRTC connection is ${state}`)
+        error.transient = state === 'connecting' || state === 'disconnected' || state === 'new'
+        throw error
       }
 
       target.channel.send(data)
