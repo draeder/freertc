@@ -682,11 +682,12 @@ test('a silent data channel is closed after one unanswered ping deadline', async
     await client.initiateConnection('remote-peer')
 
     const channel = peerConnections[0].channel
+    now = 1_000
     channel.readyState = 'open'
     channel.onopen()
 
-    now = 1_000
-    t.mock.timers.tick(1_000)
+    // The proving ping goes out AT open — a channel is unproven until its
+    // first pong, so the deadline arms immediately, not a tick later.
     assert.equal(channel.sent.filter((message) => message.type === 'ping').length, 1)
     now = 4_999
     t.mock.timers.tick(3_999)

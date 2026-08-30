@@ -508,7 +508,10 @@ export function createSignalingClient(options = {}) {
         return
       }
       log(`[webrtc] data channel open to ${remotePeerId}`)
-      lastPongAt = Date.now()
+      // 0, not now: the channel is unproven until its first pong, and the
+      // keepalive's ping-in-flight timeout must be armed from the start so
+      // a channel that never answers dies at the timeout, not never.
+      lastPongAt = 0
       _acquireWakeLock()
 
       if (typeof document !== 'undefined') {
@@ -524,9 +527,20 @@ export function createSignalingClient(options = {}) {
         // refuse a channel whose outbound direction is unproven. SCTP can
         // die one-way: messages keep ARRIVING while every send fails as
         // WebKit's async console error — readyState and connectionState
-        // both keep lying, so a returned pong is the only send-side truth.
-        openEntry.lastPongAt = Date.now()
-        openEntry.lastPingSentAt = 0
+        // both keep lying, and in Safari the failed send does not even
+        // throw. A returned pong is the only send-side truth, so an
+        // 'open' channel starts UNPROVEN (lastPongAt 0): app sends are
+        // refused until the first pong lands, and a channel whose opening
+        // ping stays unanswered dies by the normal timeout instead of
+        // enjoying a grace window it never earned.
+        openEntry.lastPongAt = 0
+        try {
+          channel.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
+          openEntry.lastPingSentAt = Date.now()
+          lastPingSentAt = openEntry.lastPingSentAt
+        } catch {
+          openEntry.lastPingSentAt = Date.now()
+        }
       }
       // RTCPeerConnection "connected" may precede data-channel readiness.
       // Emit again at the exact usable boundary so callers can send immediately.
@@ -1662,12 +1676,16 @@ export function createSignalingClient(options = {}) {
       // the peer; terminal states throw plain so callers release it.
       const channelIsLive = (entry) => {
         if (entry?.channel?.readyState !== 'open') return false
-        const state = entry.connection?.connectionState
+        if (!entry.connection) return false
+        const state = entry.connection.connectionState
         if (state !== undefined && state !== 'connected') return false
         // SCTP dies one-way: readyState and connectionState both keep
-        // claiming health while every send silently fails. A ping that has
-        // gone unanswered past the pong timeout is proof the outbound
-        // direction is gone, whatever the states claim.
+        // claiming health while every send fails — and in Safari the
+        // failure does not even throw, so no error path ever fires. The
+        // only trusted signal is the pong round trip: a channel is live
+        // once its first pong has landed, and stops being live when a
+        // ping goes unanswered past the pong timeout.
+        if (!(entry.lastPongAt > 0)) return false
         return !(entry.lastPingSentAt > entry.lastPongAt
           && Date.now() - entry.lastPingSentAt >= DATA_PONG_TIMEOUT_MS)
       }
@@ -1690,13 +1708,21 @@ export function createSignalingClient(options = {}) {
       }
       if (!channelIsLive(target)) {
         const state = target.connection?.connectionState
-        const outboundDead = target.lastPingSentAt > target.lastPongAt
-          && Date.now() - target.lastPingSentAt >= DATA_PONG_TIMEOUT_MS
+        const unproven = !(target.lastPongAt > 0)
+        const pingAge = target.lastPingSentAt > (target.lastPongAt ?? 0)
+          ? Date.now() - target.lastPingSentAt
+          : 0
+        const outboundDead = pingAge >= DATA_PONG_TIMEOUT_MS
         const error = new Error(outboundDead
-          ? 'WebRTC channel outbound is unproven past the pong timeout'
-          : `WebRTC connection is ${state}`)
+          ? 'WebRTC channel failed its pong proof'
+          : unproven
+            ? 'WebRTC channel is awaiting its first pong'
+            : `WebRTC connection is ${state}`)
+        // Awaiting-first-pong resolves within one round trip — retry.
+        // A failed proof or a bad connection state is the edge telling
+        // the truth about being gone.
         error.transient = !outboundDead
-          && (state === 'connecting' || state === 'disconnected' || state === 'new')
+          && (unproven || state === 'connecting' || state === 'disconnected' || state === 'new')
         throw error
       }
 
