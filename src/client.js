@@ -542,6 +542,15 @@ export function createSignalingClient(options = {}) {
           closeBrokenChannel(`data channel ${channel.readyState}`)
           return
         }
+        if (pc.connectionState === 'failed' || pc.connectionState === 'closed'
+          || pc.connectionState === 'disconnected') {
+          // The inverse zombie: the channel still reports 'open' but the
+          // connection under it is dead, so every send fails as the same
+          // uncatchable async console error. The connection's word beats
+          // the channel's; execute this one on the spot too.
+          closeBrokenChannel(`connection ${pc.connectionState}`)
+          return
+        }
 
         // Browsers throttle timers in hidden tabs — don't falsely time out.
         if (typeof document !== 'undefined' && document.hidden) {
@@ -1595,13 +1604,24 @@ export function createSignalingClient(options = {}) {
     },
 
     sendData(data, preferredPeerId) {
+      // A channel can keep reporting 'open' after its connection has died —
+      // WebKit then fails the send with an async console error no catch can
+      // see, so a readyState guard alone still sends into corpses. A send is
+      // only attempted over a live connection; a dead one throws, which is
+      // the synchronous signal callers use to release the peer.
+      const channelIsLive = (entry) => {
+        if (entry?.channel?.readyState !== 'open') return false
+        const state = entry.connection?.connectionState
+        return state !== 'failed' && state !== 'closed' && state !== 'disconnected'
+      }
+
       let target = null
 
       if (preferredPeerId) {
         target = mesh.connections.get(preferredPeerId) ?? null
       } else {
         for (const entry of mesh.connections.values()) {
-          if (entry.channel?.readyState === 'open') {
+          if (channelIsLive(entry)) {
             target = entry
             break
           }
@@ -1610,6 +1630,9 @@ export function createSignalingClient(options = {}) {
 
       if (!target?.channel || target.channel.readyState !== 'open') {
         throw new Error('WebRTC not yet connected')
+      }
+      if (!channelIsLive(target)) {
+        throw new Error(`WebRTC connection is ${target.connection?.connectionState}`)
       }
 
       target.channel.send(data)
