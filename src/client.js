@@ -723,14 +723,15 @@ export function createSignalingClient(options = {}) {
 
     channel.onmessage = (event) => {
       const currentEntry = mesh.connections.get(remotePeerId)
-      if (currentEntry?.connection !== pc || currentEntry.channel !== channel) return
-      if (currentEntry.dormantAt && String(event.data).indexOf(DATA_DORMANT_FRAME) === -1) {
+      const ownsCurrentEntry = currentEntry?.connection === pc && currentEntry.channel === channel
+      if (ownsCurrentEntry && currentEntry.dormantAt && String(event.data).indexOf(DATA_DORMANT_FRAME) === -1) {
         currentEntry.dormantAt = 0
       }
       let msg
       try {
         msg = JSON.parse(event.data)
       } catch {
+        if (!ownsCurrentEntry) return
         proveOutbound()
         onDataMessage?.({ peerId: remotePeerId, data: event.data })
         return
@@ -745,6 +746,7 @@ export function createSignalingClient(options = {}) {
       }
 
       if (msg?.t === DATA_CHUNK_FRAME) {
+        if (!ownsCurrentEntry) return
         const full = reassembleChunk(msg)
         if (full !== null) {
           proveOutbound()
@@ -753,11 +755,21 @@ export function createSignalingClient(options = {}) {
         return
       }
 
+      // Keepalives must be answered on the channel they arrived on, even when
+      // simultaneous negotiation left two channels on one peer connection and
+      // this one lost the `entry.channel` slot. The remote pings whichever
+      // channel IT owns; refusing to pong a non-owning channel made the remote
+      // time out a perfectly healthy transport within four seconds — an
+      // open/close/redial flap.
       if (msg?.type === 'ping') {
         try {
           channel.send(JSON.stringify({ type: 'pong', ts: Date.now() }))
         } catch {
-          closeBrokenChannel('data channel pong send failed')
+          if (ownsCurrentEntry) {
+            closeBrokenChannel('data channel pong send failed')
+          } else {
+            try { channel.close() } catch { /* already closing */ }
+          }
         }
         return
       }
@@ -773,6 +785,7 @@ export function createSignalingClient(options = {}) {
         return
       }
 
+      if (!ownsCurrentEntry) return
       proveOutbound()
 
       onDataMessage?.({ peerId: remotePeerId, data: event.data })

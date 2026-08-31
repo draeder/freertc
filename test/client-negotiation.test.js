@@ -1127,3 +1127,133 @@ test('RTP extension remaps retry on a fresh data-only connection', async () => {
     globalThis.RTCPeerConnection = originalRTCPeerConnection
   }
 })
+
+test('keepalive pings are answered on the channel they arrived on after a glare overwrite', async () => {
+  const originalWebSocket = globalThis.WebSocket
+  const originalRTCPeerConnection = globalThis.RTCPeerConnection
+  const sockets = []
+  const peerConnections = []
+  const dataMessages = []
+
+  class FakeWebSocket {
+    static CONNECTING = 0
+    static OPEN = 1
+    static CLOSED = 3
+
+    constructor(url) {
+      this.url = url
+      this.readyState = FakeWebSocket.CONNECTING
+      this.sent = []
+      sockets.push(this)
+    }
+
+    send(value) { this.sent.push(JSON.parse(value)) }
+    open() {
+      this.readyState = FakeWebSocket.OPEN
+      this.onopen?.()
+    }
+    receive(message) { this.onmessage?.({ data: JSON.stringify(message) }) }
+    close(code = 1000) {
+      this.readyState = FakeWebSocket.CLOSED
+      this.onclose?.({ code })
+    }
+  }
+
+  class FakeDataChannel {
+    constructor() {
+      this.readyState = 'open'
+      this.sent = []
+    }
+
+    send(value) { this.sent.push(JSON.parse(value)) }
+    close() {
+      this.readyState = 'closed'
+      this.onclose?.()
+    }
+  }
+
+  class FakeRTCPeerConnection {
+    constructor() {
+      this.signalingState = 'stable'
+      this.connectionState = 'new'
+      this.iceConnectionState = 'new'
+      this.iceGatheringState = 'complete'
+      this.localDescription = null
+      this.remoteDescription = null
+      peerConnections.push(this)
+    }
+
+    addTransceiver() {}
+    createDataChannel() { return new FakeDataChannel() }
+    async createOffer() { return { type: 'offer', sdp: 'offer:local' } }
+    async createAnswer() { return { type: 'answer', sdp: 'answer:local' } }
+    async setLocalDescription(description) {
+      this.localDescription = description
+      this.signalingState = description.type === 'offer' ? 'have-local-offer' : 'stable'
+    }
+    async setRemoteDescription(description) {
+      this.remoteDescription = description
+      this.signalingState = description.type === 'offer' ? 'have-remote-offer' : 'stable'
+    }
+    async addIceCandidate() {}
+    addEventListener() {}
+    removeEventListener() {}
+    close() {
+      this.signalingState = 'closed'
+      this.connectionState = 'closed'
+      this.onconnectionstatechange?.()
+    }
+  }
+
+  globalThis.WebSocket = FakeWebSocket
+  globalThis.RTCPeerConnection = FakeRTCPeerConnection
+
+  let client
+  try {
+    client = createSignalingClient({
+      peerId: 'local-peer',
+      networkId: 'test-network',
+      roomId: 'test-room',
+      signalUrl: 'wss://signal.example/ws',
+      autoConnect: false,
+      onDataMessage: (message) => dataMessages.push(message),
+    })
+
+    client.connect()
+    const socket = sockets[0]
+    socket.open()
+    socket.receive({ type: 'ack', body: { status: 'ok' } })
+
+    await client.initiateConnection('remote-peer')
+    await nextTurn()
+
+    const pc = peerConnections[0]
+    const entry = client.mesh.connections.get('remote-peer')
+    const dialedChannel = entry.channel
+    assert.ok(dialedChannel)
+
+    // Simultaneous negotiation delivers the remote peer's channel on the same
+    // peer connection; attaching it takes over the entry.channel slot.
+    const inboundChannel = new FakeDataChannel()
+    pc.ondatachannel({ channel: inboundChannel })
+    assert.equal(client.mesh.connections.get('remote-peer').channel, inboundChannel)
+
+    // The remote peer keeps pinging the channel IT owns — the one that just
+    // lost the slot locally. The ping must still be answered there, or the
+    // remote times the healthy transport out within four seconds.
+    dialedChannel.onmessage({ data: JSON.stringify({ type: 'ping', ts: 1 }) })
+    assert.deepEqual(dialedChannel.sent.map((message) => message.type), ['pong'])
+    assert.deepEqual(inboundChannel.sent, [])
+
+    // Application data on the non-owning channel stays suppressed; the owning
+    // channel still delivers.
+    dialedChannel.onmessage({ data: 'raw-bytes' })
+    assert.deepEqual(dataMessages, [])
+    inboundChannel.onmessage({ data: 'raw-bytes' })
+    assert.deepEqual(dataMessages, [{ peerId: 'remote-peer', data: 'raw-bytes' }])
+  } finally {
+    client?.disconnect()
+    globalThis.WebSocket = originalWebSocket
+    globalThis.RTCPeerConnection = originalRTCPeerConnection
+  }
+})
