@@ -658,6 +658,14 @@ export function createSignalingClient(options = {}) {
         // made a silent channel impossible to time out.
         if (pingInFlight) return
 
+        // A transient connection state (connecting, disconnected) refuses
+        // application sends already; a ping into it fails the same way —
+        // WebKit logs an uncatchable async console error per attempt, one
+        // every tick through a whole renegotiation window. Skip the ping:
+        // recovery either restores 'connected' (pings resume) or the stalled
+        // negotiation machinery executes the peer.
+        if (pc.connectionState !== undefined && pc.connectionState !== 'connected') return
+
         try {
           channel.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
           lastPingSentAt = Date.now()
@@ -685,6 +693,9 @@ export function createSignalingClient(options = {}) {
         closeBrokenChannel('data channel outbound timeout')
         return
       }
+      // Same transient-state gate as the timer ping: WebKit turns every send
+      // into a not-connected transport into an uncatchable console error.
+      if (pc.connectionState !== undefined && pc.connectionState !== 'connected') return
       if (!pingOutstanding && now - currentEntry.lastPongAt > DATA_PING_MS) {
         try {
           channel.send(JSON.stringify({ type: 'ping', ts: now }))
@@ -1844,7 +1855,8 @@ export function createSignalingClient(options = {}) {
         // channel pongs within one round trip and the next send passes; a
         // dead one lets this ping age into the execution verdict. Without
         // this, a quiet channel could stay refused forever.
-        if (unproven && !pingOutstanding && target.channel?.readyState === 'open') {
+        if (unproven && !pingOutstanding && target.channel?.readyState === 'open'
+          && (target.connection?.connectionState === undefined || target.connection.connectionState === 'connected')) {
           try {
             target.channel.send(JSON.stringify({ type: 'ping', ts: now }))
             target.lastPingSentAt = now
