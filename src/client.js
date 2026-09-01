@@ -29,6 +29,12 @@ const DATA_CHUNK_STALE_MS = 30000
 // verdicts so a tab that never returns still gets cleaned up.
 const DATA_DORMANT_FRAME = '~dormant'
 const DATA_DORMANT_MAX_MS = 30 * 60000
+// A send into a transport that is not positively connected does not throw in
+// WebKit — it logs an uncatchable 'Error sending string through
+// RTCDataChannel' console error per attempt. EVERY channel send must pass
+// this gate; the transient state either recovers (sends resume) or the
+// stalled-negotiation machinery executes the peer.
+const transportReady = (pc) => pc?.connectionState === undefined || pc.connectionState === 'connected'
 let dataChunkCounter = 0
 const SIGNAL_PING_MS = 1000
 const SIGNAL_PONG_TIMEOUT_MS = 4000
@@ -515,7 +521,7 @@ export function createSignalingClient(options = {}) {
         // Going dormant: tell the peer BEFORE the freeze lands so it parks
         // this edge instead of executing it at the pong timeout.
         try {
-          if (channel.readyState === 'open') {
+          if (channel.readyState === 'open' && transportReady(pc)) {
             channel.send(JSON.stringify({ type: DATA_DORMANT_FRAME }))
           }
         } catch { /* the peer's timeout still covers a lost announcement */ }
@@ -525,7 +531,7 @@ export function createSignalingClient(options = {}) {
       const visibleEntry = mesh.connections.get(remotePeerId)
       const owned = visibleEntry?.connection === pc && visibleEntry.channel === channel
       try {
-        if (channel.readyState === 'open') {
+        if (channel.readyState === 'open' && transportReady(pc)) {
           channel.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
           lastPingSentAt = Date.now()
           if (owned) {
@@ -586,7 +592,9 @@ export function createSignalingClient(options = {}) {
         // enjoying a grace window it never earned.
         openEntry.lastPongAt = 0
         try {
-          channel.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
+          if (transportReady(pc)) {
+            channel.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
+          }
           openEntry.lastPingSentAt = Date.now()
           lastPingSentAt = openEntry.lastPingSentAt
         } catch {
@@ -773,6 +781,13 @@ export function createSignalingClient(options = {}) {
       // time out a perfectly healthy transport within four seconds — an
       // open/close/redial flap.
       if (msg?.type === 'ping') {
+        // Inbound can outlive outbound: WebKit delivers queued pings on a
+        // transport whose sending side is already dead, and the reply was
+        // the last remaining source of the uncatchable send error. A skipped
+        // pong on a transient state is safe — the remote holds its own pings
+        // during transient states too, and a state that never returns to
+        // 'connected' is executed by the stall machinery on both ends.
+        if (!transportReady(pc)) return
         try {
           channel.send(JSON.stringify({ type: 'pong', ts: Date.now() }))
         } catch {

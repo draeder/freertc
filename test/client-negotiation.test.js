@@ -683,6 +683,9 @@ test('a silent data channel is closed after one unanswered ping deadline', async
 
     const channel = peerConnections[0].channel
     now = 1_000
+    // A data channel only opens on a connected transport, and every send is
+    // gated on that — the mock must model it or pings are (rightly) held.
+    peerConnections[0].connectionState = 'connected'
     channel.readyState = 'open'
     channel.onopen()
 
@@ -1175,7 +1178,10 @@ test('keepalive pings are answered on the channel they arrived on after a glare 
   class FakeRTCPeerConnection {
     constructor() {
       this.signalingState = 'stable'
-      this.connectionState = 'new'
+      // This test exercises channels that are already exchanging keepalives.
+      // A data channel only ever opens on a connected transport, and sends
+      // are gated on it — the mock must model it or pongs are (rightly) held.
+      this.connectionState = 'connected'
       this.iceConnectionState = 'new'
       this.iceGatheringState = 'complete'
       this.localDescription = null
