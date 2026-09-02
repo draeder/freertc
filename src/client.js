@@ -550,6 +550,19 @@ export function createSignalingClient(options = {}) {
     }
   }
 
+  // A rollback withdraws the local offer but not the data channel created
+  // for it: SCTP opens that channel anyway once the remote offer connects,
+  // and the peers end up holding two 'mesh' channels on one connection. The
+  // channel goes with the offer it was created for.
+  function withdrawChannelOfRolledBackOffer(remotePeerId, pc) {
+    const entry = mesh.connections.get(remotePeerId)
+    if (entry?.connection !== pc || !entry.channel) return
+    const abandoned = entry.channel
+    if (abandoned.readyState === 'open') return
+    entry.channel = null
+    try { abandoned.close() } catch {}
+  }
+
   function attachDataChannelHandlers(channel, remotePeerId, pc) {
     let keepaliveTimerId = null
     let lastPongAt    = Date.now()
@@ -1005,9 +1018,30 @@ export function createSignalingClient(options = {}) {
     }
 
     pc.ondatachannel = (event) => {
-      if (mesh.connections.get(remotePeerId)?.connection !== pc) {
+      const current = mesh.connections.get(remotePeerId)
+      if (current?.connection !== pc) {
         try { event.channel?.close?.() } catch {}
         return
+      }
+      // Glare leaves BOTH peers with a channel on this connection: the one
+      // each created for its own offer, and the one the other created. SCTP
+      // opens both once the winning offer connects. The two peers must keep
+      // the SAME channel — keeping "the one that arrived last" made each
+      // side close exactly the channel the other side was using, and the
+      // close was read as transport death: connect, teardown, redial, glare
+      // again, until quarantine. The impolite peer's channel wins on both
+      // sides, matching the offer that won.
+      const local = current.channel
+      if (local && local !== event.channel && local.readyState === 'connecting') {
+        const polite = String(peerId) > String(remotePeerId)
+        if (!polite) {
+          log(`[webrtc] duplicate data channel from ${remotePeerId} closed; keeping the local one (impolite peer)`)
+          try { event.channel?.close?.() } catch {}
+          return
+        }
+        log(`[webrtc] local data channel to ${remotePeerId} withdrawn for the remote one (polite peer)`)
+        current.channel = null
+        try { local.close() } catch {}
       }
       attachDataChannelHandlers(event.channel, remotePeerId, pc)
     }
@@ -1275,6 +1309,7 @@ export function createSignalingClient(options = {}) {
           pendingAnswers.delete(fromPeerId)
           await pc.setLocalDescription({ type: 'rollback' })
           log(`[webrtc] rolled back local offer for ${fromPeerId} (polite peer)`)
+          withdrawChannelOfRolledBackOffer(fromPeerId, pc)
         }
 
         try {
