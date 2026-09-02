@@ -45,8 +45,11 @@ const SIGNAL_PONG_TIMEOUT_MS = 4000
 // link back after waking, both sides stalling dials the whole time. The
 // clock is the tell: a one-second tick that fires many seconds late is a
 // suspend, and thawing runs the very same path a browser's resume does.
+// Node only, and a long gap: browsers have real lifecycle events, and a busy
+// Node event loop (a watcher hashing a publish) can legitimately pause for
+// seconds — that must never read as a suspend, which tears every link down.
 const SUSPEND_TICK_MS = 1000
-const SUSPEND_GAP_MS = 8000
+const SUSPEND_GAP_MS = 20000
 // A relay-backed offer normally reaches the destination on its next one-second
 // signaling heartbeat. Five total sends over 2.85s cover that delivery window
 // without pinning an isolated peer to one unreachable candidate for 31.85s.
@@ -479,6 +482,7 @@ export function createSignalingClient(options = {}) {
 
   function startSuspendWatch() {
     stopSuspendWatch()
+    if (typeof document !== 'undefined') return
     lastSuspendTick = Date.now()
     lastTickHidden = typeof document !== 'undefined' && document.hidden
     suspendWatchTimer = setInterval(() => {

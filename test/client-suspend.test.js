@@ -46,14 +46,18 @@ test("a clock jump is a suspend: the client resumes like a thawed browser", asyn
 
     assert.equal(resumes.length, 1, "one resume for one suspend");
     assert.equal(resumes[0].reason, "clock_jump");
-    assert.ok(resumes[0].gapMs >= 8_000);
+    assert.ok(resumes[0].gapMs >= 20_000);
     // The dead links are dropped and a fresh signaling socket is opened.
     assert.equal(peerConnectionClosed, true);
     assert.equal(client.mesh.connections.size, 0);
     assert.equal(sockets.length, 2);
 
-    // A steady clock is not a suspend.
+    // A steady clock is not a suspend — and neither is a busy event loop
+    // pausing for several seconds.
     Date.now = () => realNow + 60_000 + 1_000;
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    assert.equal(resumes.length, 1);
+    Date.now = () => realNow + 60_000 + 1_000 + 9_000;
     await new Promise((resolve) => setTimeout(resolve, 1_200));
     assert.equal(resumes.length, 1);
   } finally {
