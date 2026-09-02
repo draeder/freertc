@@ -38,6 +38,15 @@ const transportReady = (pc) => pc?.connectionState === undefined || pc.connectio
 let dataChunkCounter = 0
 const SIGNAL_PING_MS = 1000
 const SIGNAL_PONG_TIMEOUT_MS = 4000
+// A machine that sleeps freezes this process with it. Browsers announce the
+// thaw (pageshow, resume); a Node peer — the GitPigeon watcher — has no such
+// event and used to trust a signaling socket and ICE candidates that died
+// during the freeze until every timeout ground through: 46 seconds to get a
+// link back after waking, both sides stalling dials the whole time. The
+// clock is the tell: a one-second tick that fires many seconds late is a
+// suspend, and thawing runs the very same path a browser's resume does.
+const SUSPEND_TICK_MS = 1000
+const SUSPEND_GAP_MS = 8000
 // A relay-backed offer normally reaches the destination on its next one-second
 // signaling heartbeat. Five total sends over 2.85s cover that delivery window
 // without pinning an isolated peer to one unreachable candidate for 31.85s.
@@ -148,6 +157,7 @@ export function createSignalingClient(options = {}) {
     auth,
     autoConnect = true,
     onLog,
+    onResume,
     onRegistered,
     onBootstrap,
     onIncomingRelay,
@@ -204,6 +214,9 @@ export function createSignalingClient(options = {}) {
   let reconnectTimer = null
   let advertiseHeartbeatTimer = null
   let keepaliveTimer = null
+  let suspendWatchTimer = null
+  let lastSuspendTick = 0
+  let lastTickHidden = false
   let lastSignalPongAt = Date.now()
   let lastSignalPingSentAt = 0
   let intentionalClose = false
@@ -457,6 +470,32 @@ export function createSignalingClient(options = {}) {
         body: { instance_id: networkId, capabilities, hints: { wants_peers: true } },
       }))
     }, 12000)
+  }
+
+  function stopSuspendWatch() {
+    clearInterval(suspendWatchTimer)
+    suspendWatchTimer = null
+  }
+
+  function startSuspendWatch() {
+    stopSuspendWatch()
+    lastSuspendTick = Date.now()
+    lastTickHidden = typeof document !== 'undefined' && document.hidden
+    suspendWatchTimer = setInterval(() => {
+      const now = Date.now()
+      const gap = now - lastSuspendTick
+      lastSuspendTick = now
+      // A hidden tab's timers are throttled to a crawl; that gap is not a
+      // suspend, and the tab's own visibility events cover its thaw.
+      const hidden = typeof document !== 'undefined' && document.hidden
+      const wasHidden = lastTickHidden
+      lastTickHidden = hidden
+      if (hidden || wasHidden || stoppedByUser) return
+      if (gap < SUSPEND_GAP_MS) return
+      log(`[signal] clock jumped ${Math.round(gap / 1000)}s — this peer was suspended; resuming`)
+      handleSuspendRestore('clock_jump', gap)
+    }, SUSPEND_TICK_MS)
+    if (typeof suspendWatchTimer?.unref === 'function') suspendWatchTimer.unref()
   }
 
   function startKeepalive() {
@@ -1632,10 +1671,12 @@ export function createSignalingClient(options = {}) {
     reconnectAttempts = 0
   }
 
-  function handleSuspendRestore() {
+  function handleSuspendRestore(reason = 'browser_resume', gapMs = 0) {
     if (stoppedByUser) return
 
-    log('[signal] browser resumed — reconnecting immediately')
+    log(reason === 'clock_jump'
+      ? '[signal] resumed after suspend — reconnecting immediately'
+      : '[signal] browser resumed — reconnecting immediately')
     resetReconnectBackoff()
 
     // A socket can remain OPEN/CONNECTING briefly after the browser thaws even
@@ -1660,6 +1701,10 @@ export function createSignalingClient(options = {}) {
     mesh.connections.clear()
     intentionalClose = false
     openSocket()
+    // Consumers hold their own recovery state (backoffs, deadlines, stale
+    // peer sets) that a suspend leaves expired; tell them the same way the
+    // browser lifecycle would.
+    try { onResume?.({ reason, gapMs }) } catch { /* consumer error must not break resume */ }
   }
 
   function reconnectSignalingPreservingPeers(reason = 'signaling_refresh') {
@@ -1723,6 +1768,7 @@ export function createSignalingClient(options = {}) {
     connect() {
       stoppedByUser = false
       intentionalClose = false
+      startSuspendWatch()
       openSocket()
     },
 
@@ -1773,6 +1819,7 @@ export function createSignalingClient(options = {}) {
       reconnectTimer = null
       stopAdvertiseHeartbeat()
       stopKeepalive()
+      stopSuspendWatch()
       intentionalClose = true
       closeAllPeerConnections()
       mesh.connections.clear()
