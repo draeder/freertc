@@ -57,6 +57,9 @@ const OFFER_RETRY_DELAYS_MS = [100, 250, 500, 1000]
 const ANSWER_BURST_COOLDOWN_MS = 3000
 const ANSWER_BURST_DELAYS_MS = [200, 800, 2000]
 const SDP_DEDUP_WINDOW_MS = 15000
+// The ICE ufrag identifies one negotiation across every retry of its offer.
+const iceUfragOf = (sdp) => /a=ice-ufrag:(\S+)/.exec(String(sdp ?? ''))?.[1] ?? null
+const candidateLinesOf = (sdp) => String(sdp ?? '').split(/\r?\n/).filter((line) => /^a=candidate:/.test(line))
 
 /**
  * Remove a previously owned signaling identity without announcing it again.
@@ -1196,6 +1199,42 @@ export function createSignalingClient(options = {}) {
             entry.lastAnswerSentAt = Date.now()
             sendRelay('answer', cachedAnswer)
           }
+          return
+        }
+
+        // The SAME offer, retried. An offer is re-sent on a short burst, and
+        // each retry carries the local description as it stands — with the
+        // candidates gathered since the last send — so the text differs while
+        // the negotiation is the same one. Treating that as a renewed offer
+        // re-answered it with fresh ICE credentials on this side while the
+        // other side had already applied the first answer: every connectivity
+        // check then carried a username the receiver no longer recognized, and
+        // the handshake died on both sides. Two peers that discover each other
+        // at the same instant hit this on every attempt. The ICE ufrag names
+        // the negotiation: same ufrag, same offer — take its new candidates
+        // and re-send the answer already given.
+        const incomingUfrag = iceUfragOf(incomingOfferSdp)
+        if (
+          incomingOfferSdp &&
+          cachedAnswer &&
+          currentRemoteOfferSdp &&
+          currentRemoteOfferSdp !== incomingOfferSdp &&
+          incomingUfrag &&
+          incomingUfrag === iceUfragOf(currentRemoteOfferSdp)
+        ) {
+          const known = new Set(candidateLinesOf(currentRemoteOfferSdp))
+          for (const line of candidateLinesOf(incomingOfferSdp)) {
+            if (known.has(line)) continue
+            const candidate = line.replace(/^a=/, '')
+            await pc.addIceCandidate({ candidate, sdpMid: '0', sdpMLineIndex: 0 }).catch(() => {})
+          }
+          if (entry) entry.lastRemoteOfferSdp = incomingOfferSdp
+          recentOfferSdp.set(fromPeerId, { sdp: incomingOfferSdp, ts: now })
+          if (Date.now() - (entry?.lastAnswerSentAt ?? 0) > ANSWER_BURST_COOLDOWN_MS) {
+            if (entry) entry.lastAnswerSentAt = Date.now()
+            sendRelay('answer', cachedAnswer)
+          }
+          log(`[webrtc] retried offer from ${fromPeerId} (same ufrag); answered again, no renegotiation`)
           return
         }
 
