@@ -54,6 +54,15 @@ const SUSPEND_GAP_MS = 20000
 // signaling heartbeat. Five total sends over 2.85s cover that delivery window
 // without pinning an isolated peer to one unreachable candidate for 31.85s.
 const OFFER_RETRY_DELAYS_MS = [100, 250, 500, 1000]
+// A negotiation frame is perishable. An offer is retried within two seconds
+// and its negotiation given up within ten; delivered later, from the relay's
+// offline queue, it is a dead offer the receiver answers into nothing — and a
+// tab waking from a long sleep, or re-registering after a resume, received a
+// backlog of exactly those and stalled on each before it could dial. Ten
+// seconds covers the retry burst and a live handshake; the relay drops the
+// rest unread.
+const NEGOTIATION_TTL_MS = 10000
+const NEGOTIATION_TYPES = new Set(['offer', 'answer', 'ice_candidate', 'ice_end', 'renegotiate'])
 const ANSWER_BURST_COOLDOWN_MS = 3000
 const ANSWER_BURST_DELAYS_MS = [200, 800, 2000]
 const SDP_DEDUP_WINDOW_MS = 15000
@@ -451,6 +460,7 @@ export function createSignalingClient(options = {}) {
       to:         toPeerId,
       session_id: getOrCreateSessionId(toPeerId),
       body,
+      ...(NEGOTIATION_TYPES.has(type) ? { ttl_ms: NEGOTIATION_TTL_MS } : {}),
     }))
   }
 

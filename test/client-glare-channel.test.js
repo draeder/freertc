@@ -141,3 +141,24 @@ test('the polite peer that already holds the remote channel before its own arriv
     h.restore()
   }
 })
+
+test('negotiation frames carry a ten-second ttl so the relay never replays a dead offer', async () => {
+  const h = harness('a-local')
+  try {
+    await h.client.initiateConnection('z-remote')
+    const pc = h.peerConnections[0]
+    pc.onicecandidate?.({ candidate: { candidate: 'candidate:1 1 udp 1 192.168.1.5 5000 typ host', sdpMid: '0', sdpMLineIndex: 0 } })
+    pc.onicecandidate?.({ candidate: null })
+    const byType = (type) => h.socket.sent.filter((m) => m.type === type)
+    assert.ok(byType('offer').length >= 1)
+    for (const type of ['offer', 'ice_candidate', 'ice_end']) {
+      assert.ok(byType(type).length >= 1, `${type} was sent`)
+      assert.ok(byType(type).every((m) => m.ttl_ms === 10000), `${type} is perishable`)
+    }
+    const registration = h.socket.sent.find((m) => !['offer', 'answer', 'ice_candidate', 'ice_end', 'renegotiate'].includes(m.type))
+    assert.ok(registration, 'a non-negotiation frame was sent')
+    assert.notEqual(registration.ttl_ms, 10000, 'only negotiation frames are perishable')
+  } finally {
+    h.restore()
+  }
+})
