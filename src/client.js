@@ -1059,7 +1059,16 @@ export function createSignalingClient(options = {}) {
       // again, until quarantine. The impolite peer's channel wins on both
       // sides, matching the offer that won.
       const local = current.channel
-      if (local && local !== event.channel && local.readyState === 'connecting') {
+      // The rule held only while the local channel was still 'connecting'.
+      // On one host SCTP opens both channels within milliseconds, so the
+      // local one was often already OPEN when the remote's arrived; the
+      // rule was skipped, the remote channel simply replaced the entry's,
+      // and each side ended up owning the channel the OTHER side had
+      // created — every app frame then arrived on a non-owning channel and
+      // was dropped, the PeerPigeon handshake never completed, the stalled-
+      // negotiation watchdog executed the peer, and the pair looped. The
+      // rule now applies to any live local channel.
+      if (local && local !== event.channel && local.readyState !== 'closed' && local.readyState !== 'closing') {
         const polite = String(peerId) > String(remotePeerId)
         if (!polite) {
           log(`[webrtc] duplicate data channel from ${remotePeerId} closed; keeping the local one (impolite peer)`)
@@ -1067,8 +1076,18 @@ export function createSignalingClient(options = {}) {
           return
         }
         log(`[webrtc] local data channel to ${remotePeerId} withdrawn for the remote one (polite peer)`)
+        // Adopt first, withdraw second: whoever watches the entry sees the
+        // old channel close while it is no longer the entry's, so the
+        // withdrawal is not read as the transport dying.
         current.channel = null
+        attachDataChannelHandlers(event.channel, remotePeerId, pc)
         try { local.close() } catch {}
+        if (event.channel.readyState === 'open') {
+          // Already open: its onopen will never fire again, so state the
+          // usable boundary now for whoever waits on it.
+          onConnectionStateChangeCb?.({ peerId: remotePeerId, state: 'connected', ts: Date.now() })
+        }
+        return
       }
       attachDataChannelHandlers(event.channel, remotePeerId, pc)
     }

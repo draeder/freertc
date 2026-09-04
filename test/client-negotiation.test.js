@@ -1131,7 +1131,7 @@ test('RTP extension remaps retry on a fresh data-only connection', async () => {
   }
 })
 
-test('keepalive pings are answered on the channel they arrived on after a glare overwrite', async () => {
+test('the impolite peer keeps its already-open channel when the remote one arrives late', async () => {
   const originalWebSocket = globalThis.WebSocket
   const originalRTCPeerConnection = globalThis.RTCPeerConnection
   const sockets = []
@@ -1239,23 +1239,21 @@ test('keepalive pings are answered on the channel they arrived on after a glare 
     assert.ok(dialedChannel)
 
     // Simultaneous negotiation delivers the remote peer's channel on the same
-    // peer connection; attaching it takes over the entry.channel slot.
+    // peer connection AFTER the local one already opened (one host opens
+    // both within milliseconds). 'local-peer' < 'remote-peer' makes this
+    // side impolite: it keeps the channel it created and closes the
+    // duplicate, exactly as it would had its own still been connecting.
+    // Letting the late arrival take the slot left each side owning the
+    // channel the OTHER created, and every frame was dropped as non-owning.
     const inboundChannel = new FakeDataChannel()
     pc.ondatachannel({ channel: inboundChannel })
-    assert.equal(client.mesh.connections.get('remote-peer').channel, inboundChannel)
+    assert.equal(client.mesh.connections.get('remote-peer').channel, dialedChannel)
+    assert.equal(inboundChannel.readyState, 'closed')
 
-    // The remote peer keeps pinging the channel IT owns — the one that just
-    // lost the slot locally. The ping must still be answered there, or the
-    // remote times the healthy transport out within four seconds.
+    // Keepalives and application data flow on the kept channel.
     dialedChannel.onmessage({ data: JSON.stringify({ type: 'ping', ts: 1 }) })
     assert.deepEqual(dialedChannel.sent.map((message) => message.type), ['pong'])
-    assert.deepEqual(inboundChannel.sent, [])
-
-    // Application data on the non-owning channel stays suppressed; the owning
-    // channel still delivers.
     dialedChannel.onmessage({ data: 'raw-bytes' })
-    assert.deepEqual(dataMessages, [])
-    inboundChannel.onmessage({ data: 'raw-bytes' })
     assert.deepEqual(dataMessages, [{ peerId: 'remote-peer', data: 'raw-bytes' }])
   } finally {
     client?.disconnect()
