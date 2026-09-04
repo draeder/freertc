@@ -1126,12 +1126,28 @@ export function createSignalingClient(options = {}) {
     const priorEntry = mesh.connections.get(toPeerId)
     const prior = priorEntry?.connection
 
-    // Don't dial if the data channel is already open.
+    // Don't dial over a connection that is already open OR still being
+    // made. Closing a prior that was mid-negotiation — the remote's offer
+    // answered, ICE checking, channel opening — replaced it with our own
+    // offer, which the remote (already holding that live connection) never
+    // answered; our retries exhausted, marked the peer dead, and tore down
+    // the connection the remote had just completed. Only a prior that is
+    // failed, closed or dead is replaced.
     if (priorEntry?.channel?.readyState === 'open') {
       return prior
     }
-
     if (prior && prior.signalingState !== 'closed') {
+      const progressing = priorEntry?.state !== 'dead'
+        && prior.connectionState !== 'failed'
+        && prior.connectionState !== 'closed'
+        && (prior.connectionState === 'connected'
+          || prior.connectionState === 'connecting'
+          || prior.signalingState === 'have-remote-offer'
+          || Boolean(prior.remoteDescription))
+      if (progressing) {
+        log(`[webrtc] not dialing ${toPeerId}: a connection is already in progress`)
+        return prior
+      }
       try {
         prior.close()
       } catch {}
