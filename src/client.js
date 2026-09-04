@@ -660,14 +660,22 @@ export function createSignalingClient(options = {}) {
         // ping stays unanswered dies by the normal timeout instead of
         // enjoying a grace window it never earned.
         openEntry.lastPongAt = 0
+        // Only a ping that actually left counts as outstanding. Recording
+        // one that was skipped (transport not yet 'connected') armed a
+        // phantom four-second timeout that the first inbound message
+        // executed as "outbound timeout" on a channel nobody had pinged.
         try {
           if (transportReady(pc)) {
             channel.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
+            openEntry.lastPingSentAt = Date.now()
+            lastPingSentAt = openEntry.lastPingSentAt
+          } else {
+            openEntry.lastPingSentAt = 0
+            lastPingSentAt = 0
           }
-          openEntry.lastPingSentAt = Date.now()
-          lastPingSentAt = openEntry.lastPingSentAt
         } catch {
-          openEntry.lastPingSentAt = Date.now()
+          openEntry.lastPingSentAt = 0
+          lastPingSentAt = 0
         }
       }
       // RTCPeerConnection "connected" may precede data-channel readiness.
@@ -856,7 +864,16 @@ export function createSignalingClient(options = {}) {
         // pong on a transient state is safe — the remote holds its own pings
         // during transient states too, and a state that never returns to
         // 'connected' is executed by the stall machinery on both ends.
-        if (!transportReady(pc)) return
+        // A ping arriving here PROVES the remote can reach us on this
+        // channel; the reply is the only proof it gets of the other
+        // direction. Gating the pong on pc.connectionState === 'connected'
+        // dropped it whenever a browser reported 'connecting' with the
+        // channel open — a state Chromium and WebKit both pass through
+        // during (re)negotiation — and the remote read the silence as a
+        // one-way-dead channel and executed a healthy transport four
+        // seconds later ("data channel outbound timeout"). Only the
+        // channel's own state gates the reply; a failed send is caught.
+        if (channel.readyState !== 'open') return
         try {
           channel.send(JSON.stringify({ type: 'pong', ts: Date.now() }))
         } catch {
