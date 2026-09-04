@@ -577,6 +577,15 @@ export function createSignalingClient(options = {}) {
     let keepaliveTimerId = null
     let lastPongAt    = Date.now()
     let lastPingSentAt = 0   // 0 = no ping in flight
+    let lastInboundAt = Date.now()
+    // A ping cannot be late while it is still sitting in our own send
+    // buffer, and a channel that keeps delivering messages is not dead. The
+    // watcher's index node pushes megabytes of storage the moment a browser
+    // connects; over werift's SCTP that takes longer than the pong deadline,
+    // the ping queued behind it, and the keepalive executed a channel that
+    // was working flat out — on every peer, on every connection.
+    const backlogged = () => Number(channel.bufferedAmount ?? 0) > 0
+    const inboundAlive = () => Date.now() - lastInboundAt < DATA_PONG_TIMEOUT_MS
 
     // The moment the tab becomes visible, PROBE the channel instead of
     // assuming it survived: faking a fresh pong here stamped every
@@ -754,7 +763,13 @@ export function createSignalingClient(options = {}) {
 
         // Only consider a timeout if we sent a ping that hasn't been answered.
         const pingInFlight = lastPingSentAt > lastPongAt
-        if (pingInFlight && Date.now() - lastPingSentAt >= DATA_PONG_TIMEOUT_MS) {
+        if (pingInFlight && backlogged()) {
+          // Still in our buffer: the clock on this ping has not started.
+          lastPingSentAt = Date.now()
+          if (currentEntry.lastPingSentAt > currentEntry.lastPongAt) currentEntry.lastPingSentAt = lastPingSentAt
+          return
+        }
+        if (pingInFlight && Date.now() - lastPingSentAt >= DATA_PONG_TIMEOUT_MS && !inboundAlive()) {
           closeBrokenChannel('data channel timeout')
           return
         }
@@ -794,6 +809,10 @@ export function createSignalingClient(options = {}) {
       if (currentEntry.dormantAt) return
       const now = Date.now()
       const pingOutstanding = currentEntry.lastPingSentAt > currentEntry.lastPongAt
+      if (pingOutstanding && backlogged()) {
+        currentEntry.lastPingSentAt = now
+        return
+      }
       if (pingOutstanding && now - currentEntry.lastPingSentAt >= DATA_PONG_TIMEOUT_MS) {
         closeBrokenChannel('data channel outbound timeout')
         return
@@ -838,6 +857,7 @@ export function createSignalingClient(options = {}) {
     }
 
     channel.onmessage = (event) => {
+      lastInboundAt = Date.now()
       const currentEntry = mesh.connections.get(remotePeerId)
       const ownsCurrentEntry = currentEntry?.connection === pc && currentEntry.channel === channel
       if (ownsCurrentEntry && currentEntry.dormantAt && String(event.data).indexOf(DATA_DORMANT_FRAME) === -1) {
@@ -2079,6 +2099,7 @@ export function createSignalingClient(options = {}) {
         const unproven = !(target.lastPongAt > 0) || now - target.lastPongAt >= DATA_PROOF_FRESH_MS
         const pingOutstanding = target.lastPingSentAt > (target.lastPongAt ?? 0)
         const outboundDead = pingOutstanding && now - target.lastPingSentAt >= DATA_PONG_TIMEOUT_MS
+          && !(Number(target.channel?.bufferedAmount ?? 0) > 0)
         // A refusal for a stale proof arms its own re-proof: a healthy
         // channel pongs within one round trip and the next send passes; a
         // dead one lets this ping age into the execution verdict. Without
