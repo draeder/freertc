@@ -625,7 +625,27 @@ export function createSignalingClient(options = {}) {
     }
 
     const entry = mesh.connections.get(remotePeerId)
-    if (entry?.connection === pc) entry.channel = channel
+    if (entry?.connection === pc) {
+      entry.channel = channel
+      // The proof bookkeeping belongs to THIS channel. It used to survive a
+      // channel swap on the entry (glare adoption, a redial on the same
+      // connection), so a fresh channel inherited an unanswered ping from
+      // the dead one, the first send was refused as "failed its pong proof"
+      // — a terminal refusal — and the peer was released the instant it
+      // connected. Start unproven with nothing in flight; an already-open
+      // channel is armed here exactly as onopen would have armed it.
+      entry.lastPongAt = 0
+      entry.lastPingSentAt = 0
+      lastPongAt = 0
+      lastPingSentAt = 0
+      if (channel.readyState === 'open' && transportReady(pc)) {
+        try {
+          channel.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
+          entry.lastPingSentAt = Date.now()
+          lastPingSentAt = entry.lastPingSentAt
+        } catch { /* the keepalive verdict handles it */ }
+      }
+    }
 
     channel.onopen = () => {
       const currentEntry = mesh.connections.get(remotePeerId)
