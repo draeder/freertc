@@ -26,6 +26,10 @@ const RELAY_TYPES = new Set([
 ]);
 
 const DEFAULT_TTL_MS = 30_000;
+const FEDERATED_PEER_QUERY_TIMEOUT_MS = 2_500;
+// A discover is answered within this bound no matter what federation does;
+// the local peers are sent alone if the federated lookup is still running.
+const DISCOVER_REPLY_DEADLINE_MS = 4_000;
 const MAX_TTL_MS = 120_000;
 const MAX_MESSAGE_SIZE = 64 * 1024;
 const MAX_BATCH = 50;
@@ -413,7 +417,12 @@ async function queryRelayForPeers(relayUrl, network, room, requesterPeerId) {
     const base = relayHttpBase(relayUrl);
     const params = new URLSearchParams({ network, room });
     if (requesterPeerId) params.set("exclude", requesterPeerId);
-    const resp = await fetch(`${base}/api/v1/peers?${params.toString()}`);
+    // A relay that hangs must not hang every discover that consults it: one
+    // slow provider stalled the whole federated list past the clients' probe
+    // window and they switched relays instead of getting an answer.
+    const resp = await fetch(`${base}/api/v1/peers?${params.toString()}`, {
+      signal: AbortSignal.timeout(FEDERATED_PEER_QUERY_TIMEOUT_MS),
+    });
     if (!resp.ok) return [];
     const data = await resp.json();
     const peers = Array.isArray(data?.peers) ? data.peers : [];
@@ -1067,16 +1076,29 @@ async function handleClientMessage(
       }
 
     } else if (type === "discover") {
+      // Never leave a discover unanswered. A federated lookup that hung, or
+      // threw, used to mean no peer_list at all — clients read that silence
+      // as a dead relay and moved, so peers on THIS relay could not even
+      // find each other. The reply is bounded: federated peers when they
+      // arrive in time, the local ones alone otherwise.
+      let answered = false;
+      const reply = (peers) => {
+        if (answered) return;
+        answered = true;
+        try { sendPeerList(socket, network, room, peers, peerId, relayPeerId); } catch {}
+      };
+      const localOnly = async () => {
+        try { return db ? await findPeers(db, network, room, peerId) : []; } catch { return []; }
+      };
+      const deadline = setTimeout(() => { localOnly().then(reply); }, DISCOVER_REPLY_DEADLINE_MS);
       try {
-        sendPeerList(
-          socket,
-          network,
-          room,
-          await findFederatedPeers(env, selfRelayUrl, network, room, peerId, livePeers.size),
-          peerId,
-          relayPeerId
-        );
-      } catch {}
+        const peers = await findFederatedPeers(env, selfRelayUrl, network, room, peerId, livePeers.size);
+        clearTimeout(deadline);
+        reply(peers);
+      } catch {
+        clearTimeout(deadline);
+        reply(await localOnly());
+      }
 
     } else if (type === "ext" && message.body?.action === "relay_list") {
       // Remote relay is sharing its known relay list — cache any new entries
