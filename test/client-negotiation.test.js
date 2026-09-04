@@ -1250,9 +1250,10 @@ test('the impolite peer keeps its already-open channel when the remote one arriv
     assert.equal(client.mesh.connections.get('remote-peer').channel, dialedChannel)
     assert.equal(inboundChannel.readyState, 'closed')
 
-    // Keepalives and application data flow on the kept channel.
+    // Keepalives and application data flow on the kept channel. Attaching
+    // an already-open channel arms its proof with one ping first.
     dialedChannel.onmessage({ data: JSON.stringify({ type: 'ping', ts: 1 }) })
-    assert.deepEqual(dialedChannel.sent.map((message) => message.type), ['pong'])
+    assert.deepEqual(dialedChannel.sent.map((message) => message.type).filter((type) => type !== 'ping'), ['pong'])
     dialedChannel.onmessage({ data: 'raw-bytes' })
     assert.deepEqual(dataMessages, [{ peerId: 'remote-peer', data: 'raw-bytes' }])
   } finally {
