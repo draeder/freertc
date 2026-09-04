@@ -2044,7 +2044,13 @@ export function createSignalingClient(options = {}) {
       }
 
       if (!target?.channel || target.channel.readyState !== 'open') {
-        throw new Error('WebRTC not yet connected')
+        // Not open YET is transient by definition: the channel is still
+        // being negotiated or attached. This refusal carried no flag, so a
+        // send that raced the open was read as terminal and the peer was
+        // released the moment it had connected.
+        const error = new Error('WebRTC not yet connected')
+        error.transient = true
+        throw error
       }
       if (target.dormantAt && Date.now() - target.dormantAt < DATA_DORMANT_MAX_MS) {
         const error = new Error('Peer is dormant (hidden tab)')
