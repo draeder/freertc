@@ -1281,13 +1281,37 @@ export function createSignalingClient(options = {}) {
 
         const existingEntry = mesh.connections.get(fromPeerId)
 
-        // Already connected — just re-send our cached answer so the remote
-        // peer's retry timer can stop; do NOT tear down the live connection.
+        // Already connected. A retry of the offer we answered just needs that
+        // answer again so the remote's retry timer can stop; the live
+        // connection stays. But an offer with NEW ICE credentials on a channel
+        // that still looks open means the other side has lost its end and is
+        // dialing afresh. Our end is dead too, our keepalive just has not said
+        // so yet; ignoring the offer (or answering it with the cached answer
+        // for a connection that no longer exists over there) left the two
+        // sides deaf to each other for twenty seconds, then redialing — the
+        // churn a watcher sees every time a browser wakes. Replace the
+        // connection and answer the new offer.
         if (existingEntry?.channel?.readyState === 'open') {
-          if (existingEntry.lastLocalAnswer) {
-            sendRelay('answer', existingEntry.lastLocalAnswer)
+          const openRemoteSdp = existingEntry.lastRemoteOfferSdp
+            ?? existingEntry.connection?.remoteDescription?.sdp
+            ?? null
+          const freshUfrag = iceUfragOf(offer?.sdp ?? null)
+          const openUfrag = iceUfragOf(openRemoteSdp)
+          const sameNegotiation = !freshUfrag || !openUfrag || freshUfrag === openUfrag
+          if (sameNegotiation) {
+            if (existingEntry.lastLocalAnswer) {
+              sendRelay('answer', existingEntry.lastLocalAnswer)
+            }
+            return
           }
-          return
+          log(`[webrtc] fresh offer from ${fromPeerId} (ufrag ${openUfrag} → ${freshUfrag}) on an open channel; the remote restarted, replacing the connection`)
+          const openPc = existingEntry.connection
+          if (openPc) clearOfferRetryTimer(openPc)
+          clearAnswerBurst(fromPeerId)
+          pendingCandidates.delete(fromPeerId)
+          pendingAnswers.delete(fromPeerId)
+          mesh.connections.delete(fromPeerId)
+          try { openPc?.close() } catch {}
         }
 
         // If the existing connection is dead/failed (but signalingState not yet
