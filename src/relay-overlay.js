@@ -33,6 +33,19 @@ const PROVIDER_RECORD_TTL_MS = 45_000;
 const MAX_RECENT_PROVIDER_PUBLISHES = 20_000;
 const PEER_PROVIDER_LOOKUP_CACHE_MS = 5_000;
 const MAX_RECENT_PEER_PROVIDER_LOOKUPS = 2_000;
+// A shared pending promise must never park every caller forever. A join or a
+// lookup started on behalf of one socket can be abandoned by the platform when
+// that socket's request ends; whoever awaits it next would otherwise hang,
+// and every relay operation funnels through these two waits.
+const SHARED_WAIT_TIMEOUT_MS = 6_000;
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
 
 const identityPromises = new WeakMap();
 const joinPromises = new WeakMap();
@@ -380,7 +393,14 @@ async function ensureRoutingContacts(context) {
       .finally(() => joinPromises.delete(context.env));
     joinPromises.set(context.env, join);
   }
-  await joinPromises.get(context.env);
+  const pending = joinPromises.get(context.env);
+  try {
+    await withTimeout(pending, SHARED_WAIT_TIMEOUT_MS, 'Kademlia bootstrap');
+  } catch (error) {
+    // Forget the stuck join so the next operation starts a fresh one; this
+    // caller carries on with whatever contacts are already in the table.
+    if (joinPromises.get(context.env) === pending) joinPromises.delete(context.env);
+  }
 }
 
 async function replicateProviderRecord(context, record, wantRecords = false) {
@@ -466,9 +486,20 @@ export async function lookupPeerProviders(env, selfUrl, network, room, peerId, o
   const cacheKey = JSON.stringify([selfUrl, network, room, peerId]);
   const now = Date.now();
   const cached = recentPeerProviderLookups.get(cacheKey);
-  if (cached?.promise) return cached.promise;
-  if (cached?.records && cached.expiresAt > now) return cached.records;
-  if (cached) recentPeerProviderLookups.delete(cacheKey);
+  if (cached?.promise) {
+    if (now - cached.startedAt < SHARED_WAIT_TIMEOUT_MS) {
+      try {
+        return await withTimeout(cached.promise, SHARED_WAIT_TIMEOUT_MS, 'Peer provider lookup');
+      } catch {
+        // Fall through to a fresh lookup of our own.
+      }
+    }
+    if (recentPeerProviderLookups.get(cacheKey) === cached) recentPeerProviderLookups.delete(cacheKey);
+  } else if (cached?.records && cached.expiresAt > now) {
+    return cached.records;
+  } else if (cached) {
+    recentPeerProviderLookups.delete(cacheKey);
+  }
 
   // One WebRTC offer commonly produces an offer plus a burst of ICE packets.
   // They all target the same peer and must share one Kademlia lookup instead of
@@ -490,8 +521,8 @@ export async function lookupPeerProviders(env, selfUrl, network, room, peerId, o
       recentPeerProviderLookups.delete(cacheKey);
       throw error;
     });
-  rememberPeerProviderLookup(cacheKey, { promise, expiresAt: now });
-  return promise;
+  rememberPeerProviderLookup(cacheKey, { promise, expiresAt: now, startedAt: now });
+  return withTimeout(promise, SHARED_WAIT_TIMEOUT_MS * 2, 'Peer provider lookup');
 }
 
 export async function handleKademliaRequest(request, env, options = {}) {

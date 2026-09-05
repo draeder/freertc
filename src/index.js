@@ -37,11 +37,20 @@ const RELAY_EXPIRY_MS = 5 * 60_000;       // relay entry expires after 5 min wit
 const FEDERATION_INTERVAL_MS = 2 * 60_000; // re-heartbeat every 2 min per isolate
 const DEFAULT_HUB_URL = "wss://peer.ooo/ws"; // default bootstrap hub
 const KADEMLIA_FORWARD_LIMIT = 2;
+const FEDERATED_FORWARD_DEADLINE_MS = 15_000;
 const PEER_RELAY_HINT_TTL_MS = 60_000;
 
 const livePeers = new Map(); // key: JSON [network, room, peerId]
 const networkSubscribers = new Map(); // key: JSON [network, room] -> Set of sockets
 const peerRelayHints = new Map(); // key: JSON [network, room, peerId] -> { url, expiresAt }
+// Diagnostic trail of federation work done on behalf of live sockets. Read
+// through GET /debug/state on the coordinator. Bounded; newest last.
+const debugTrail = [];
+const DEBUG_TRAIL_LIMIT = 300;
+function debugNote(entry) {
+  debugTrail.push({ t: Date.now(), ...entry });
+  while (debugTrail.length > DEBUG_TRAIL_LIMIT) debugTrail.shift();
+}
 let nextSocketGeneration = 0;
 
 export function claimLivePeer(livePeerMap, key, value) {
@@ -205,6 +214,11 @@ export default {
       return jsonResponse({ ok: false, error: "Method not allowed" }, 405);
     }
 
+    if (url.pathname === "/debug/state") {
+      const coordinator = relayCoordinatorStub(env);
+      if (coordinator) return coordinator.fetch(request);
+      return jsonResponse({ ok: false, error: "No coordinator" }, 404);
+    }
     if (url.pathname === "/api/v1/relay") {
       if (request.method === "POST") {
         const coordinator = relayCoordinatorStub(env);
@@ -238,6 +252,17 @@ export class RelayCoordinator {
     }
     if (url.pathname === "/api/v1/relay" && request.method === "POST") {
       return handleRelayForward(request, this.env);
+    }
+    if (url.pathname === "/debug/state") {
+      const now = Date.now();
+      return jsonResponse({
+        ok: true,
+        now,
+        peers: livePeers.size,
+        peerKeys: [...livePeers.keys()].map((key) => key.slice(0, 80)),
+        hints: [...peerRelayHints.entries()].map(([key, hint]) => ({ key: key.slice(0, 80), url: hint.url, expiresIn: hint.expiresAt - now })),
+        trail: debugTrail.slice(-Number(url.searchParams.get("limit") || 60)),
+      }, 200);
     }
     if (url.pathname === "/health") {
       return jsonResponse({
@@ -1168,20 +1193,33 @@ async function handleClientMessage(
       // walk in each direction. Kademlia remains the authoritative fallback.
       if (!deliveredLive && selfRelayUrl && env.DB) {
         ctx.waitUntil((async () => {
-          const deliveredRemote = await forwardFederatedMessage(
-            env,
-            selfRelayUrl,
-            network,
-            room,
-            message,
-            livePeers.size,
-          );
-          if (deliveredRemote) {
-            console.log(`[FED] Routed ${type} to peer relay for ${message.to}`);
-            return;
+          const startedAt = Date.now();
+          const hint = getPeerRelayHint(network, room, message.to);
+          try {
+            // Bounded: a forward that cannot finish inside the deadline is
+            // queued like an unreachable peer instead of silently vanishing.
+            const deliveredRemote = await Promise.race([
+              forwardFederatedMessage(
+                env,
+                selfRelayUrl,
+                network,
+                room,
+                message,
+                livePeers.size,
+              ),
+              new Promise((resolve) => setTimeout(() => resolve(false), FEDERATED_FORWARD_DEADLINE_MS)),
+            ]);
+            debugNote({ op: 'forward', type, from: peerId.slice(0, 8), to: message.to.slice(0, 8), hint, delivered: deliveredRemote, ms: Date.now() - startedAt });
+            if (deliveredRemote) {
+              console.log(`[FED] Routed ${type} to peer relay for ${message.to}`);
+              return;
+            }
+            await insertRelayMessage(db, message);
+            console.log(`[RELAY] Peer ${message.to} unavailable across federation, queued ${type} in DB`);
+          } catch (error) {
+            debugNote({ op: 'forward', type, from: peerId.slice(0, 8), to: message.to.slice(0, 8), hint, error: String(error?.stack || error?.message || error).slice(0, 400), ms: Date.now() - startedAt });
+            console.error(`[FED] forwarding ${type} to ${message.to} failed: ${error?.message}`);
           }
-          await insertRelayMessage(db, message);
-          console.log(`[RELAY] Peer ${message.to} unavailable across federation, queued ${type} in DB`);
         })());
       } else if (!deliveredLive && db) {
         await insertRelayMessage(db, message);
