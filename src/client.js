@@ -67,7 +67,11 @@ const SUSPEND_GAP_MS = 20000
 // A relay-backed offer normally reaches the destination on its next one-second
 // signaling heartbeat. Five total sends over 2.85s cover that delivery window
 // without pinning an isolated peer to one unreachable candidate for 31.85s.
-const OFFER_RETRY_DELAYS_MS = [100, 250, 500, 1000]
+// Under two seconds used to be the whole budget for an answer. A watcher
+// that has just restarted, or is publishing a bundle, answers late — its
+// answers arrived after the dial had given up, were queued for a connection
+// that no longer existed, and the pair redialed. Sixteen seconds covers it.
+const OFFER_RETRY_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000, 8000]
 // A negotiation frame is perishable. An offer is retried within two seconds
 // and its negotiation given up within ten; delivered later, from the relay's
 // offline queue, it is a dead offer the receiver answers into nothing — and a

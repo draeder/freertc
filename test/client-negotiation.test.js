@@ -498,7 +498,7 @@ test('recovery reset clears offer backoff and retransmits immediately', async (t
   }
 })
 
-test('an unreachable offer fails over in under three seconds', async (t) => {
+test('an unreachable offer fails over after the sixteen-second retry budget', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const originalWebSocket = globalThis.WebSocket
   const originalRTCPeerConnection = globalThis.RTCPeerConnection
@@ -573,13 +573,12 @@ test('an unreachable offer fails over in under three seconds', async (t) => {
 
     const offers = () => sockets[0].sent.filter((message) => message.type === 'offer').length
     assert.equal(offers(), 1)
-    t.mock.timers.tick(100)
-    t.mock.timers.tick(250)
-    t.mock.timers.tick(500)
-    t.mock.timers.tick(1_000)
-    t.mock.timers.tick(999)
+    // Retries at 100 ms, 250 ms, 500 ms, 1 s, 2 s, 4 s and 8 s: a peer that
+    // is merely busy answers inside this window; only silence fails over.
+    for (const delay of [100, 250, 500, 1_000, 2_000, 4_000, 8_000]) t.mock.timers.tick(delay)
+    t.mock.timers.tick(7_999)
     assert.equal(failures.length, 0)
-    assert.equal(offers(), 5)
+    assert.equal(offers(), 8)
     t.mock.timers.tick(1)
     assert.equal(failures.length, 1)
     assert.equal(failures[0].peerId, 'unreachable-peer')
