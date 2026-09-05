@@ -51,6 +51,195 @@ function debugNote(entry) {
   debugTrail.push({ t: Date.now(), ...entry });
   while (debugTrail.length > DEBUG_TRAIL_LIMIT) debugTrail.shift();
 }
+
+// ===================== Deferred work =====================
+//
+// Nothing that leaves the runtime — a D1 query, a fetch to another relay, a
+// Kademlia walk — may run on a WebSocket's own request context. The platform
+// charges every such subrequest to the request that opened the socket, and a
+// socket that lives for hours pays for all of them at once: after a handful of
+// federated forwards each further call fails with "Subrequest depth limit
+// exceeded", silently, and the peer looks reachable while nothing it sends
+// gets out. So the socket handler only touches memory, and hands the rest to
+// the coordinator's alarm, which runs each batch on a fresh context.
+const DEFERRED_TASK_PREFIX = "task:";
+const MAX_DEFERRED_TASKS_PER_ALARM = 6;
+const CLEANUP_INTERVAL_MS = 60_000;
+let deferredTaskSequence = 0;
+let lastCleanupAt = 0;
+
+function canDefer(ctx) {
+  return Boolean(ctx?.storage?.put && ctx?.storage?.setAlarm && ctx?.storage?.getAlarm);
+}
+
+async function deferWork(ctx, env, task) {
+  if (!canDefer(ctx)) {
+    // No coordinator (legacy single-isolate mode): run it here as before.
+    const work = runDeferredTask(env, task).catch((error) => {
+      console.error(`[TASK] ${task.kind} failed: ${error?.message}`);
+    });
+    if (ctx?.waitUntil) ctx.waitUntil(work);
+    return;
+  }
+  deferredTaskSequence = (deferredTaskSequence + 1) % 1_000_000;
+  const key = `${DEFERRED_TASK_PREFIX}${String(Date.now()).padStart(15, "0")}:${String(deferredTaskSequence).padStart(6, "0")}`;
+  await ctx.storage.put(key, task);
+  if ((await ctx.storage.getAlarm()) === null) {
+    await ctx.storage.setAlarm(Date.now());
+  }
+}
+
+async function drainDeferredTasks(state, env) {
+  const entries = await state.storage.list({ prefix: DEFERRED_TASK_PREFIX, limit: MAX_DEFERRED_TASKS_PER_ALARM });
+  if (entries.size === 0) return;
+  await Promise.all([...entries].map(async ([key, task]) => {
+    const startedAt = Date.now();
+    try {
+      await runDeferredTask(env, task);
+    } catch (error) {
+      debugNote({ op: "task-error", kind: task?.kind, error: String(error?.message || error).slice(0, 300), ms: Date.now() - startedAt });
+      console.error(`[TASK] ${task?.kind} failed: ${error?.message}`);
+    }
+    await state.storage.delete(key);
+  }));
+  const remaining = await state.storage.list({ prefix: DEFERRED_TASK_PREFIX, limit: 1 });
+  if (remaining.size > 0) await state.storage.setAlarm(Date.now());
+}
+
+async function runDeferredTask(env, task) {
+  const db = env.DB;
+  const { kind, network, room, peerId, selfRelayUrl } = task;
+  const relayPeerId = resolveRelayPeerId(env.RELAY_PEER_ID, selfRelayUrl);
+  const liveSocket = () => livePeers.get(peerScopeKey(network, room, peerId))?.socket ?? null;
+
+  if (kind === "announce") {
+    if (db) {
+      await upsertAnnouncement(db, task.message);
+      const socket = liveSocket();
+      if (socket) await deliverQueuedRelayMessages(db, socket, network, room, peerId);
+    }
+    if (selfRelayUrl && isKademliaEnabled(env)) {
+      if (task.isHeartbeat) {
+        await publishPeerProviderRecords(env, selfRelayUrl, network, room, peerId, { connections: livePeers.size });
+      } else {
+        // Query the established overlay immediately while publishing this
+        // peer's provider records in parallel. Discovery must not sit behind
+        // the publication round trip for a peer that is already isolated.
+        await discoverJoiningPeer({
+          discover: (scopeProviders) => findFederatedPeers(env, selfRelayUrl, network, room, peerId, livePeers.size, scopeProviders),
+          publish: () => publishPeerProviderRecords(env, selfRelayUrl, network, room, peerId, { connections: livePeers.size, returnScopeProviders: true }),
+          send: (peers) => {
+            const socket = liveSocket();
+            if (!socket) return;
+            try { sendPeerList(socket, network, room, peers, peerId, relayPeerId); } catch {}
+          },
+        });
+      }
+    }
+    // Only broadcast peer_list when the peer is newly joining, not on a
+    // heartbeat re-announce: no topology change occurred.
+    if (!task.isHeartbeat && db) {
+      console.log(`[NET] Broadcasting peer_list for network=${network} room=${room} after new announce from ${peerId}`);
+      await broadcastPeerList(db, network, room, relayPeerId).catch((err) => console.error(`[Broadcast error]`, err?.message));
+    }
+    return;
+  }
+
+  if (kind === "discover") {
+    // Never leave a discover unanswered. The reply is bounded: federated
+    // peers when they arrive in time, the local ones alone otherwise.
+    let answered = false;
+    const reply = (peers) => {
+      if (answered) return;
+      answered = true;
+      const socket = liveSocket();
+      if (!socket) return;
+      try { sendPeerList(socket, network, room, peers, peerId, relayPeerId); } catch {}
+    };
+    const localOnly = async () => {
+      try { return db ? await findPeers(db, network, room, peerId) : []; } catch { return []; }
+    };
+    const deadline = setTimeout(() => { localOnly().then(reply); }, DISCOVER_REPLY_DEADLINE_MS);
+    try {
+      const peers = await findFederatedPeers(env, selfRelayUrl, network, room, peerId, livePeers.size);
+      clearTimeout(deadline);
+      reply(peers);
+    } catch {
+      clearTimeout(deadline);
+      reply(await localOnly());
+    }
+    return;
+  }
+
+  if (kind === "peer-left") {
+    if (!db) return;
+    await deleteAnnouncement(db, network, room, peerId);
+    await broadcastPeerList(db, network, room, relayPeerId).catch(() => {});
+    return;
+  }
+
+  if (kind === "deliver-queued") {
+    const socket = liveSocket();
+    if (db && socket) await deliverQueuedRelayMessages(db, socket, network, room, peerId);
+    return;
+  }
+
+  if (kind === "relay-list") {
+    if (!db) return;
+    await Promise.all((task.relays || [])
+      .filter((r) => r?.url)
+      .map((r) => upsertRelay(db, r.url, r.name || null).catch(() => {})));
+    return;
+  }
+
+  if (kind === "forward") {
+    const message = task.message;
+    const type = message.type;
+    // The peer may have arrived here since the socket handler looked.
+    const live = livePeers.get(peerScopeKey(network, room, message.to));
+    if (live) {
+      try {
+        live.socket.send(JSON.stringify(message));
+        debugNote({ op: "forward", type, from: peerId.slice(0, 8), to: message.to.slice(0, 8), hint: "local", delivered: true, ms: 0 });
+        return;
+      } catch {}
+    }
+    if (!db) {
+      console.warn(`[RELAY] Could not deliver ${type} to ${message.to}; persistence unavailable`);
+      return;
+    }
+    if (!selfRelayUrl) {
+      await insertRelayMessage(db, message);
+      return;
+    }
+    const startedAt = Date.now();
+    const hint = getPeerRelayHint(network, room, message.to);
+    try {
+      // Bounded: a forward that cannot finish inside the deadline is queued
+      // like an unreachable peer instead of silently vanishing.
+      const deliveredRemote = await Promise.race([
+        forwardFederatedMessage(env, selfRelayUrl, network, room, message, livePeers.size),
+        new Promise((resolve) => setTimeout(() => resolve(false), FEDERATED_FORWARD_DEADLINE_MS)),
+      ]);
+      debugNote({ op: "forward", type, from: peerId.slice(0, 8), to: message.to.slice(0, 8), hint, delivered: deliveredRemote, ms: Date.now() - startedAt });
+      if (deliveredRemote) {
+        console.log(`[FED] Routed ${type} to peer relay for ${message.to}`);
+        return;
+      }
+    } catch (error) {
+      debugNote({ op: "forward", type, from: peerId.slice(0, 8), to: message.to.slice(0, 8), hint, error: String(error?.stack || error?.message || error).slice(0, 400), ms: Date.now() - startedAt });
+      console.error(`[FED] forwarding ${type} to ${message.to} failed: ${error?.message}`);
+    }
+    await insertRelayMessage(db, message);
+    console.log(`[RELAY] Peer ${message.to} unavailable across federation, queued ${type} in DB`);
+    return;
+  }
+
+  if (kind === "cleanup") {
+    if (db) await cleanupExpired(db);
+    return;
+  }
+}
 let nextSocketGeneration = 0;
 
 export function claimLivePeer(livePeerMap, key, value) {
@@ -240,6 +429,18 @@ export class RelayCoordinator {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+    // Work queued before a restart is still in storage; make sure an alarm
+    // exists to drain it.
+    state.blockConcurrencyWhile(async () => {
+      const pending = await state.storage.list({ prefix: DEFERRED_TASK_PREFIX, limit: 1 });
+      if (pending.size > 0 && (await state.storage.getAlarm()) === null) {
+        await state.storage.setAlarm(Date.now());
+      }
+    }).catch(() => {});
+  }
+
+  async alarm() {
+    await drainDeferredTasks(this.state, this.env);
   }
 
   async fetch(request) {
@@ -876,11 +1077,8 @@ function handleWebSocket(request, env, ctx, selfRelayUrl) {
     // A replaced socket can close after its successor has already announced.
     // Only the socket that still owns this peer ID may delete the shared lease.
     if (env.DB && releasedLivePeer) {
-      ctx.waitUntil(
-        deleteAnnouncement(env.DB, currentNetwork, currentRoom, currentPeerId)
-          .then(() => broadcastPeerList(env.DB, currentNetwork, currentRoom, relayPeerId))
-          .catch(() => {})
-      );
+      deferWork(ctx, env, { kind: "peer-left", network: currentNetwork, room: currentRoom, peerId: currentPeerId, selfRelayUrl })
+        .catch(() => {});
     }
 
     return subscriberScope;
@@ -1038,54 +1236,6 @@ async function handleClientMessage(
 
     if (type === "announce") {
       const isHeartbeat = prevPeerKey === peerKey;
-      if (db) {
-        await upsertAnnouncement(db, message);
-        await deliverQueuedRelayMessages(db, socket, network, room, peerId);
-      }
-
-      if (selfRelayUrl && isKademliaEnabled(env)) {
-        ctx.waitUntil((async () => {
-          if (isHeartbeat) {
-            await publishPeerProviderRecords(
-              env,
-              selfRelayUrl,
-              network,
-              room,
-              peerId,
-              { connections: livePeers.size },
-            );
-            return;
-          }
-
-          // Query the established overlay immediately while publishing this
-          // peer's provider records in parallel. Discovery must not sit behind
-          // the publication round trip for a peer that is already isolated.
-          await discoverJoiningPeer({
-            discover: (scopeProviders) => findFederatedPeers(
-              env,
-              selfRelayUrl,
-              network,
-              room,
-              peerId,
-              livePeers.size,
-              scopeProviders,
-            ),
-            publish: () => publishPeerProviderRecords(
-              env,
-              selfRelayUrl,
-              network,
-              room,
-              peerId,
-              { connections: livePeers.size, returnScopeProviders: true },
-            ),
-            send: (peers) => {
-              try {
-                sendPeerList(socket, network, room, peers, peerId, relayPeerId);
-              } catch {}
-            },
-          });
-        })().catch((err) => console.error("[KAD] Announce discovery failed:", err?.message)));
-      }
 
       // Registration is complete only after the relay has accepted the
       // announcement. Clients use this ACK to begin discovery and signaling.
@@ -1093,58 +1243,25 @@ async function handleClientMessage(
         message,
         relayPeerId
       )));
-      
-      // Only broadcast peer_list when the peer is newly joining, not on heartbeat re-announces.
-      // prevPeerKey === peerKey means same peer on the same socket sending a periodic keep-alive;
-      // no topology change occurred, so no need to push a new list to everyone.
-      if (!isHeartbeat && db) {
-        console.log(`[NET] Broadcasting peer_list for network=${network} room=${room} after new announce from ${peerId}`);
-        broadcastPeerList(db, network, room, relayPeerId).catch((err) => console.error(`[Broadcast error]`, err?.message));
-      }
+
+      // The registry write, queued deliveries, provider publication and the
+      // joining peer's discovery all leave the runtime; they run on the
+      // coordinator's alarm, never on this socket's request.
+      await deferWork(ctx, env, { kind: "announce", network, room, peerId, selfRelayUrl, message, isHeartbeat });
 
     } else if (type === "withdraw") {
       const releasedLivePeer = deleteLivePeerIfOwned(livePeers, peerKey, socket);
       if (db && releasedLivePeer) {
-        await deleteAnnouncement(db, network, room, peerId);
-      }
-      if (db && releasedLivePeer) {
-        broadcastPeerList(db, network, room, relayPeerId).catch(() => {});
+        await deferWork(ctx, env, { kind: "peer-left", network, room, peerId, selfRelayUrl });
       }
 
     } else if (type === "discover") {
-      // Never leave a discover unanswered. A federated lookup that hung, or
-      // threw, used to mean no peer_list at all — clients read that silence
-      // as a dead relay and moved, so peers on THIS relay could not even
-      // find each other. The reply is bounded: federated peers when they
-      // arrive in time, the local ones alone otherwise.
-      let answered = false;
-      const reply = (peers) => {
-        if (answered) return;
-        answered = true;
-        try { sendPeerList(socket, network, room, peers, peerId, relayPeerId); } catch {}
-      };
-      const localOnly = async () => {
-        try { return db ? await findPeers(db, network, room, peerId) : []; } catch { return []; }
-      };
-      const deadline = setTimeout(() => { localOnly().then(reply); }, DISCOVER_REPLY_DEADLINE_MS);
-      try {
-        const peers = await findFederatedPeers(env, selfRelayUrl, network, room, peerId, livePeers.size);
-        clearTimeout(deadline);
-        reply(peers);
-      } catch {
-        clearTimeout(deadline);
-        reply(await localOnly());
-      }
+      await deferWork(ctx, env, { kind: "discover", network, room, peerId, selfRelayUrl });
 
     } else if (type === "ext" && message.body?.action === "relay_list") {
       // Remote relay is sharing its known relay list — cache any new entries
       if (db) {
-        const remoteRelays = message.body.relays || [];
-        await Promise.all(
-          remoteRelays
-            .filter(r => r.url)
-            .map(r => upsertRelay(db, r.url, r.name || null).catch(() => {}))
-        );
+        await deferWork(ctx, env, { kind: "relay-list", network, room, peerId, selfRelayUrl, relays: message.body.relays || [] });
       }
 
     } else if (type === "ping") {
@@ -1156,16 +1273,13 @@ async function handleClientMessage(
         ttl_ms: DEFAULT_TTL_MS, body: {}
       }));
       if (db) {
-        await deliverQueuedRelayMessages(db, socket, network, room, peerId);
+        await deferWork(ctx, env, { kind: "deliver-queued", network, room, peerId, selfRelayUrl });
       }
 
     } else if (type === "bye") {
       const releasedLivePeer = deleteLivePeerIfOwned(livePeers, peerKey, socket);
       if (db && releasedLivePeer) {
-        await deleteAnnouncement(db, network, room, peerId);
-      }
-      if (db && releasedLivePeer) {
-        broadcastPeerList(db, network, room, relayPeerId).catch(() => {});
+        await deferWork(ctx, env, { kind: "peer-left", network, room, peerId, selfRelayUrl });
       }
 
     } else if (RELAY_TYPES.has(type)) {
@@ -1187,48 +1301,18 @@ async function handleClientMessage(
         }
       }
 
-      // If still not delivered locally, use the peer's Kademlia providers.
-      // A route learned during discovery or from the incoming federation hop
-      // is tried first, so offer/answer/ICE does not perform a fresh overlay
-      // walk in each direction. Kademlia remains the authoritative fallback.
-      if (!deliveredLive && selfRelayUrl && env.DB) {
-        ctx.waitUntil((async () => {
-          const startedAt = Date.now();
-          const hint = getPeerRelayHint(network, room, message.to);
-          try {
-            // Bounded: a forward that cannot finish inside the deadline is
-            // queued like an unreachable peer instead of silently vanishing.
-            const deliveredRemote = await Promise.race([
-              forwardFederatedMessage(
-                env,
-                selfRelayUrl,
-                network,
-                room,
-                message,
-                livePeers.size,
-              ),
-              new Promise((resolve) => setTimeout(() => resolve(false), FEDERATED_FORWARD_DEADLINE_MS)),
-            ]);
-            debugNote({ op: 'forward', type, from: peerId.slice(0, 8), to: message.to.slice(0, 8), hint, delivered: deliveredRemote, ms: Date.now() - startedAt });
-            if (deliveredRemote) {
-              console.log(`[FED] Routed ${type} to peer relay for ${message.to}`);
-              return;
-            }
-            await insertRelayMessage(db, message);
-            console.log(`[RELAY] Peer ${message.to} unavailable across federation, queued ${type} in DB`);
-          } catch (error) {
-            debugNote({ op: 'forward', type, from: peerId.slice(0, 8), to: message.to.slice(0, 8), hint, error: String(error?.stack || error?.message || error).slice(0, 400), ms: Date.now() - startedAt });
-            console.error(`[FED] forwarding ${type} to ${message.to} failed: ${error?.message}`);
-          }
-        })());
-      } else if (!deliveredLive && db) {
-        await insertRelayMessage(db, message);
-      } else if (!deliveredLive) {
-        console.warn(`[RELAY] Could not deliver ${type} to ${message.to}; persistence unavailable`);
+      // Not here: route it through the peer's relay. A learned route is tried
+      // first, Kademlia is the fallback, and an unreachable peer's message is
+      // queued — all on the coordinator's alarm, off this socket's request.
+      if (!deliveredLive) {
+        await deferWork(ctx, env, { kind: "forward", network, room, peerId, selfRelayUrl, message });
       }
     }
 
-    ctx.waitUntil(cleanupExpired(db).catch(() => {}));
+    if (db && Date.now() - lastCleanupAt > CLEANUP_INTERVAL_MS) {
+      lastCleanupAt = Date.now();
+      await deferWork(ctx, env, { kind: "cleanup", network, room, peerId, selfRelayUrl });
+    }
     return { peerKey, network, room, peerId };
   } catch (err) {
     console.error("[Handler] Error:", err?.message || String(err));
