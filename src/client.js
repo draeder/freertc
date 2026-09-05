@@ -20,7 +20,9 @@ const DATA_PING_RETRY_MS = 5000
 // flush event and re-subscribes each on every flush, so a few thousand
 // sends stuck behind a peer whose window closed cost the whole process
 // (the watcher sat at a full core doing nothing but that bookkeeping).
-const DATA_MAX_BUFFERED_BYTES = 4 * 1024 * 1024
+// One megabyte: the cost is per pending send, so the cap has to bound the
+// count, and a few hundred pending frames is already visible in a profile.
+const DATA_MAX_BUFFERED_BYTES = 1024 * 1024
 // A backlog that has not shrunk for this long is stalled, not busy.
 const DATA_BACKLOG_STALL_MS = 20000
 // A pong is proof of a working outbound direction — but only a RECENT one.
