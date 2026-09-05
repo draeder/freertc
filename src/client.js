@@ -1389,15 +1389,31 @@ export function createSignalingClient(options = {}) {
           currentRemoteOfferSdp &&
           currentRemoteOfferSdp !== incomingOfferSdp
         ) {
-          // A new SDP is not proof that the current transport is stale. The
-          // other peer may have retried before this side's data-channel `open`
-          // event, or may be performing a normal ICE renegotiation. Closing a
-          // connected/connecting RTCPeerConnection here made both peers start
-          // over repeatedly. Apply the offer to the stable existing connection;
-          // explicit failed/closed states were already replaced above, and the
-          // RTP-extension error path below still performs a fresh retry when a
-          // browser genuinely cannot reuse this connection.
-          log(`[webrtc] applying renewed offer from ${fromPeerId} to existing connection`)
+          const currentUfrag = iceUfragOf(currentRemoteOfferSdp)
+          const channelOpen = entry?.channel?.readyState === 'open'
+          if (!channelOpen && incomingUfrag && currentUfrag && incomingUfrag !== currentUfrag) {
+            // A different ufrag is a different negotiation: the other peer
+            // gave up on the last one and started over with fresh ICE
+            // credentials. Applying that offer to the unfinished connection
+            // as a "renewal" left this side checking with the old password —
+            // every STUN response then failed its integrity check on both
+            // machines, and two watchers on one LAN sat at 'connecting' for
+            // hours. An unfinished connection is replaced; only a connection
+            // with an open channel is renegotiated in place.
+            log(`[webrtc] new negotiation from ${fromPeerId} (ufrag ${currentUfrag} → ${incomingUfrag}); replacing the unfinished connection`)
+            clearOfferRetryTimer(pc)
+            clearAnswerBurst(fromPeerId)
+            pendingCandidates.delete(fromPeerId)
+            try { pc.close() } catch {}
+            mesh.connections.delete(fromPeerId)
+            pc = createPeerConnection(fromPeerId, resolveIceServers(entry?.iceServers), sendRelay)
+            entry = mesh.connections.get(fromPeerId)
+          } else {
+            // A new SDP with the same credentials, or one arriving on a
+            // connection whose channel is already open, is a normal ICE
+            // renegotiation on the existing connection.
+            log(`[webrtc] applying renewed offer from ${fromPeerId} to existing connection`)
+          }
         }
 
         if (pc.signalingState === 'closed') return
