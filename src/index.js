@@ -327,8 +327,13 @@ async function handleRelayForward(request, env) {
   if (live) {
     try {
       live.socket.send(JSON.stringify(message));
+      console.log(`[FED-IN] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} from ${viaRelayUrl}: delivered to live socket`);
       return jsonResponse({ ok: true, delivered: true }, 200);
-    } catch {}
+    } catch (error) {
+      console.log(`[FED-IN] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} from ${viaRelayUrl}: live socket send failed (${error?.message})`);
+    }
+  } else {
+    console.log(`[FED-IN] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} from ${viaRelayUrl}: not live here (${livePeers.size} live); queued`);
   }
   await insertRelayMessage(env.DB, message);
   return jsonResponse({ ok: true, delivered: false, queued: true }, 202);
@@ -511,17 +516,23 @@ async function forwardToRelayResult(relayUrl, message, selfRelayId) {
     // Offer/answer/ICE bursts can otherwise exhaust that limit and deadlock
     // the WebSocket request that is forwarding the negotiation.
     const bytes = await response.arrayBuffer();
-    if (!response.ok) return "failed";
-    try {
-      const result = JSON.parse(new TextDecoder().decode(bytes));
-      if (result?.delivered === true) return "delivered";
-      if (result?.queued === true) return "queued";
-      if (result?.delivered === false) return "failed";
-    } catch {
-      // Legacy relay versions returned an empty success response.
+    let outcome = "delivered";
+    if (!response.ok) {
+      outcome = "failed";
+    } else {
+      try {
+        const result = JSON.parse(new TextDecoder().decode(bytes));
+        if (result?.delivered === true) outcome = "delivered";
+        else if (result?.queued === true) outcome = "queued";
+        else if (result?.delivered === false) outcome = "failed";
+      } catch {
+        // Legacy relay versions returned an empty success response.
+      }
     }
-    return "delivered";
-  } catch {
+    console.log(`[FED] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} via ${relayUrl}: ${outcome} (${response.status})`);
+    return outcome;
+  } catch (error) {
+    console.log(`[FED] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} via ${relayUrl}: fetch failed (${error?.message})`);
     return "failed";
   }
 }
