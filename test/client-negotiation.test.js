@@ -692,10 +692,10 @@ test('a silent data channel is closed after one unanswered ping deadline', async
     // The proving ping goes out AT open — a channel is unproven until its
     // first pong, so the deadline arms immediately, not a tick later.
     assert.equal(channel.sent.filter((message) => message.type === 'ping').length, 1)
-    now = 4_999
-    t.mock.timers.tick(3_999)
+    now = 20_999
+    t.mock.timers.tick(19_999)
     assert.equal(channel.readyState, 'open')
-    now = 5_000
+    now = 21_000
     t.mock.timers.tick(1)
     assert.equal(channel.readyState, 'closed')
     assert.equal(peerConnections[0].connectionState, 'closed')

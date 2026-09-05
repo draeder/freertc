@@ -3,7 +3,12 @@ const BACKOFF_BASE_MS = 1000
 const BACKOFF_MAX_MS = 30000
 const BACKOFF_FACTOR = 1.5
 const DATA_PING_MS = 1000
-const DATA_PONG_TIMEOUT_MS = 4000
+// Twenty seconds, not four. A pong can sit behind the peer's own outbound
+// burst — the GitPigeon index sync moves megabytes in both directions the
+// moment two peers meet, and werift's SCTP is slow — and four seconds
+// executed healthy channels on every connection. A dead channel is still
+// caught; it merely takes twenty seconds instead of four.
+const DATA_PONG_TIMEOUT_MS = 20000
 // A pong is proof of a working outbound direction — but only a RECENT one.
 // After a machine suspends and resumes, every frozen channel still holds its
 // pre-suspend pong and every state field still claims health, so an
