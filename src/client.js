@@ -14,6 +14,15 @@ const DATA_PONG_TIMEOUT_MS = 20000
 // a peer whose channel has not flipped to 'open' yet — must not be a death
 // sentence twenty seconds later; the retry keeps the original clock.
 const DATA_PING_RETRY_MS = 5000
+// A send buffer that stops draining is a dead receiver, however the channel
+// reports itself. Beyond this many queued bytes nothing more is handed to
+// the transport: werift keeps every pending send subscribed to its SCTP
+// flush event and re-subscribes each on every flush, so a few thousand
+// sends stuck behind a peer whose window closed cost the whole process
+// (the watcher sat at a full core doing nothing but that bookkeeping).
+const DATA_MAX_BUFFERED_BYTES = 4 * 1024 * 1024
+// A backlog that has not shrunk for this long is stalled, not busy.
+const DATA_BACKLOG_STALL_MS = 20000
 // A pong is proof of a working outbound direction — but only a RECENT one.
 // After a machine suspends and resumes, every frozen channel still holds its
 // pre-suspend pong and every state field still claims health, so an
@@ -609,7 +618,20 @@ export function createSignalingClient(options = {}) {
     // connects; over werift's SCTP that takes longer than the pong deadline,
     // the ping queued behind it, and the keepalive executed a channel that
     // was working flat out — on every peer, on every connection.
-    const backlogged = () => Number(channel.bufferedAmount ?? 0) > 0
+    // Backlogged means BUSY, not merely non-empty: the buffer has to be
+    // shrinking. A buffer that holds or grows for the stall window is a
+    // receiver that stopped reading, and the keepalive verdict must run.
+    let lastBufferedAmount = 0
+    let lastBufferedProgressAt = Date.now()
+    const backlogged = () => {
+      const buffered = Number(channel.bufferedAmount ?? 0)
+      const now = Date.now()
+      if (buffered < lastBufferedAmount) lastBufferedProgressAt = now
+      lastBufferedAmount = buffered
+      return buffered > 0 && now - lastBufferedProgressAt < DATA_BACKLOG_STALL_MS
+    }
+    const backlogStalled = () => Number(channel.bufferedAmount ?? 0) > 0
+      && Date.now() - lastBufferedProgressAt >= DATA_BACKLOG_STALL_MS
     const inboundAlive = () => Date.now() - lastInboundAt < DATA_PONG_TIMEOUT_MS
 
     // The moment the tab becomes visible, PROBE the channel instead of
@@ -792,7 +814,12 @@ export function createSignalingClient(options = {}) {
 
         // Only consider a timeout if we sent a ping that hasn't been answered.
         const pingInFlight = lastPingSentAt > lastPongAt
-        if (pingInFlight && backlogged()) {
+        const busy = backlogged()
+        if (!busy && backlogStalled()) {
+          closeBrokenChannel('data channel backlog stalled')
+          return
+        }
+        if (pingInFlight && busy) {
           // Still in our buffer: the clock on this ping has not started.
           lastPingSentAt = Date.now()
           if (currentEntry.lastPingSentAt > currentEntry.lastPongAt) currentEntry.lastPingSentAt = lastPingSentAt
@@ -2170,6 +2197,13 @@ export function createSignalingClient(options = {}) {
       }
       if (target.dormantAt && Date.now() - target.dormantAt < DATA_DORMANT_MAX_MS) {
         const error = new Error('Peer is dormant (hidden tab)')
+        error.transient = true
+        throw error
+      }
+      if (Number(target.channel.bufferedAmount ?? 0) > DATA_MAX_BUFFERED_BYTES) {
+        // Backpressure. The peer is not reading fast enough (or at all); the
+        // keepalive decides which. Nothing more goes into the transport.
+        const error = new Error('WebRTC channel send buffer is full')
         error.transient = true
         throw error
       }
