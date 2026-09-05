@@ -42,7 +42,11 @@ const DATA_DORMANT_MAX_MS = 30 * 60000
 const transportReady = (pc) => pc?.connectionState === undefined || pc.connectionState === 'connected'
 let dataChunkCounter = 0
 const SIGNAL_PING_MS = 1000
-const SIGNAL_PONG_TIMEOUT_MS = 4000
+// Twenty seconds, matching the data-channel deadline. A watcher pushing a
+// multi-megabyte index sync over werift stalls its own event loop for a few
+// seconds; a four-second pong deadline read that as a dead relay, dropped
+// the socket, re-registered, and every peer was released in the process.
+const SIGNAL_PONG_TIMEOUT_MS = 20000
 // A machine that sleeps freezes this process with it. Browsers announce the
 // thaw (pageshow, resume); a Node peer — the GitPigeon watcher — has no such
 // event and used to trust a signaling socket and ICE candidates that died

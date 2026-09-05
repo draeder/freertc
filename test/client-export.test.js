@@ -493,11 +493,15 @@ test("a silent signaling socket is detected without continually resetting its pi
     now = 1_000;
     t.mock.timers.tick(1_000);
     assert.equal(sockets[0].sent.filter((message) => message.type === "ping").length, 1);
-    now = 4_999;
-    t.mock.timers.tick(3_999);
+    // A second at a time: one large jump reads as a machine sleep to the
+    // suspend watch, which is its own verdict.
+    for (let second = 2; second <= 20; second += 1) {
+      now = second * 1_000;
+      t.mock.timers.tick(1_000);
+    }
     assert.equal(sockets[0].closeCode, null);
-    now = 5_000;
-    t.mock.timers.tick(1);
+    now = 21_000;
+    t.mock.timers.tick(1_000);
     assert.equal(sockets[0].closeCode, 4000);
   } finally {
     client?.disconnect();
