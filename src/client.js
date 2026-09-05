@@ -9,6 +9,11 @@ const DATA_PING_MS = 1000
 // executed healthy channels on every connection. A dead channel is still
 // caught; it merely takes twenty seconds instead of four.
 const DATA_PONG_TIMEOUT_MS = 20000
+// A ping is re-sent this often while it stays unanswered. One outstanding
+// ping is the rule, but a single lost frame — the arming ping werift hands to
+// a peer whose channel has not flipped to 'open' yet — must not be a death
+// sentence twenty seconds later; the retry keeps the original clock.
+const DATA_PING_RETRY_MS = 5000
 // A pong is proof of a working outbound direction — but only a RECENT one.
 // After a machine suspends and resumes, every frozen channel still holds its
 // pre-suspend pong and every state field still claims health, so an
@@ -587,6 +592,13 @@ export function createSignalingClient(options = {}) {
     let lastPongAt    = Date.now()
     let lastPingSentAt = 0   // 0 = no ping in flight
     let lastInboundAt = Date.now()
+    let lastPingRetryAt = 0
+    // werift delivers a message on a channel it still reports as
+    // 'connecting': the remote's arming ping lands a beat before our 'open'
+    // fires. Its pong is owed, not skipped — it is the only proof the remote
+    // gets that this direction works, and it sends no second ping while the
+    // first is outstanding.
+    let pongOwed = false
     // A ping cannot be late while it is still sitting in our own send
     // buffer, and a channel that keeps delivering messages is not dead. The
     // watcher's index node pushes megabytes of storage the moment a browser
@@ -716,6 +728,10 @@ export function createSignalingClient(options = {}) {
           lastPingSentAt = 0
         }
       }
+      if (pongOwed) {
+        pongOwed = false
+        try { channel.send(JSON.stringify({ type: 'pong', ts: Date.now() })) } catch { /* the keepalive verdict handles it */ }
+      }
       // RTCPeerConnection "connected" may precede data-channel readiness.
       // Emit again at the exact usable boundary so callers can send immediately.
       onConnectionStateChangeCb?.({ peerId: remotePeerId, state: 'connected', ts: Date.now() })
@@ -784,8 +800,18 @@ export function createSignalingClient(options = {}) {
         }
 
         // Keep one outstanding ping. Replacing its timestamp on every tick
-        // made a silent channel impossible to time out.
-        if (pingInFlight) return
+        // made a silent channel impossible to time out — so the clock stays,
+        // but the frame itself is re-sent every few seconds: a lost ping is
+        // recovered within one retry instead of executing a live channel.
+        if (pingInFlight) {
+          const now = Date.now()
+          if (now - lastPingSentAt >= DATA_PING_RETRY_MS && now - lastPingRetryAt >= DATA_PING_RETRY_MS
+            && (pc.connectionState === undefined || pc.connectionState === 'connected')) {
+            lastPingRetryAt = now
+            try { channel.send(JSON.stringify({ type: 'ping', ts: now })) } catch { /* verdict below */ }
+          }
+          return
+        }
 
         // A transient connection state (connecting, disconnected) refuses
         // application sends already; a ping into it fails the same way —
@@ -922,6 +948,7 @@ export function createSignalingClient(options = {}) {
         // one-way-dead channel and executed a healthy transport four
         // seconds later ("data channel outbound timeout"). Only the
         // channel's own state gates the reply; a failed send is caught.
+        if (channel.readyState === 'connecting') { pongOwed = true; return }
         if (channel.readyState !== 'open') return
         try {
           channel.send(JSON.stringify({ type: 'pong', ts: Date.now() }))
