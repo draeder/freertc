@@ -685,18 +685,28 @@ test('a silent data channel is closed after one unanswered ping deadline', async
     now = 1_000
     // A data channel only opens on a connected transport, and every send is
     // gated on that — the mock must model it or pings are (rightly) held.
+    // The offer was answered too: an unanswered offer exhausts its retries
+    // and closes the connection long before a twenty-second pong deadline,
+    // which is a different verdict than the one this test is about.
     peerConnections[0].connectionState = 'connected'
+    peerConnections[0].remoteDescription = { type: 'answer', sdp: 'answer:remote' }
+    peerConnections[0].signalingState = 'stable'
     channel.readyState = 'open'
     channel.onopen()
 
     // The proving ping goes out AT open — a channel is unproven until its
     // first pong, so the deadline arms immediately, not a tick later.
     assert.equal(channel.sent.filter((message) => message.type === 'ping').length, 1)
-    now = 20_999
-    t.mock.timers.tick(19_999)
+    // The clock advances a second at a time: a single twenty-second jump
+    // reads as a machine sleep to the suspend watch, which is its own
+    // verdict and tears the transport down for its own reasons.
+    for (let second = 1; second <= 19; second += 1) {
+      now = 1_000 + second * 1_000
+      t.mock.timers.tick(1_000)
+    }
     assert.equal(channel.readyState, 'open')
     now = 21_000
-    t.mock.timers.tick(1)
+    t.mock.timers.tick(1_000)
     assert.equal(channel.readyState, 'closed')
     assert.equal(peerConnections[0].connectionState, 'closed')
   } finally {
