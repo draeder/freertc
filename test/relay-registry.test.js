@@ -166,3 +166,21 @@ test('a negotiation forward goes stale after its retry budget, and cheap waiting
   ]).map(([, task]) => task.kind);
   assert.deepEqual(ordered, ['discover', 'announce', 'forward', 'forward', 'deliver-queued']);
 });
+
+test('a discover written today sorts ahead of any backlog, including keys an older build left behind', async () => {
+  const { deferredTaskEnqueuedAt, deferredTaskIsStale, deferredTaskKey } = await import('../src/index.js');
+  const now = 1_700_000_000_000;
+  const oldStyle = (age) => `task:${String(now - age).padStart(15, '0')}:000001`;
+  const discover = deferredTaskKey({ kind: 'discover' }, now, 7);
+  const forward = deferredTaskKey({ kind: 'forward', message: { type: 'offer' } }, now - 30_000, 3);
+  const backlog = oldStyle(600_000);
+  const listed = [backlog, forward, discover].sort();
+  assert.deepEqual(listed, [discover, forward, backlog], 'priority first, then the old timestamp-only keys');
+  assert.equal(deferredTaskEnqueuedAt(discover), now);
+  assert.equal(deferredTaskEnqueuedAt(forward), now - 30_000);
+  assert.equal(deferredTaskEnqueuedAt(backlog), now - 600_000);
+  assert.equal(deferredTaskEnqueuedAt('other:1'), null);
+  assert.equal(deferredTaskIsStale(forward, { kind: 'forward', message: { type: 'offer' } }, now), true);
+  assert.equal(deferredTaskIsStale(backlog, { kind: 'deliver-queued' }, now), true, 'old-build keys are read the same way');
+  assert.equal(deferredTaskIsStale(discover, { kind: 'discover' }, now), false);
+});
