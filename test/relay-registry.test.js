@@ -167,7 +167,7 @@ test('a negotiation forward goes stale after its retry budget, and forwards run 
   assert.deepEqual(ordered, ['forward', 'forward', 'discover', 'announce', 'deliver-queued']);
 });
 
-test('a discover written today sorts ahead of any backlog, including keys an older build left behind', async () => {
+test('a forward or discover written today sorts ahead of any backlog, including keys an older build left behind', async () => {
   const { deferredTaskEnqueuedAt, deferredTaskIsStale, deferredTaskKey } = await import('../src/index.js');
   const now = 1_700_000_000_000;
   const oldStyle = (age) => `task:${String(now - age).padStart(15, '0')}:000001`;
@@ -175,7 +175,7 @@ test('a discover written today sorts ahead of any backlog, including keys an old
   const forward = deferredTaskKey({ kind: 'forward', message: { type: 'offer' } }, now - 30_000, 3);
   const backlog = oldStyle(600_000);
   const listed = [backlog, forward, discover].sort();
-  assert.deepEqual(listed, [discover, forward, backlog], 'priority first, then the old timestamp-only keys');
+  assert.deepEqual(listed, [forward, discover, backlog], 'priority first, then the old timestamp-only keys');
   assert.equal(deferredTaskEnqueuedAt(discover), now);
   assert.equal(deferredTaskEnqueuedAt(forward), now - 30_000);
   assert.equal(deferredTaskEnqueuedAt(backlog), now - 600_000);
