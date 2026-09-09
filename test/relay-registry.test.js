@@ -148,3 +148,21 @@ test('a stale queue drain or heartbeat is dropped by the alarm; work someone wai
   assert.equal(deferredTaskIsStale(key(120_000), { kind: 'forward' }, now), false);
   assert.equal(deferredTaskIsStale('task:garbage', { kind: 'deliver-queued' }, now), false, 'an unreadable key is left to run');
 });
+
+test('a negotiation forward goes stale after its retry budget, and cheap waiting work runs before forwards', async () => {
+  const { deferredTaskIsStale, orderDeferredTasks } = await import('../src/index.js');
+  const now = 1_700_000_000_000;
+  const key = (age) => `task:${String(now - age).padStart(15, '0')}:000001`;
+  assert.equal(deferredTaskIsStale(key(30_000), { kind: 'forward', message: { type: 'offer' } }, now), true);
+  assert.equal(deferredTaskIsStale(key(30_000), { kind: 'forward', message: { type: 'ice_candidate' } }, now), true);
+  assert.equal(deferredTaskIsStale(key(5_000), { kind: 'forward', message: { type: 'offer' } }, now), false);
+  assert.equal(deferredTaskIsStale(key(120_000), { kind: 'forward', message: { type: 'bye' } }, now), false, 'a goodbye is never too late');
+  const ordered = orderDeferredTasks([
+    [key(1), { kind: 'forward', message: { type: 'offer' } }],
+    [key(2), { kind: 'deliver-queued' }],
+    [key(3), { kind: 'discover' }],
+    [key(4), { kind: 'announce', isHeartbeat: false }],
+    [key(5), { kind: 'forward', message: { type: 'answer' } }],
+  ]).map(([, task]) => task.kind);
+  assert.deepEqual(ordered, ['discover', 'announce', 'forward', 'forward', 'deliver-queued']);
+});

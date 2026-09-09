@@ -72,6 +72,13 @@ const DEFERRED_TASK_SCAN_LIMIT = 256;
 // announced again since, or is gone. Running it anyway is what kept a relay
 // with a deep backlog answering nothing for as long as the backlog lasted.
 const DEFERRED_TASK_STALE_MS = 60_000;
+// A negotiation frame waits ten seconds on the wire and its sender retries
+// for sixteen; a forward that has sat in the queue longer than that would
+// only deliver an offer the other side has already given up on.
+const DEFERRED_FORWARD_STALE_MS = 20_000;
+// Cheap tasks that other peers are blocked on run before slow federated
+// forwards, so a burst of cross-relay ICE can never bury a discover.
+const DEFERRED_TASK_PRIORITY = { discover: 0, announce: 1, "peer-left": 1, "relay-list": 2, forward: 3, "deliver-queued": 4 };
 const CLEANUP_INTERVAL_MS = 60_000;
 let deferredTaskSequence = 0;
 let lastCleanupAt = 0;
@@ -116,10 +123,18 @@ async function deferWork(ctx, env, task) {
 // leave, or a forward is always run because something is waiting on it.
 export function deferredTaskIsStale(key, task, now = Date.now()) {
   const kind = task?.kind;
-  if (kind !== "deliver-queued" && !(kind === "announce" && task?.isHeartbeat)) return false;
+  let budget;
+  if (kind === "deliver-queued" || (kind === "announce" && task?.isHeartbeat)) budget = DEFERRED_TASK_STALE_MS;
+  else if (kind === "forward" && NEGOTIATION_TYPES.has(task?.message?.type)) budget = DEFERRED_FORWARD_STALE_MS;
+  else return false;
   const enqueuedAt = Number(String(key ?? "").slice(DEFERRED_TASK_PREFIX.length, DEFERRED_TASK_PREFIX.length + 15));
   if (!Number.isFinite(enqueuedAt) || enqueuedAt <= 0) return false;
-  return now - enqueuedAt > DEFERRED_TASK_STALE_MS;
+  return now - enqueuedAt > budget;
+}
+
+export function orderDeferredTasks(entries) {
+  const rank = (task) => DEFERRED_TASK_PRIORITY[task?.kind] ?? 5;
+  return [...entries].sort((left, right) => rank(left[1]) - rank(right[1]));
 }
 
 async function drainDeferredTasks(state, env) {
@@ -127,15 +142,17 @@ async function drainDeferredTasks(state, env) {
   if (scanned.size === 0) return;
   const now = Date.now();
   const staleKeys = [];
-  const entries = [];
+  const live = [];
   for (const [key, task] of scanned) {
     if (deferredTaskIsStale(key, task, now)) staleKeys.push(key);
-    else if (entries.length < MAX_DEFERRED_TASKS_PER_ALARM) entries.push([key, task]);
+    else live.push([key, task]);
   }
-  if (staleKeys.length > 0) {
-    await state.storage.delete(staleKeys);
-    debugNote({ op: "task-stale-dropped", count: staleKeys.length });
+  // Durable Object storage deletes at most 128 keys per call.
+  for (let index = 0; index < staleKeys.length; index += 128) {
+    await state.storage.delete(staleKeys.slice(index, index + 128));
   }
+  if (staleKeys.length > 0) debugNote({ op: "task-stale-dropped", count: staleKeys.length });
+  const entries = orderDeferredTasks(live).slice(0, MAX_DEFERRED_TASKS_PER_ALARM);
   await Promise.all(entries.map(async ([key, task]) => {
     const startedAt = Date.now();
     try {
