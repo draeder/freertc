@@ -152,6 +152,44 @@ test('an offer to a mesh-reachable peer travels over the mesh, and its answer co
   }
 })
 
+test('a peer that has not yet answered over the mesh gets the relay copy too; after it does, mesh only', async () => {
+  const fakes = installFakes()
+  const meshFrames = []
+  let client
+  try {
+    client = createSignalingClient({
+      peerId: LOCAL,
+      networkId: 'test-network',
+      roomId: 'test-room',
+      signalUrl: 'wss://signal.example/ws',
+      autoConnect: false,
+      signalTransport: (envelope) => { meshFrames.push(envelope); return true },
+    })
+    client.connect()
+    const socket = fakes.sockets[0]
+    socket.open()
+    socket.receive({ type: 'ack', body: { status: 'ok' } })
+
+    // First contact: the peer may be on a build that cannot hear the mesh.
+    await client.initiateConnection(REMOTE)
+    await nextTurn()
+    assert.equal(meshFrames.filter((f) => f.type === 'offer').length, 1, 'offer went over the mesh')
+    assert.equal(socket.sent.filter((f) => f.type === 'offer' && f.to === REMOTE).length, 1, 'and over the relay')
+
+    // The peer answers over the mesh: from now on the relay copy stops.
+    assert.equal(client.injectSignal(meshEnvelope('answer', { sdp: 'v=0\r\na=ice-ufrag:answer\r\n' })), true)
+    await nextTurn()
+    const relayBefore = socket.sent.length
+    client.closePeerConnection(REMOTE, 'test_close')
+    await nextTurn()
+    assert.ok(meshFrames.some((f) => f.type === 'bye'), 'the goodbye went over the mesh')
+    assert.equal(socket.sent.slice(relayBefore).filter((f) => f.to === REMOTE).length, 0, 'nothing more for that peer on the relay')
+  } finally {
+    client?.disconnect()
+    fakes.restore()
+  }
+})
+
 test('the relay carries a frame the mesh cannot route, so nothing is lost while the mesh is thin', async () => {
   const fakes = installFakes()
   let client

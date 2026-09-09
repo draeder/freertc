@@ -486,6 +486,13 @@ export function createSignalingClient(options = {}) {
 
   const loudSignalType = (type) => type === 'offer' || type === 'answer' || type === 'renegotiate'
 
+  // Peers that have proven they hear the mesh: one of their frames arrived
+  // through injectSignal. Until a peer is in this set every frame for it
+  // also goes to the relay, so a peer on a build that ignores mesh-carried
+  // signaling still receives the offer, the answer, and the candidates.
+  // After the first mesh frame from it, the relay copy stops.
+  const meshCapablePeers = new Set()
+
   // The mesh is tried before the relay for every frame addressed to one
   // peer. A peer already reachable through connected neighbours negotiates
   // without any relay in the path, so a relay outage, a partial relay view,
@@ -510,14 +517,17 @@ export function createSignalingClient(options = {}) {
       body,
       ...(NEGOTIATION_TYPES.has(type) ? { ttl_ms: NEGOTIATION_TTL_MS } : {}),
     })
-    if (sendViaMesh(toPeerId, type, envelope)) return
+    const viaMesh = sendViaMesh(toPeerId, type, envelope)
+    if (viaMesh && meshCapablePeers.has(toPeerId)) return
 
     if (!registered) {
-      log('[signal] not registered yet')
+      if (!viaMesh) log('[signal] not registered yet')
       return
     }
     if (loudSignalType(type)) {
-      log(`[signal] sending ${type} to ${toPeerId}`)
+      log(viaMesh
+        ? `[signal] sending ${type} to ${toPeerId} on the relay as well; it has not answered over the mesh yet`
+        : `[signal] sending ${type} to ${toPeerId}`)
     }
 
     send(envelope)
@@ -533,6 +543,7 @@ export function createSignalingClient(options = {}) {
     if (envelope.to !== peerId) return false
     if (envelope.network !== networkId) return false
     if (envelope.session_id !== roomId) return false
+    meshCapablePeers.add(envelope.from)
     handleMessage(envelope)
     return true
   }
