@@ -110,7 +110,7 @@ async function deferWork(ctx, env, task) {
     return;
   }
   deferredTaskSequence = (deferredTaskSequence + 1) % 1_000_000;
-  const key = `${DEFERRED_TASK_PREFIX}${String(Date.now()).padStart(15, "0")}:${String(deferredTaskSequence).padStart(6, "0")}`;
+  const key = deferredTaskKey(task, Date.now(), deferredTaskSequence);
   await ctx.storage.put(key, task);
   if ((await ctx.storage.getAlarm()) === null) {
     await ctx.storage.setAlarm(Date.now());
@@ -121,14 +121,35 @@ async function deferWork(ctx, env, task) {
 // age without reading the task. A drain for a peer's queued frames and a
 // heartbeat republish are only useful while fresh; a discover, a join, a
 // leave, or a forward is always run because something is waiting on it.
+// Storage lists keys in order, so the key decides what an alarm sees first.
+// The priority digit comes before the enqueue time, and the "!" that leads
+// it sorts before any digit, so every key written by this build sorts ahead
+// of the timestamp-only keys an earlier build left behind. A discover is
+// therefore always in the first window no matter how deep the backlog is.
+const DEFERRED_TASK_PRIORITY_MARK = "!";
+
+export function deferredTaskKey(task, now = Date.now(), sequence = 0) {
+  const priority = DEFERRED_TASK_PRIORITY[task?.kind] ?? 5;
+  return `${DEFERRED_TASK_PREFIX}${DEFERRED_TASK_PRIORITY_MARK}${priority}:${String(now).padStart(15, "0")}:${String(sequence).padStart(6, "0")}`;
+}
+
+export function deferredTaskEnqueuedAt(key) {
+  const text = String(key ?? "");
+  if (!text.startsWith(DEFERRED_TASK_PREFIX)) return null;
+  let rest = text.slice(DEFERRED_TASK_PREFIX.length);
+  if (rest.startsWith(DEFERRED_TASK_PRIORITY_MARK)) rest = rest.slice(rest.indexOf(":") + 1);
+  const enqueuedAt = Number(rest.slice(0, 15));
+  return Number.isFinite(enqueuedAt) && enqueuedAt > 0 ? enqueuedAt : null;
+}
+
 export function deferredTaskIsStale(key, task, now = Date.now()) {
   const kind = task?.kind;
   let budget;
   if (kind === "deliver-queued" || (kind === "announce" && task?.isHeartbeat)) budget = DEFERRED_TASK_STALE_MS;
   else if (kind === "forward" && NEGOTIATION_TYPES.has(task?.message?.type)) budget = DEFERRED_FORWARD_STALE_MS;
   else return false;
-  const enqueuedAt = Number(String(key ?? "").slice(DEFERRED_TASK_PREFIX.length, DEFERRED_TASK_PREFIX.length + 15));
-  if (!Number.isFinite(enqueuedAt) || enqueuedAt <= 0) return false;
+  const enqueuedAt = deferredTaskEnqueuedAt(key);
+  if (enqueuedAt === null) return false;
   return now - enqueuedAt > budget;
 }
 
