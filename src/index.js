@@ -2,6 +2,7 @@ import {
   handleKademliaRequest,
   heartbeatKademlia,
   isKademliaEnabled,
+  listKnownRelays,
   lookupPeerProviders,
   lookupScopeProviders,
   publishPeerProviderRecords,
@@ -72,6 +73,19 @@ function canDefer(ctx) {
   return Boolean(ctx?.storage?.put && ctx?.storage?.setAlarm && ctx?.storage?.getAlarm);
 }
 
+// Whether a ping has to drain the D1 relay queue for its sender. Under the
+// coordinator every live socket is in this one object, so a frame for a
+// live peer is delivered on arrival and only a frame for an absent peer is
+// ever queued; that peer drains the queue when it announces again. Queuing
+// a drain task on every ping from every peer fed the alarm queue faster
+// than an alarm could empty it, and the discover replies waiting in the
+// same queue starved: the busiest relays answered pings in a quarter of a
+// second and discovers never. Without the coordinator, sockets can live in
+// different isolates and the ping drain remains the delivery path.
+export function pingDrainsQueuedMessages(ctx) {
+  return !canDefer(ctx);
+}
+
 async function deferWork(ctx, env, task) {
   if (!canDefer(ctx)) {
     // No coordinator (legacy single-isolate mode): run it here as before.
@@ -113,6 +127,7 @@ async function runDeferredTask(env, task) {
   const liveSocket = () => livePeers.get(peerScopeKey(network, room, peerId))?.socket ?? null;
 
   if (kind === "announce") {
+    let federatedPeers = null;
     if (db) {
       await upsertAnnouncement(db, task.message);
       const socket = liveSocket();
@@ -125,7 +140,7 @@ async function runDeferredTask(env, task) {
         // Query the established overlay immediately while publishing this
         // peer's provider records in parallel. Discovery must not sit behind
         // the publication round trip for a peer that is already isolated.
-        await discoverJoiningPeer({
+        federatedPeers = await discoverJoiningPeer({
           discover: (scopeProviders) => findFederatedPeers(env, selfRelayUrl, network, room, peerId, livePeers.size, scopeProviders),
           publish: () => publishPeerProviderRecords(env, selfRelayUrl, network, room, peerId, { connections: livePeers.size, returnScopeProviders: true }),
           send: (peers) => {
@@ -140,7 +155,8 @@ async function runDeferredTask(env, task) {
     // heartbeat re-announce: no topology change occurred.
     if (!task.isHeartbeat && db) {
       console.log(`[NET] Broadcasting peer_list for network=${network} room=${room} after new announce from ${peerId}`);
-      await broadcastPeerList(db, network, room, relayPeerId).catch((err) => console.error(`[Broadcast error]`, err?.message));
+      await broadcastPeerList(env, selfRelayUrl, network, room, relayPeerId, { federatedPeers })
+        .catch((err) => console.error(`[Broadcast error]`, err?.message));
     }
     return;
   }
@@ -174,7 +190,7 @@ async function runDeferredTask(env, task) {
   if (kind === "peer-left") {
     if (!db) return;
     await deleteAnnouncement(db, network, room, peerId);
-    await broadcastPeerList(db, network, room, relayPeerId).catch(() => {});
+    await broadcastPeerList(env, selfRelayUrl, network, room, relayPeerId).catch(() => {});
     return;
   }
 
@@ -388,7 +404,7 @@ export default {
     // Federation: relay registry endpoints (any worker can serve these from its own D1)
     if (url.pathname === "/api/v1/relays") {
       if (request.method === "GET") {
-        return handleListRelays(env);
+        return handleListRelays(env, selfRelayUrl);
       }
       if (request.method === "POST") {
         return handleRegisterRelay(request, env);
@@ -493,10 +509,32 @@ function jsonResponse(body, status = 200) {
 
 // ===================== Federation =====================
 
-async function handleListRelays(env) {
+async function handleListRelays(env, selfRelayUrl = null) {
   if (!env.DB) return jsonResponse({ ok: false, error: "No database" }, 503);
-  const relays = await listRelays(env.DB);
+  const relays = await listFederatedRelays(env, selfRelayUrl);
   return jsonResponse({ ok: true, relays });
+}
+
+// The registry a client bootstraps from is every relay this one knows: the
+// legacy self-registrations in psp_relays plus every relay verified through
+// the Kademlia overlay, with this relay itself first. Before this, a relay
+// with signing keys skipped the legacy registration entirely and answered
+// with an empty list, so clients ranking relays by distance only ever saw
+// the static defaults and every newly deployed relay stayed invisible.
+async function listFederatedRelays(env, selfRelayUrl = null) {
+  const merged = new Map();
+  const add = (relay) => {
+    const relayUrl = normalizeRelayUrl(relay?.url);
+    if (!relayUrl) return;
+    const previous = merged.get(relayUrl) || {};
+    merged.set(relayUrl, { ...previous, ...relay, url: relayUrl, name: relay.name ?? previous.name ?? null });
+  };
+  if (selfRelayUrl) add({ url: selfRelayUrl, name: env.RELAY_NAME || relayHostname(selfRelayUrl) });
+  if (isKademliaEnabled(env) && selfRelayUrl) {
+    for (const relay of await listKnownRelays(env, selfRelayUrl, { connections: livePeers.size }).catch(() => [])) add(relay);
+  }
+  for (const relay of await listRelays(env.DB).catch(() => [])) add(relay);
+  return Array.from(merged.values());
 }
 
 async function handleRegisterRelay(request, env) {
@@ -902,9 +940,18 @@ function createRegistrationAck(message, relayPeerId = "bootstrap:local") {
 }
 
 // Broadcast only to peers in the same Network + Room scope.
-async function broadcastPeerList(db, network, room, relayPeerId) {
+// The list pushed to every subscriber after a join or a leave is the same
+// federated view a discover reply carries. It used to be this relay's own
+// rows alone, and a client that treats every peer_list as the whole room
+// dropped its dials to every peer registered elsewhere each time one landed.
+async function broadcastPeerList(env, selfRelayUrl, network, room, relayPeerId, {
+  federatedPeers = null,
+  subscribers = networkSubscribers,
+} = {}) {
+  const db = env?.DB;
+  if (!db) return;
   const storageScope = scopeKey(network, room);
-  const sockets = networkSubscribers.get(storageScope);
+  const sockets = subscribers.get(storageScope);
   if (!sockets || sockets.size === 0) return;
 
   const now = Date.now();
@@ -916,11 +963,16 @@ async function broadcastPeerList(db, network, room, relayPeerId) {
     LIMIT ?3
   `).bind(storageScope, now, MAX_BATCH).all();
 
-  const peers = (result.results || []).map(row => ({
+  const localPeers = (result.results || []).map(row => ({
     peer_id: row.peer_id,
     session_id: row.session_id,
     timestamp: row.updated_at_ms
   }));
+  let remotePeers = Array.isArray(federatedPeers) ? federatedPeers : null;
+  if (remotePeers === null && selfRelayUrl && isKademliaEnabled(env)) {
+    remotePeers = await findFederatedPeers(env, selfRelayUrl, network, room, "", livePeers.size).catch(() => []);
+  }
+  const peers = mergeDiscoveredPeers(localPeers, remotePeers ?? []);
   for (const socket of sockets) {
     try {
       sendPeerList(socket, network, room, peers, null, relayPeerId);
@@ -1272,7 +1324,7 @@ async function handleClientMessage(
         message_id: crypto.randomUUID(), timestamp: Date.now(),
         ttl_ms: DEFAULT_TTL_MS, body: {}
       }));
-      if (db) {
+      if (db && pingDrainsQueuedMessages(ctx)) {
         await deferWork(ctx, env, { kind: "deliver-queued", network, room, peerId, selfRelayUrl });
       }
 
@@ -1334,8 +1386,10 @@ function validEnvelope(msg) {
 }
 
 export {
+  broadcastPeerList,
   createRegistrationAck,
   discoverJoiningPeer,
+  listFederatedRelays,
   normalizeRoom,
   peerScopeKey,
   resolveRelayPeerId,

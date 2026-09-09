@@ -187,10 +187,23 @@ async function upsertNodeRecord(context, record) {
   `).bind(index, DEFAULT_K_BUCKET_SIZE).run();
 }
 
+// A record read back from the table carries the row's last_seen_ms beside
+// the signed fields. That column is bookkeeping, not part of what the relay
+// signed, so it is dropped before the signature is checked. Relays already
+// deployed still serve their contacts with it attached; without this a new
+// relay rejected every second-hand contact those relays offered and only
+// ever knew the relays it had spoken to itself.
+function signedNodeRecord(record) {
+  if (!record || typeof record !== 'object') return record;
+  const { last_seen_ms: _lastSeen, ...signed } = record;
+  return signed;
+}
+
 async function acceptNodeRecord(context, record) {
-  const valid = await verifySignedRelayRecord(record, { allowedKinds: new Set([RELAY_NODE_RECORD_KIND]) });
+  const signed = signedNodeRecord(record);
+  const valid = await verifySignedRelayRecord(signed, { allowedKinds: new Set([RELAY_NODE_RECORD_KIND]) });
   if (!valid) return false;
-  await upsertNodeRecord(context, record);
+  await upsertNodeRecord(context, signed);
   return true;
 }
 
@@ -281,6 +294,9 @@ async function acceptLookupResponse(context, response, targetId, records, knownN
   const uniqueNodes = Array.from(new Map(
     [response.node, ...responseNodes]
       .filter((node) => typeof node?.node_id === 'string')
+      // Another relay's table holds this relay too; a lookup never adds
+      // itself to its own shortlist.
+      .filter((node) => node.node_id !== context.identity.nodeId)
       .filter((node) => !knownNodeIds?.has(node.node_id))
       .map((node) => [node.node_id, node]),
   ).values());
@@ -351,8 +367,24 @@ async function iterativeLookup(context, targetId, wantRecords = false) {
   };
 }
 
+// Every relay this one has ever verified is a bootstrap from then on, not
+// only the configured hub. A relay that learned its neighbours through the
+// hub keeps joining through them when the hub is unreachable, and a relay
+// that only ever heard of others through a peer's lookup response still has
+// somewhere to join. The configured urls always stay in the set; the learned
+// ones are bounded to the closest bucket so a large table is not queried whole.
+async function bootstrapUrlsFor(context) {
+  const urls = new Set(configuredBootstrapUrls(context.env));
+  const known = await listActiveNodeRecords(context);
+  for (const node of selectClosestNodes(known, context.identity.nodeId, DEFAULT_K_BUCKET_SIZE)) {
+    if (typeof node.url === 'string' && node.url) urls.add(node.url);
+  }
+  urls.delete(context.selfUrl);
+  return Array.from(urls);
+}
+
 async function joinBootstrap(context) {
-  const bootstrapUrls = configuredBootstrapUrls(context.env).filter((url) => url !== context.selfUrl);
+  const bootstrapUrls = await bootstrapUrlsFor(context);
   const responses = await Promise.all(bootstrapUrls.map((url) => postRpc(url, '/api/v1/kad/find', {
     target: context.identity.nodeId,
     want_records: false,
@@ -414,6 +446,30 @@ async function replicateProviderRecord(context, record, wantRecords = false) {
       record,
     })));
   return lookup;
+}
+
+/**
+ * Every relay in the routing table, as a client-facing bootstrap list. A
+ * client that reaches any one relay can learn every relay that one has
+ * verified, so no relay is a private detour and the hub is not the only
+ * place a peer can start from.
+ */
+export async function listKnownRelays(env, selfUrl, options = {}) {
+  const context = await overlayContext(env, selfUrl, options);
+  if (!context) return [];
+  const known = await listActiveNodeRecords(context);
+  const relays = [];
+  for (const node of [context.nodeRecord, ...known]) {
+    if (typeof node?.url !== 'string' || !node.url) continue;
+    relays.push({
+      url: node.url,
+      name: node.name ?? null,
+      node_id: node.node_id,
+      connections: Number(node.connections || 0),
+      capacity: Number(node.capacity || 0),
+    });
+  }
+  return relays;
 }
 
 export async function heartbeatKademlia(env, selfUrl, options = {}) {
@@ -551,7 +607,8 @@ export async function handleKademliaRequest(request, env, options = {}) {
   if (path === '/api/v1/kad/find') {
     if (!isNodeId(body.target)) return jsonResponse({ ok: false, error: 'Invalid target' }, 400);
     const localNodes = await listActiveNodeRecords(context);
-    const nodes = selectClosestNodes([...localNodes, context.nodeRecord], body.target, DEFAULT_K_BUCKET_SIZE);
+    const nodes = selectClosestNodes([...localNodes, context.nodeRecord], body.target, DEFAULT_K_BUCKET_SIZE)
+      .map(signedNodeRecord);
     const records = body.want_records ? await findLocalProviderRecords(context, body.target) : [];
     return jsonResponse({ ok: true, node: context.nodeRecord, nodes, records });
   }

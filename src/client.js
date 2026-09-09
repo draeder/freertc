@@ -92,6 +92,9 @@ const OFFER_RETRY_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000, 8000]
 // rest unread.
 const NEGOTIATION_TTL_MS = 10000
 const NEGOTIATION_TYPES = new Set(['offer', 'answer', 'ice_candidate', 'ice_end', 'renegotiate'])
+// Frames addressed to one peer that can travel over an established mesh
+// instead of the relay: everything a negotiation needs, plus the goodbye.
+const MESH_SIGNAL_TYPES = new Set(['offer', 'answer', 'ice_candidate', 'ice_end', 'renegotiate', 'bye'])
 const ANSWER_BURST_COOLDOWN_MS = 3000
 const ANSWER_BURST_DELAYS_MS = [200, 800, 2000]
 const SDP_DEDUP_WINDOW_MS = 15000
@@ -209,6 +212,11 @@ export function createSignalingClient(options = {}) {
     onConnectionStateChange,
     onStatusChange,
     onDataMessage,
+    // Optional first-choice path for addressed signaling frames. Called with
+    // the complete PSP envelope; returning true means the mesh took it and
+    // the relay is not used for that frame. Anything else falls back to the
+    // relay socket exactly as before.
+    signalTransport = null,
   } = options
 
   const roomId = configuredRoomId || legacyRoomId || networkId
@@ -476,21 +484,57 @@ export function createSignalingClient(options = {}) {
     }
   }
 
-  async function relaySignal(toPeerId, type, body) {
-    if (!registered) {
-      log('[signal] not registered yet')
-      return
-    }
-    if (type === 'offer' || type === 'answer' || type === 'renegotiate') {
-      log(`[signal] sending ${type} to ${toPeerId}`)
-    }
+  const loudSignalType = (type) => type === 'offer' || type === 'answer' || type === 'renegotiate'
 
-    send(pspEnvelope(type, {
+  // The mesh is tried before the relay for every frame addressed to one
+  // peer. A peer already reachable through connected neighbours negotiates
+  // without any relay in the path, so a relay outage, a partial relay view,
+  // or two peers registered on different relays no longer decides whether
+  // they can connect. Registration only gates the relay fallback.
+  function sendViaMesh(toPeerId, type, envelope) {
+    if (!toPeerId || typeof signalTransport !== 'function' || !MESH_SIGNAL_TYPES.has(type)) return false
+    let accepted = false
+    try {
+      accepted = signalTransport(envelope) === true
+    } catch {
+      accepted = false
+    }
+    if (accepted && loudSignalType(type)) log(`[signal] sending ${type} to ${toPeerId} via mesh`)
+    return accepted
+  }
+
+  async function relaySignal(toPeerId, type, body) {
+    const envelope = pspEnvelope(type, {
       to:         toPeerId,
       session_id: getOrCreateSessionId(toPeerId),
       body,
       ...(NEGOTIATION_TYPES.has(type) ? { ttl_ms: NEGOTIATION_TTL_MS } : {}),
-    }))
+    })
+    if (sendViaMesh(toPeerId, type, envelope)) return
+
+    if (!registered) {
+      log('[signal] not registered yet')
+      return
+    }
+    if (loudSignalType(type)) {
+      log(`[signal] sending ${type} to ${toPeerId}`)
+    }
+
+    send(envelope)
+  }
+
+  // A signaling frame that arrived over the mesh instead of the relay
+  // socket. It is held to the same shape the relay would have delivered:
+  // addressed to this peer, for this network and room, from someone else.
+  function injectSignal(envelope) {
+    if (!envelope || typeof envelope !== 'object') return false
+    if (!MESH_SIGNAL_TYPES.has(envelope.type)) return false
+    if (typeof envelope.from !== 'string' || !envelope.from || envelope.from === peerId) return false
+    if (envelope.to !== peerId) return false
+    if (envelope.network !== networkId) return false
+    if (envelope.session_id !== roomId) return false
+    handleMessage(envelope)
+    return true
   }
 
   function stopAdvertiseHeartbeat() {
@@ -2147,6 +2191,8 @@ export function createSignalingClient(options = {}) {
     async initiateConnection(toPeerId, iceServers = []) {
       return initiateWebRTCConnection(toPeerId, iceServers)
     },
+
+    injectSignal,
 
     sendData(data, preferredPeerId) {
       // A channel can keep reporting 'open' while its connection is anything
