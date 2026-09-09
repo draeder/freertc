@@ -135,3 +135,16 @@ test('a ping only drains the relay queue where sockets can live outside the coor
   assert.equal(pingDrainsQueuedMessages({ waitUntil() {} }), true, 'a plain worker isolate still drains on ping');
   assert.equal(pingDrainsQueuedMessages(undefined), true);
 });
+
+test('a stale queue drain or heartbeat is dropped by the alarm; work someone waits on is never stale', async () => {
+  const { deferredTaskIsStale } = await import('../src/index.js');
+  const now = 1_700_000_000_000;
+  const key = (age) => `task:${String(now - age).padStart(15, '0')}:000001`;
+  assert.equal(deferredTaskIsStale(key(120_000), { kind: 'deliver-queued' }, now), true);
+  assert.equal(deferredTaskIsStale(key(120_000), { kind: 'announce', isHeartbeat: true }, now), true);
+  assert.equal(deferredTaskIsStale(key(5_000), { kind: 'deliver-queued' }, now), false, 'fresh drains still run');
+  assert.equal(deferredTaskIsStale(key(120_000), { kind: 'discover' }, now), false, 'a discover has a peer waiting on it');
+  assert.equal(deferredTaskIsStale(key(120_000), { kind: 'announce', isHeartbeat: false }, now), false, 'a join broadcasts the room');
+  assert.equal(deferredTaskIsStale(key(120_000), { kind: 'forward' }, now), false);
+  assert.equal(deferredTaskIsStale('task:garbage', { kind: 'deliver-queued' }, now), false, 'an unreadable key is left to run');
+});

@@ -65,6 +65,13 @@ function debugNote(entry) {
 // the coordinator's alarm, which runs each batch on a fresh context.
 const DEFERRED_TASK_PREFIX = "task:";
 const MAX_DEFERRED_TASKS_PER_ALARM = 6;
+// How many queued entries one alarm inspects when deciding what is still
+// worth running. Stale entries are dropped in bulk; only live ones run.
+const DEFERRED_TASK_SCAN_LIMIT = 256;
+// A queue drain or a heartbeat older than this is worthless: the peer has
+// announced again since, or is gone. Running it anyway is what kept a relay
+// with a deep backlog answering nothing for as long as the backlog lasted.
+const DEFERRED_TASK_STALE_MS = 60_000;
 const CLEANUP_INTERVAL_MS = 60_000;
 let deferredTaskSequence = 0;
 let lastCleanupAt = 0;
@@ -103,10 +110,33 @@ async function deferWork(ctx, env, task) {
   }
 }
 
+// The queue key carries the enqueue time, so an alarm can tell a task's
+// age without reading the task. A drain for a peer's queued frames and a
+// heartbeat republish are only useful while fresh; a discover, a join, a
+// leave, or a forward is always run because something is waiting on it.
+export function deferredTaskIsStale(key, task, now = Date.now()) {
+  const kind = task?.kind;
+  if (kind !== "deliver-queued" && !(kind === "announce" && task?.isHeartbeat)) return false;
+  const enqueuedAt = Number(String(key ?? "").slice(DEFERRED_TASK_PREFIX.length, DEFERRED_TASK_PREFIX.length + 15));
+  if (!Number.isFinite(enqueuedAt) || enqueuedAt <= 0) return false;
+  return now - enqueuedAt > DEFERRED_TASK_STALE_MS;
+}
+
 async function drainDeferredTasks(state, env) {
-  const entries = await state.storage.list({ prefix: DEFERRED_TASK_PREFIX, limit: MAX_DEFERRED_TASKS_PER_ALARM });
-  if (entries.size === 0) return;
-  await Promise.all([...entries].map(async ([key, task]) => {
+  const scanned = await state.storage.list({ prefix: DEFERRED_TASK_PREFIX, limit: DEFERRED_TASK_SCAN_LIMIT });
+  if (scanned.size === 0) return;
+  const now = Date.now();
+  const staleKeys = [];
+  const entries = [];
+  for (const [key, task] of scanned) {
+    if (deferredTaskIsStale(key, task, now)) staleKeys.push(key);
+    else if (entries.length < MAX_DEFERRED_TASKS_PER_ALARM) entries.push([key, task]);
+  }
+  if (staleKeys.length > 0) {
+    await state.storage.delete(staleKeys);
+    debugNote({ op: "task-stale-dropped", count: staleKeys.length });
+  }
+  await Promise.all(entries.map(async ([key, task]) => {
     const startedAt = Date.now();
     try {
       await runDeferredTask(env, task);
