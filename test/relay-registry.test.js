@@ -149,7 +149,7 @@ test('a stale queue drain or heartbeat is dropped by the alarm; work someone wai
   assert.equal(deferredTaskIsStale('task:garbage', { kind: 'deliver-queued' }, now), false, 'an unreadable key is left to run');
 });
 
-test('a negotiation forward goes stale after its retry budget, and cheap waiting work runs before forwards', async () => {
+test('a negotiation forward goes stale after its retry budget, and forwards run before discovery work', async () => {
   const { deferredTaskIsStale, orderDeferredTasks } = await import('../src/index.js');
   const now = 1_700_000_000_000;
   const key = (age) => `task:${String(now - age).padStart(15, '0')}:000001`;
@@ -164,7 +164,7 @@ test('a negotiation forward goes stale after its retry budget, and cheap waiting
     [key(4), { kind: 'announce', isHeartbeat: false }],
     [key(5), { kind: 'forward', message: { type: 'answer' } }],
   ]).map(([, task]) => task.kind);
-  assert.deepEqual(ordered, ['discover', 'announce', 'forward', 'forward', 'deliver-queued']);
+  assert.deepEqual(ordered, ['forward', 'forward', 'discover', 'announce', 'deliver-queued']);
 });
 
 test('a discover written today sorts ahead of any backlog, including keys an older build left behind', async () => {
@@ -183,4 +183,23 @@ test('a discover written today sorts ahead of any backlog, including keys an old
   assert.equal(deferredTaskIsStale(forward, { kind: 'forward', message: { type: 'offer' } }, now), true);
   assert.equal(deferredTaskIsStale(backlog, { kind: 'deliver-queued' }, now), true, 'old-build keys are read the same way');
   assert.equal(deferredTaskIsStale(discover, { kind: 'discover' }, now), false);
+});
+
+test('duplicate discovers and heartbeats for one peer collapse to the newest; forwards are never collapsed', async () => {
+  const { coalesceDeferredTasks, deferredTaskKey } = await import('../src/index.js');
+  const now = 1_700_000_000_000;
+  const d1 = deferredTaskKey({ kind: 'discover' }, now - 3000, 1);
+  const d2 = deferredTaskKey({ kind: 'discover' }, now - 1000, 2);
+  const f1 = deferredTaskKey({ kind: 'forward' }, now - 2000, 3);
+  const f2 = deferredTaskKey({ kind: 'forward' }, now - 1500, 4);
+  const other = deferredTaskKey({ kind: 'discover' }, now - 500, 5);
+  const { run, redundant } = coalesceDeferredTasks([
+    [d1, { kind: 'discover', network: 'n', room: 'r', peerId: 'p' }],
+    [f1, { kind: 'forward', network: 'n', room: 'r', message: { to: 'q', type: 'offer' } }],
+    [d2, { kind: 'discover', network: 'n', room: 'r', peerId: 'p' }],
+    [f2, { kind: 'forward', network: 'n', room: 'r', message: { to: 'q', type: 'ice_candidate' } }],
+    [other, { kind: 'discover', network: 'n', room: 'r', peerId: 'other' }],
+  ]);
+  assert.deepEqual(redundant, [d1]);
+  assert.deepEqual(run.map(([key]) => key).sort(), [d2, f1, f2, other].sort());
 });

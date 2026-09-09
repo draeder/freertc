@@ -64,7 +64,7 @@ function debugNote(entry) {
 // gets out. So the socket handler only touches memory, and hands the rest to
 // the coordinator's alarm, which runs each batch on a fresh context.
 const DEFERRED_TASK_PREFIX = "task:";
-const MAX_DEFERRED_TASKS_PER_ALARM = 6;
+const MAX_DEFERRED_TASKS_PER_ALARM = 16;
 // How many queued entries one alarm inspects when deciding what is still
 // worth running. Stale entries are dropped in bulk; only live ones run.
 const DEFERRED_TASK_SCAN_LIMIT = 256;
@@ -76,9 +76,11 @@ const DEFERRED_TASK_STALE_MS = 60_000;
 // for sixteen; a forward that has sat in the queue longer than that would
 // only deliver an offer the other side has already given up on.
 const DEFERRED_FORWARD_STALE_MS = 20_000;
-// Cheap tasks that other peers are blocked on run before slow federated
-// forwards, so a burst of cross-relay ICE can never bury a discover.
-const DEFERRED_TASK_PRIORITY = { discover: 0, announce: 1, "peer-left": 1, "relay-list": 2, forward: 3, "deliver-queued": 4 };
+// A negotiation forward is the most time-critical thing in the queue: the
+// offer behind it dies in ten seconds. Discovers and announces come next;
+// a peer re-requests discovery before every dial, and letting those crowd
+// out forwards left every cross-relay offer to expire unrun.
+const DEFERRED_TASK_PRIORITY = { forward: 0, discover: 1, announce: 1, "peer-left": 1, "relay-list": 2, "deliver-queued": 3 };
 const CLEANUP_INTERVAL_MS = 60_000;
 let deferredTaskSequence = 0;
 let lastCleanupAt = 0;
@@ -158,6 +160,27 @@ export function orderDeferredTasks(entries) {
   return [...entries].sort((left, right) => rank(left[1]) - rank(right[1]));
 }
 
+// Several discovers, heartbeats, or queue drains for the same peer answer
+// the same question; only the newest is worth running. Returns the entries
+// to run and the keys made redundant by a newer duplicate.
+export function coalesceDeferredTasks(entries) {
+  const newestByPeer = new Map();
+  const redundant = [];
+  const keep = [];
+  for (const entry of entries) {
+    const [key, task] = entry;
+    const kind = task?.kind;
+    const coalescable = kind === "discover" || kind === "deliver-queued" || (kind === "announce" && task?.isHeartbeat);
+    if (!coalescable) { keep.push(entry); continue; }
+    const id = `${kind}:${task.network}:${task.room}:${task.peerId}`;
+    const previous = newestByPeer.get(id);
+    if (previous) redundant.push(previous[0]);
+    newestByPeer.set(id, entry);
+  }
+  for (const entry of newestByPeer.values()) keep.push(entry);
+  return { run: keep, redundant };
+}
+
 async function drainDeferredTasks(state, env) {
   const scanned = await state.storage.list({ prefix: DEFERRED_TASK_PREFIX, limit: DEFERRED_TASK_SCAN_LIMIT });
   if (scanned.size === 0) return;
@@ -168,12 +191,14 @@ async function drainDeferredTasks(state, env) {
     if (deferredTaskIsStale(key, task, now)) staleKeys.push(key);
     else live.push([key, task]);
   }
+  const coalesced = coalesceDeferredTasks(live);
+  staleKeys.push(...coalesced.redundant);
   // Durable Object storage deletes at most 128 keys per call.
   for (let index = 0; index < staleKeys.length; index += 128) {
     await state.storage.delete(staleKeys.slice(index, index + 128));
   }
   if (staleKeys.length > 0) debugNote({ op: "task-stale-dropped", count: staleKeys.length });
-  const entries = orderDeferredTasks(live).slice(0, MAX_DEFERRED_TASKS_PER_ALARM);
+  const entries = orderDeferredTasks(coalesced.run).slice(0, MAX_DEFERRED_TASKS_PER_ALARM);
   await Promise.all(entries.map(async ([key, task]) => {
     const startedAt = Date.now();
     try {
