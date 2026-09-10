@@ -2297,11 +2297,28 @@ export function createSignalingClient(options = {}) {
         throw error
       }
 
+      // A channel that reports 'open' can still throw from send(): Safari and
+      // Chrome both do while SCTP is settling right after the channel opens,
+      // and again while it is closing. The gate above already passed, so
+      // this is not proof the edge is gone; the pong round trip decides that.
+      // Surfacing the throw as terminal released a freshly connected peer on
+      // its first frame, both sides redialed, and the pair churned forever.
+      const sendFrame = (frame) => {
+        try {
+          target.channel.send(frame)
+        } catch (err) {
+          const error = new Error(`WebRTC channel refused a frame: ${err?.message ?? err}`)
+          error.transient = true
+          error.cause = err
+          throw error
+        }
+      }
+
       if (typeof data === 'string' && data.length > DATA_CHUNK_THRESHOLD) {
         const id = `${Date.now().toString(36)}-${(dataChunkCounter++).toString(36)}`
         const total = Math.ceil(data.length / DATA_CHUNK_SLICE)
         for (let seq = 0; seq < total; seq++) {
-          target.channel.send(JSON.stringify({
+          sendFrame(JSON.stringify({
             t: DATA_CHUNK_FRAME,
             i: id,
             s: seq,
@@ -2312,7 +2329,7 @@ export function createSignalingClient(options = {}) {
         return target
       }
 
-      target.channel.send(data)
+      sendFrame(data)
       return target
     },
 
