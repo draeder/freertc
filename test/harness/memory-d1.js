@@ -5,6 +5,9 @@ export class MemoryD1 {
   constructor() {
     this.nodes = new Map();
     this.records = new Map();
+    // Rows the overlay actually wrote to psp_kad_nodes. D1 bills writes, so
+    // tests assert on this rather than on the table's final contents.
+    this.nodeWrites = 0;
   }
 
   prepare(sql) {
@@ -15,6 +18,18 @@ export class MemoryD1 {
           async run() {
             if (sql.includes('INSERT INTO psp_kad_nodes')) {
               const [nodeId, bucketIndex, url, recordJson, expiresAt, lastSeen] = values;
+              // Mirrors the upsert's WHERE guard, and only when the statement
+              // actually carries it: an existing row is rewritten only if the
+              // contact moved or has under half its lifetime left. A statement
+              // without the guard overwrites unconditionally, as SQLite would.
+              const guarded = sql.includes('WHERE psp_kad_nodes.url != excluded.url');
+              const existing = db.nodes.get(nodeId);
+              const renew = !existing
+                || !guarded
+                || existing.url !== url
+                || (existing.expires_at_ms - lastSeen) * 2 <= (expiresAt - lastSeen);
+              if (!renew) return { success: true, meta: { changes: 0 } };
+              db.nodeWrites += 1;
               db.nodes.set(nodeId, {
                 node_id: nodeId,
                 bucket_index: bucketIndex,
@@ -23,6 +38,7 @@ export class MemoryD1 {
                 expires_at_ms: expiresAt,
                 last_seen_ms: lastSeen,
               });
+              return { success: true, meta: { changes: 1 } };
             } else if (sql.includes('INSERT INTO psp_kad_records')) {
               const [routingKey, ownerNodeId, kind, sequence, recordJson, expiresAt] = values;
               const key = `${routingKey}:${ownerNodeId}:${kind}`;

@@ -271,3 +271,87 @@ test('lookup refreshes configured bootstraps even when a stale routing contact e
     globalThis.fetch = originalFetch;
   }
 });
+
+// Runs `body` with Date.now() under the test's control, so contact records can
+// be issued and heard at chosen moments without waiting in real time.
+async function withClock(startMs, body) {
+  const realNow = Date.now;
+  let current = startMs;
+  Date.now = () => current;
+  try {
+    await body({ now: () => current, advance: (ms) => { current += ms; } });
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+async function overlayWithContact() {
+  const [pairA, pairB] = await Promise.all([generateRandomPair(), generateRandomPair()]);
+  const identityB = await createRelayIdentity(pairB.pub, pairB.priv);
+  const env = {
+    DB: new MemoryD1(),
+    RELAY_SIGNING_PUBLIC_KEY: pairA.pub,
+    RELAY_SIGNING_PRIVATE_KEY: pairA.priv,
+  };
+  const options = { selfUrl: 'wss://relay-a.example/ws' };
+  const hear = (record) => handleKademliaRequest(
+    rpcRequest('/api/v1/kad/ping', { requester: record }),
+    env,
+    options,
+  );
+  return { env, identityB, hear };
+}
+
+test('a contact heard on every message is written once, not once per message', async () => {
+  const { env, identityB, hear } = await overlayWithContact();
+  await withClock(1_800_000_000_000, async (clock) => {
+    for (let i = 0; i < 25; i += 1) {
+      // Each RPC carries a freshly signed record, as real relays send.
+      const record = await createSignedNodeRecord(identityB, { url: 'wss://relay-b.example/ws', now: clock.now() });
+      assert.equal((await hear(record)).status, 200);
+      clock.advance(1_000);
+    }
+  });
+  assert.equal(env.DB.nodes.size, 1);
+  assert.equal(env.DB.nodeWrites, 1);
+});
+
+test('a contact is renewed once its stored record is past half its lifetime', async () => {
+  const { env, identityB, hear } = await overlayWithContact();
+  await withClock(1_800_000_000_000, async (clock) => {
+    const issue = () => createSignedNodeRecord(identityB, { url: 'wss://relay-b.example/ws', now: clock.now() });
+
+    await hear(await issue());
+    const first = [...env.DB.nodes.values()][0].expires_at_ms;
+    assert.equal(env.DB.nodeWrites, 1);
+
+    clock.advance(60_000); // 1 min into a 5 min record: still plenty of life left
+    await hear(await issue());
+    assert.equal(env.DB.nodeWrites, 1);
+    assert.equal([...env.DB.nodes.values()][0].expires_at_ms, first);
+
+    clock.advance(100_000); // 2m40s in: under half the lifetime remains, so it is renewed
+    await hear(await issue());
+    assert.equal(env.DB.nodeWrites, 2);
+    assert.ok([...env.DB.nodes.values()][0].expires_at_ms > first);
+
+    // A contact that is heard again must never be left to lapse while it is still talking.
+    for (let i = 0; i < 10; i += 1) {
+      clock.advance(30_000);
+      await hear(await issue());
+      const row = [...env.DB.nodes.values()][0];
+      assert.ok(row.expires_at_ms > clock.now(), 'stored record must still be live');
+    }
+  });
+});
+
+test('a contact that moves to a new url is rewritten immediately', async () => {
+  const { env, identityB, hear } = await overlayWithContact();
+  await withClock(1_800_000_000_000, async (clock) => {
+    await hear(await createSignedNodeRecord(identityB, { url: 'wss://relay-b.example/ws', now: clock.now() }));
+    clock.advance(1_000);
+    await hear(await createSignedNodeRecord(identityB, { url: 'wss://relay-b2.example/ws', now: clock.now() }));
+  });
+  assert.equal(env.DB.nodeWrites, 2);
+  assert.equal([...env.DB.nodes.values()][0].url, 'wss://relay-b2.example/ws');
+});

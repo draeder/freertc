@@ -27,7 +27,12 @@ const MAX_LOOKUP_RECORDS = 64;
 const MAX_PROVIDER_RELAYS = 8;
 const MAX_RPC_BODY_BYTES = 128 * 1024;
 const RPC_TIMEOUT_MS = 3_000;
-const BOOTSTRAP_REFRESH_INTERVAL_MS = 5_000;
+// How long a completed bootstrap join is trusted. Every join is a fan-out of
+// find RPCs and a database write per contact heard, and the cache is per
+// isolate, so a short interval multiplies across every isolate the platform
+// starts. Node records live five minutes by default; rejoining at under half
+// that keeps this relay announced to its bootstraps without churning them.
+const BOOTSTRAP_REFRESH_INTERVAL_MS = 120_000;
 const PROVIDER_PUBLISH_INTERVAL_MS = 20_000;
 const PROVIDER_RECORD_TTL_MS = 45_000;
 const MAX_RECENT_PROVIDER_PUBLISHES = 20_000;
@@ -157,7 +162,13 @@ async function upsertNodeRecord(context, record) {
   if (record.node_id === context.identity.nodeId) return;
   const index = bucketIndex(context.identity.nodeId, record.node_id);
   const now = Date.now();
-  await context.db.prepare(`
+  // Every RPC carries a freshly signed requester record, so an unconditional
+  // upsert rewrites a row (and both of its indexes) on every message from a
+  // contact already known. Rewrite only when the contact is new, has moved, or
+  // its stored record has less than half of its lifetime left: rows are still
+  // renewed well before they expire, but a busy contact costs one write per
+  // half-life instead of one per message. A skipped write changes no rows.
+  const written = await context.db.prepare(`
     INSERT INTO psp_kad_nodes
       (node_id, bucket_index, url, record_json, expires_at_ms, last_seen_ms)
     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -167,6 +178,9 @@ async function upsertNodeRecord(context, record) {
       record_json = excluded.record_json,
       expires_at_ms = excluded.expires_at_ms,
       last_seen_ms = excluded.last_seen_ms
+    WHERE psp_kad_nodes.url != excluded.url
+      OR (psp_kad_nodes.expires_at_ms - excluded.last_seen_ms) * 2
+         <= (excluded.expires_at_ms - excluded.last_seen_ms)
   `).bind(
     record.node_id,
     index,
@@ -175,6 +189,8 @@ async function upsertNodeRecord(context, record) {
     record.expires_at_ms,
     now,
   ).run();
+  // Nothing was inserted or renewed, so no bucket can have grown past k.
+  if (written?.meta?.changes === 0) return;
 
   await context.db.prepare(`
     DELETE FROM psp_kad_nodes
