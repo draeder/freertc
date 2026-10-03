@@ -95,16 +95,15 @@ function cleanExpired() {
 function listPeers(network, requesterPeerId = null) {
   const now = Date.now();
   const out = [];
-  for (const [key, row] of announcements.entries()) {
-    const [rowNetwork, rowPeerId] = key.split(':');
-    if (rowNetwork !== network || row.expiresAtMs <= now) {
+  for (const row of announcements.values()) {
+    if (row.network !== network || row.expiresAtMs <= now) {
       continue;
     }
-    if (requesterPeerId && rowPeerId === requesterPeerId) {
+    if (requesterPeerId && row.peerId === requesterPeerId) {
       continue;
     }
     out.push({
-      peer_id: rowPeerId,
+      peer_id: row.peerId,
       session_id: row.sessionId,
       timestamp: row.updatedAtMs
     });
@@ -200,7 +199,10 @@ function upsertAnnouncement(message) {
   const key = makePeerKey(message.network, message.from);
   const now = Date.now();
   const ttl = normalizeTtl(message.ttl_ms);
+  // A network or a peer id may itself contain ":", so the row keeps both rather than the key being split.
   announcements.set(key, {
+    network: message.network,
+    peerId: message.from,
     sessionId: message.session_id || null,
     expiresAtMs: now + ttl,
     updatedAtMs: now
