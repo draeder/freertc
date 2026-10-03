@@ -80,6 +80,52 @@ Use `client.initiateConnection(peerId)` to open a WebRTC data channel and
 `client.sendData(data, peerId)` to send an application payload. Calling
 `client.disconnect()` closes signaling and peer connections.
 
+### Relay on demand (opt-in)
+
+By default the client keeps its relay socket open for as long as it runs: an announce every 12 s and a
+ping every second. The relay is for meeting the mesh, so a peer that already has a healthy mesh can let
+it go:
+
+```js
+import { createSignalingClient } from "freertc/client";
+
+const client = createSignalingClient({
+  peerId: crypto.randomUUID(),
+  networkId: "my-app",
+  roomId: "pairing-room",
+  signalUrl: "wss://your-relay.example/ws",
+  autoConnect: false,
+  onDataMessage: ({ peerId, data }) => {
+    console.log("data from", peerId, data);
+  },
+  // Required for on-demand: a way to carry negotiation frames over the mesh.
+  signalTransport: (envelope) => mesh.send(envelope),
+  relay: { mode: "on-demand", minMeshPeers: 2, anchors: 3 },
+  onRelayStateChange: ({ state }) => console.log("relay", state), // up | idle | waking
+});
+
+client.connect();
+```
+
+- A peer with at least `minMeshPeers` live data-channel neighbours withdraws from the relay and closes
+  its socket once it has been releasable for `settleMs` (30 s).
+- **Anchors** stay registered so a newcomer still finds a way in: the `anchors` peers (default 3) whose id
+  is closest to the room, by SHA-256 on a 256-bit ring. Neighbours tell each other which peers they can
+  vouch for with a small `~anchors` frame over the data channel, so each peer works out the same set,
+  and an anchor that disappears is replaced as soon as its neighbours stop vouching for it.
+- A released peer wakes the relay when its mesh drops below `minMeshPeers`, when it needs to signal a
+  peer the mesh cannot reach, when it asks for discovery (`requestBootstrap`), or on `client.wakeRelay()`.
+  It stays up for `lingerMs` (60 s) after a wake.
+- `client.relayIdle` is true while the socket is released on purpose. **A host that watches for a missing
+  relay acknowledgement must treat that as healthy**, or it will reopen the socket it was meant to leave
+  closed.
+- Without `signalTransport`, `mode: "on-demand"` is ignored, because a released relay is only safe when
+  negotiation can travel by mesh.
+
+Limits: anchors are chosen among a peer, its live neighbours and the peers they vouch for (two hops), so a
+very large room has more than `anchors` of them, never fewer; a neighbour that lies can make a peer
+release the relay early, and the peer wakes it again as soon as its own mesh degree drops.
+
 ## What this worker does
 
 - Accepts WebSocket client connections at `/ws`.
