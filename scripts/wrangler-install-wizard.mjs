@@ -15,6 +15,8 @@ const ROOT = resolveProjectRoot(process.cwd());
 const WRANGLER_CONFIG = path.join(ROOT, 'wrangler.jsonc');
 const WRANGLER_TEMPLATE = path.join(ROOT, 'wrangler.template.jsonc');
 const D1_SCHEMA_FILE = path.join(ROOT, 'scripts', 'd1-schema.sql');
+// Seeds for joining the public network. Any relay can be one; a relay asks them one at a time.
+const PUBLIC_SEED_URLS = 'wss://peer.ooo/ws,wss://decentralize.ooo/ws';
 
 function readProjectName(dir) {
   const pkgPath = path.join(dir, 'package.json');
@@ -570,18 +572,21 @@ async function main() {
 
       // Federation opt-in
       console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-      console.log('\nGlobal peer network: contribute your relay to peer.ooo federation?');
-      console.log('When enabled, peers across all federated relays can discover each other.');
-      const joinGlobal = await rl.question('Join global network at peer.ooo? [Y/n]: ');
+      console.log('\nPublic relay network: join it through its seed relays?');
+      console.log('When enabled, peers across all joined relays can discover each other.');
+      console.log('No relay is a hub: any relay can be a seed, and a seed points you at the relays closest to you.');
+      const joinGlobal = await rl.question('Join the public network? [Y/n]: ');
       let updatedText = fs.readFileSync(WRANGLER_CONFIG, 'utf8');
       if (yes(joinGlobal, true)) {
         const relayNameAnswer = (await rl.question('Relay display name [press Enter to skip]: ')).trim();
-        updatedText = patchVar(updatedText, 'GLOBAL_RELAY_URL', 'wss://peer.ooo/ws');
+        updatedText = patchVar(updatedText, 'KADEMLIA_BOOTSTRAP_URLS', PUBLIC_SEED_URLS);
+        updatedText = removeVar(updatedText, 'GLOBAL_RELAY_URL');
         if (relayNameAnswer) {
           updatedText = patchVar(updatedText, 'RELAY_NAME', relayNameAnswer);
         }
-        console.log('✓ GLOBAL_RELAY_URL set to wss://peer.ooo/ws');
+        console.log(`✓ KADEMLIA_BOOTSTRAP_URLS set to ${PUBLIC_SEED_URLS}`);
       } else {
+        updatedText = removeVar(updatedText, 'KADEMLIA_BOOTSTRAP_URLS');
         updatedText = removeVar(updatedText, 'GLOBAL_RELAY_URL');
         updatedText = removeVar(updatedText, 'RELAY_NAME');
         console.log('✓ Skipped global network — relay will operate standalone.');

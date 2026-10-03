@@ -1,4 +1,5 @@
 import {
+  configuredBootstrapUrls,
   handleKademliaRequest,
   heartbeatKademlia,
   isKademliaEnabled,
@@ -36,7 +37,6 @@ const MAX_MESSAGE_SIZE = 64 * 1024;
 const MAX_BATCH = 50;
 const RELAY_EXPIRY_MS = 5 * 60_000;       // relay entry expires after 5 min without heartbeat
 const FEDERATION_INTERVAL_MS = 2 * 60_000; // re-heartbeat every 2 min per isolate
-const DEFAULT_HUB_URL = "wss://peer.ooo/ws"; // default bootstrap hub
 // Relays asked to deliver a message when none is known to hold its peer. They are the relays
 // that serve the room, and each one that does not hold the peer says so, so asking all of
 // them (up to the most a lookup returns) costs requests, not queued copies.
@@ -434,9 +434,10 @@ export default {
           }
 
           await upsertRelay(env.DB, selfRelayUrl, relayName).catch(() => {});
-          const hubUrl = env.GLOBAL_RELAY_URL || DEFAULT_HUB_URL;
-          // Skip registering with hub if we ARE the hub
-          if (normalizeRelayUrl(hubUrl) !== selfRelayUrl) {
+          // The legacy registry registers with a hub only when one is named. No relay is the
+          // default hub: a relay that names none just keeps its own registry.
+          const hubUrl = env.GLOBAL_RELAY_URL;
+          if (hubUrl && normalizeRelayUrl(hubUrl) !== selfRelayUrl) {
             await registerWithHub(
               { ...env, GLOBAL_RELAY_URL: hubUrl, RELAY_NAME: relayName },
               selfRelayUrl
@@ -484,9 +485,7 @@ export default {
         relay_url: selfRelayUrl,
         relay_peer_id: resolveRelayPeerId(env.RELAY_PEER_ID, selfRelayUrl),
         kademlia_enabled: isKademliaEnabled(env),
-        federation_hub: selfRelayUrl
-          ? normalizeRelayUrl(env.GLOBAL_RELAY_URL || DEFAULT_HUB_URL)
-          : null
+        bootstrap_urls: configuredBootstrapUrls(env).filter((seed) => seed !== selfRelayUrl),
       }, 200);
     }
 
@@ -586,9 +585,7 @@ export class RelayCoordinator {
         relay_url: selfRelayUrl,
         relay_peer_id: resolveRelayPeerId(this.env.RELAY_PEER_ID, selfRelayUrl),
         kademlia_enabled: isKademliaEnabled(this.env),
-        federation_hub: selfRelayUrl
-          ? normalizeRelayUrl(this.env.GLOBAL_RELAY_URL || DEFAULT_HUB_URL)
-          : null,
+        bootstrap_urls: configuredBootstrapUrls(this.env).filter((seed) => seed !== selfRelayUrl),
         coordinated: true,
       }, 200);
     }
@@ -1095,7 +1092,14 @@ async function broadcastPeerList(env, selfRelayUrl, network, room, relayPeerId, 
 
 // ===================== D1 Database Functions =====================
 
-async function upsertAnnouncement(db, message) {
+/**
+ * Record that a peer is here. A client re-announces every 12 s to keep a 30 s lease, and each
+ * unconditional rewrite is a row (and its index entries) for a lease that was nowhere near its
+ * end. An existing announcement is rewritten only when its session changed or it has less than
+ * half its lease left, so a live peer is renewed well before it lapses at a fraction of the
+ * writes, and a peer that is gone still ages out on the lease it was given.
+ */
+export async function upsertAnnouncement(db, message) {
   const now = Date.now();
   const ttl = Math.min(message.ttl_ms || DEFAULT_TTL_MS, MAX_TTL_MS);
   const expiresAt = now + ttl;
@@ -1107,6 +1111,9 @@ async function upsertAnnouncement(db, message) {
       session_id = excluded.session_id,
       expires_at_ms = excluded.expires_at_ms,
       updated_at_ms = excluded.updated_at_ms
+    WHERE psp_announcements.session_id IS NOT excluded.session_id
+      OR (psp_announcements.expires_at_ms - excluded.updated_at_ms) * 2
+         <= (excluded.expires_at_ms - excluded.updated_at_ms)
   `).bind(scopeKey(message.network, normalizeRoom(message.session_id)), message.from, message.session_id, expiresAt, now).run();
 }
 

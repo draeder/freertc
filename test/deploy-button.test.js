@@ -41,7 +41,9 @@ test("Deploy Button configuration provisions D1, migrations, and private relay i
 
   for (const config of [buttonConfig, workersDevConfig]) {
     assert.match(config, /"workers_dev"\s*:\s*true/);
-    assert.match(config, /"GLOBAL_RELAY_URL"\s*:\s*"wss:\/\/peer\.ooo\/ws"/);
+    // Several seeds, none of them a hub every relay must go through.
+    assert.match(config, /"KADEMLIA_BOOTSTRAP_URLS"\s*:\s*"wss:\/\/peer\.ooo\/ws,wss:\/\/decentralize\.ooo\/ws"/);
+    assert.doesNotMatch(config, /"GLOBAL_RELAY_URL"\s*:/);
     assert.doesNotMatch(config, /"RELAY_URL"\s*:/);
     assert.match(config, /"migrations_dir"\s*:\s*"migrations"/);
     assert.match(config, /"RELAY_COORDINATOR"/);
@@ -154,7 +156,8 @@ test("the first workers.dev request registers that domain with the federation hu
     assert.equal(response.status, 200);
     assert.equal(health.relay_url, "wss://freertc-relay.example-account.workers.dev/ws");
     assert.equal(health.relay_peer_id, "bootstrap:freertc-relay.example-account.workers.dev");
-    assert.equal(health.federation_hub, "wss://peer.ooo/ws");
+    assert.deepEqual(health.bootstrap_urls, ["wss://peer.ooo/ws"]);
+    assert.equal("federation_hub" in health, false);
     assert.equal(registration.url, "https://peer.ooo/api/v1/relays");
     assert.deepEqual(JSON.parse(registration.options.body), {
       url: "wss://freertc-relay.example-account.workers.dev/ws",

@@ -9,7 +9,8 @@
   "vars": {
     "RELAY_PEER_ID": "bootstrap-relay",
     // npm run dev:cf creates the private relay identity in .dev.vars.
-    "GLOBAL_RELAY_URL": "wss://peer.ooo/ws"
+    // Seeds: any relay can be one. List several; the relay asks one at a time, in random order.
+    "KADEMLIA_BOOTSTRAP_URLS": "wss://peer.ooo/ws,wss://decentralize.ooo/ws"
   },
   "d1_databases": [
     {

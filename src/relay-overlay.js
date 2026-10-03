@@ -97,7 +97,7 @@ function relayHttpBase(relayUrl) {
     .replace(/\/ws$/, '');
 }
 
-function configuredBootstrapUrls(env) {
+export function configuredBootstrapUrls(env) {
   const values = [
     ...(typeof env.KADEMLIA_BOOTSTRAP_URLS === 'string' ? env.KADEMLIA_BOOTSTRAP_URLS.split(',') : []),
     env.GLOBAL_RELAY_URL,
@@ -385,36 +385,52 @@ async function iterativeLookup(context, targetId, wantRecords = false) {
   };
 }
 
-// Every relay this one has ever verified is a bootstrap from then on, not
-// only the configured hub. A relay that learned its neighbours through the
-// hub keeps joining through them when the hub is unreachable, and a relay
-// that only ever heard of others through a peer's lookup response still has
-// somewhere to join. The configured urls always stay in the set; the learned
-// ones are bounded to the closest bucket so a large table is not queried whole.
-async function bootstrapUrlsFor(context) {
-  const urls = new Set(configuredBootstrapUrls(context.env));
-  const known = await listActiveNodeRecords(context);
-  for (const node of selectClosestNodes(known, context.identity.nodeId, DEFAULT_K_BUCKET_SIZE)) {
-    if (typeof node.url === 'string' && node.url) urls.add(node.url);
+/** The urls in a random order, so no one seed is every relay's first stop. */
+function shuffled(urls) {
+  const out = [...urls];
+  for (let i = out.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
   }
-  urls.delete(context.selfUrl);
-  return Array.from(urls);
+  return out;
 }
 
+/** The relays closest to this one among those it has heard of: where to join when no seed answers. */
+async function learnedBootstrapUrls(context, exclude) {
+  const known = await listActiveNodeRecords(context);
+  return selectClosestNodes(known, context.identity.nodeId, DEFAULT_K_BUCKET_SIZE)
+    .map((node) => node.url)
+    .filter((url) => typeof url === 'string' && url && !exclude.has(url) && url !== context.selfUrl);
+}
+
+// The standard Kademlia join. No relay is the hub: any relay can be a seed, and a seed answers
+// with the relays closest to the joiner's own id, which is how a new relay is directed to the
+// ones near it. So one seed is asked, in random order, and the first to answer is enough;
+// asking every seed and every relay ever heard of at once was a fan-out that grew with the
+// network and that every receiver wrote down. Relays learned from earlier answers are only
+// tried when every configured seed is unreachable, so a relay still rejoins through its
+// neighbours when the seeds are down.
 async function joinBootstrap(context) {
-  const bootstrapUrls = await bootstrapUrlsFor(context);
-  const responses = await Promise.all(bootstrapUrls.map((url) => postRpc(url, '/api/v1/kad/find', {
-    target: context.identity.nodeId,
-    want_records: false,
-    requester: context.nodeRecord,
-  })));
+  const seeds = shuffled(configuredBootstrapUrls(context.env).filter((url) => url !== context.selfUrl));
+  const tried = [];
   const records = new Map();
-  let joined = 0;
-  for (const response of responses) {
-    if (response?.ok) joined += 1;
-    await acceptLookupResponse(context, response, context.identity.nodeId, records);
-  }
-  return { bootstrapUrls, joined };
+  const askOneOf = async (urls) => {
+    for (const url of urls) {
+      tried.push(url);
+      const response = await postRpc(url, '/api/v1/kad/find', {
+        target: context.identity.nodeId,
+        want_records: false,
+        requester: context.nodeRecord,
+      });
+      if (response?.ok) {
+        await acceptLookupResponse(context, response, context.identity.nodeId, records);
+        return true;
+      }
+    }
+    return false;
+  };
+  const joined = await askOneOf(seeds) || await askOneOf(await learnedBootstrapUrls(context, new Set(seeds)));
+  return { bootstrapUrls: tried, joined: joined ? 1 : 0 };
 }
 
 async function ensureRoutingContacts(context) {

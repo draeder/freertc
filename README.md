@@ -8,9 +8,9 @@ This project provides a Cloudflare Worker signaling relay for WebRTC peers using
 
 **This is the fastest installation path.** The button creates the Worker and D1 database in your Cloudflare account, applies every D1 migration, generates an UnSEA relay identity, installs it directly as an encrypted Worker secret, and deploys the relay to your own `<worker>.<account>.workers.dev` address. The private identity is never printed or added to the generated repository.
 
-Immediately after deployment, the install script requests the new Worker's `/health` endpoint. The Worker derives `wss://<worker>.<account>.workers.dev/ws` from that request and registers the address with the `wss://peer.ooo/ws` federation hub. No custom domain is required. Cloudflare lets you customize the Worker and database names before deployment.
+Immediately after deployment, the install script requests the new Worker's `/health` endpoint. The Worker derives `wss://<worker>.<account>.workers.dev/ws` from that request and joins the Kademlia overlay through its seed relays. No custom domain is required. Cloudflare lets you customize the Worker and database names before deployment.
 
-Every one-click relay joins the bootstrap network through `wss://peer.ooo/ws` and derives a unique PSP relay sender ID from its deployed hostname (`bootstrap:<worker>.<account>.workers.dev`).
+There is no hub. Every one-click relay joins the network through the seeds in `KADEMLIA_BOOTSTRAP_URLS`, asking one at a time in random order; the seed answers with the relays closest to the newcomer's own ID, and the newcomer carries on from those. Any relay can be a seed for the next, and `/health` lists the seeds a relay was given. Each relay derives a unique PSP relay sender ID from its deployed hostname (`bootstrap:<worker>.<account>.workers.dev`).
 
 See [Cloudflare's Deploy Button documentation](https://developers.cloudflare.com/workers/platform/deploy-buttons/) for details about the account and repository flow.
 
@@ -126,11 +126,11 @@ Production deployment applies pending remote migrations, deploys the Worker, the
 Optional routing settings remain ordinary Wrangler variables:
 
 ```jsonc
-"KADEMLIA_BOOTSTRAP_URLS": "wss://peer.ooo/ws",
+"KADEMLIA_BOOTSTRAP_URLS": "wss://peer.ooo/ws,wss://decentralize.ooo/ws",
 "RELAY_CAPACITY": "10000"
 ```
 
-Every bootstrap URL must point to a FreeRTC relay with Kademlia enabled. `GLOBAL_RELAY_URL` is also treated as a bootstrap URL for compatibility. Legacy deployments using separate `RELAY_SIGNING_PUBLIC_KEY` and `RELAY_SIGNING_PRIVATE_KEY` values continue to work during migration. `npx freertc relay:keygen` remains available only for manual identity recovery or migration.
+Every bootstrap URL must point to a FreeRTC relay with Kademlia enabled. List several: a joining relay asks one at a time, in a random order, and stops at the first that answers; relays it has learned of are tried only when every seed is down. Nothing is a default hub, and a relay with no seeds simply runs standalone. `GLOBAL_RELAY_URL` is still read as one more seed for compatibility, and, only when it is set and the relay has no signing keys, it names the hub for the legacy registry. Legacy deployments using separate `RELAY_SIGNING_PUBLIC_KEY` and `RELAY_SIGNING_PRIVATE_KEY` values continue to work during migration. `npx freertc relay:keygen` remains available only for manual identity recovery or migration.
 
 ## Runtime scope
 

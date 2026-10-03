@@ -400,6 +400,86 @@ test('a heartbeat on an empty table joins; once a contact is live it makes no RP
   }
 });
 
+/**
+ * A relay configured with `seedUrls`, each a relay of its own, with fetch routed between them
+ * and a count of the find requests every host received. Hosts in `dead` refuse every request.
+ */
+async function relayWithSeeds(seedUrls, { dead = [], extraRelays = [] } = {}) {
+  const hostOf = (url) => new URL(url.replace('wss://', 'https://')).hostname;
+  const members = [...seedUrls, ...extraRelays];
+  const pairs = await Promise.all([generateRandomPair(), ...members.map(() => generateRandomPair())]);
+  const urlA = 'wss://joiner.example/ws';
+  const envA = {
+    DB: new MemoryD1(),
+    RELAY_SIGNING_PUBLIC_KEY: pairs[0].pub,
+    RELAY_SIGNING_PRIVATE_KEY: pairs[0].priv,
+    KADEMLIA_BOOTSTRAP_URLS: seedUrls.join(','),
+  };
+  const relays = new Map(members.map((url, i) => [hostOf(url), {
+    selfUrl: url,
+    env: { DB: new MemoryD1(), RELAY_SIGNING_PUBLIC_KEY: pairs[i + 1].pub, RELAY_SIGNING_PRIVATE_KEY: pairs[i + 1].priv },
+  }]));
+  const finds = new Map();
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    const { hostname, pathname } = new URL(request.url);
+    if (pathname === '/api/v1/kad/find') finds.set(hostname, (finds.get(hostname) || 0) + 1);
+    if (dead.includes(hostname)) return new Response('down', { status: 503 });
+    const target = relays.get(hostname);
+    if (!target) return new Response('not found', { status: 404 });
+    return handleKademliaRequest(request, target.env, { selfUrl: target.selfUrl });
+  };
+  return { envA, urlA, finds, relays, restore: () => { globalThis.fetch = realFetch; } };
+}
+
+test('a joining relay asks one seed, not every seed', async () => {
+  const seeds = ['wss://seed-1.example/ws', 'wss://seed-2.example/ws', 'wss://seed-3.example/ws'];
+  const { envA, urlA, finds, restore } = await relayWithSeeds(seeds);
+  try {
+    assert.equal((await heartbeatKademlia(envA, urlA)).joined, true);
+    const asked = seeds.filter((url) => finds.get(new URL(url.replace('wss://', 'https://')).hostname) > 0);
+    assert.equal(asked.length, 1, `expected one seed to be asked, asked ${asked.join(', ')}`);
+    assert.equal(envA.DB.nodes.size, 1);
+  } finally {
+    restore();
+  }
+});
+
+test('a seed that is down is skipped, and the next one is enough', async () => {
+  const seeds = ['wss://seed-1.example/ws', 'wss://seed-2.example/ws', 'wss://seed-3.example/ws'];
+  const { envA, urlA, finds, restore } = await relayWithSeeds(seeds, { dead: ['seed-1.example'] });
+  try {
+    assert.equal((await heartbeatKademlia(envA, urlA)).joined, true);
+    const liveAsked = ['seed-2.example', 'seed-3.example'].filter((host) => finds.get(host) > 0);
+    assert.equal(liveAsked.length, 1, 'once a seed has answered, the others are not asked');
+    assert.equal(envA.DB.nodes.size, 1);
+  } finally {
+    restore();
+  }
+});
+
+test('with every seed down, a relay it learned of earlier is the way back in', async () => {
+  const seeds = ['wss://seed-1.example/ws'];
+  const learnedUrl = 'wss://learned.example/ws';
+  const { envA, urlA, finds, relays, restore } = await relayWithSeeds(seeds, { dead: ['seed-1.example'], extraRelays: [learnedUrl] });
+  try {
+    // The joiner has already heard from the learned relay, as a relay it was once told about.
+    const learned = relays.get('learned.example');
+    const identity = await createRelayIdentity(learned.env.RELAY_SIGNING_PUBLIC_KEY, learned.env.RELAY_SIGNING_PRIVATE_KEY);
+    const record = await createSignedNodeRecord(identity, { url: learnedUrl });
+    const heard = await handleKademliaRequest(rpcRequest('/api/v1/kad/ping', { requester: record }), envA, { selfUrl: urlA });
+    assert.equal(heard.status, 200);
+    assert.equal(envA.DB.nodes.size, 1);
+
+    await lookupScopeProviders(envA, urlA, 'network-fallback', 'room-fallback');
+    assert.ok(finds.get('seed-1.example') > 0, 'the configured seed is tried first');
+    assert.ok(finds.get('learned.example') > 0, 'then the relay it learned of');
+  } finally {
+    restore();
+  }
+});
+
 test('many peers in one room are one publication of the room, and none of any single peer', async () => {
   const { envA, envB, urlA, restore } = await twoRelays();
   const stores = [];
