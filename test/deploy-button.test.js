@@ -154,6 +154,9 @@ test("the first workers.dev request registers that domain with the federation hu
     await Promise.all(pending);
 
     assert.equal(response.status, 200);
+    // A relay reports the version of the package it was built from, so a fleet can be checked
+    // from outside: the layout materializer only refreshes copies when this number changes.
+    assert.equal(health.version, JSON.parse(await read("package.json")).version);
     assert.equal(health.relay_url, "wss://freertc-relay.example-account.workers.dev/ws");
     assert.equal(health.relay_peer_id, "bootstrap:freertc-relay.example-account.workers.dev");
     assert.deepEqual(health.bootstrap_urls, ["wss://peer.ooo/ws"]);
