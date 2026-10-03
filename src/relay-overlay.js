@@ -488,13 +488,28 @@ export async function listKnownRelays(env, selfUrl, options = {}) {
   return relays;
 }
 
+async function hasLiveContacts(context) {
+  const result = await context.db.prepare(
+    'SELECT node_id FROM psp_kad_nodes WHERE expires_at_ms > ?1 LIMIT ?2',
+  ).bind(Date.now(), 1).all();
+  return (result.results || []).length > 0;
+}
+
+/**
+ * Join the overlay when this relay knows nobody. A relay that already holds a live contact
+ * has nothing to refresh on a clock: it learns contacts from the traffic that passes through
+ * it, and an operation that needs more joins on demand (ensureRoutingContacts). Without this
+ * every isolate the platform starts repeated the join and a walk toward its own id every
+ * two minutes, and each repeat was a fan-out of RPCs that the receivers wrote down.
+ */
 export async function heartbeatKademlia(env, selfUrl, options = {}) {
   const context = await overlayContext(env, selfUrl, options);
   if (!context) return { enabled: false };
+  if (await hasLiveContacts(context)) return { enabled: true, node_id: context.identity.nodeId, joined: false };
   await cleanupExpiredOverlay(context);
   await ensureRoutingContacts(context);
   await iterativeLookup(context, context.identity.nodeId, false);
-  return { enabled: true, node_id: context.identity.nodeId };
+  return { enabled: true, node_id: context.identity.nodeId, joined: true };
 }
 
 export async function publishPeerProviderRecords(env, selfUrl, network, room, peerId, options = {}) {

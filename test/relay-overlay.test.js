@@ -355,3 +355,67 @@ test('a contact that moves to a new url is rewritten immediately', async () => {
   assert.equal(env.DB.nodeWrites, 2);
   assert.equal([...env.DB.nodes.values()][0].url, 'wss://relay-b2.example/ws');
 });
+
+/** Two relays whose fetch goes straight to each other, counting every RPC made. */
+async function twoRelays() {
+  const [pairA, pairB] = await Promise.all([generateRandomPair(), generateRandomPair()]);
+  const urlA = 'wss://relay-a.example/ws';
+  const urlB = 'wss://relay-b.example/ws';
+  const envA = { DB: new MemoryD1(), RELAY_SIGNING_PUBLIC_KEY: pairA.pub, RELAY_SIGNING_PRIVATE_KEY: pairA.priv, KADEMLIA_BOOTSTRAP_URLS: urlB };
+  const envB = { DB: new MemoryD1(), RELAY_SIGNING_PUBLIC_KEY: pairB.pub, RELAY_SIGNING_PRIVATE_KEY: pairB.priv };
+  const relays = new Map([
+    ['relay-a.example', { env: envA, selfUrl: urlA }],
+    ['relay-b.example', { env: envB, selfUrl: urlB }],
+  ]);
+  const calls = { count: 0 };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    const target = relays.get(new URL(request.url).hostname);
+    if (!target) return new Response('not found', { status: 404 });
+    calls.count += 1;
+    return handleKademliaRequest(request, target.env, { selfUrl: target.selfUrl });
+  };
+  return { envA, envB, urlA, urlB, calls, restore: () => { globalThis.fetch = realFetch; } };
+}
+
+test('a heartbeat on an empty table joins; once a contact is live it makes no RPCs and writes nothing', async () => {
+  const { envA, urlA, calls, restore } = await twoRelays();
+  try {
+    const first = await heartbeatKademlia(envA, urlA);
+    assert.equal(first.joined, true);
+    assert.ok(calls.count > 0, 'an empty relay must reach out to its bootstrap');
+    assert.equal(envA.DB.nodes.size, 1);
+
+    const rpcsAfterJoin = calls.count;
+    const writesAfterJoin = envA.DB.nodeWrites;
+    for (let i = 0; i < 5; i += 1) {
+      const again = await heartbeatKademlia(envA, urlA);
+      assert.equal(again.joined, false);
+    }
+    assert.equal(calls.count, rpcsAfterJoin, 'a relay with a live contact must not poll on a heartbeat');
+    assert.equal(envA.DB.nodeWrites, writesAfterJoin);
+  } finally {
+    restore();
+  }
+});
+
+test('a heartbeat joins again once every contact it knew has expired', async () => {
+  const { envA, urlA, calls, restore } = await twoRelays();
+  try {
+    await withClock(1_800_000_000_000, async (clock) => {
+      assert.equal((await heartbeatKademlia(envA, urlA)).joined, true);
+      const rpcsAfterJoin = calls.count;
+
+      clock.advance(60_000);
+      assert.equal((await heartbeatKademlia(envA, urlA)).joined, false);
+      assert.equal(calls.count, rpcsAfterJoin);
+
+      clock.advance(11 * 60_000); // past the longest a node record can live
+      assert.equal((await heartbeatKademlia(envA, urlA)).joined, true);
+      assert.ok(calls.count > rpcsAfterJoin);
+    });
+  } finally {
+    restore();
+  }
+});
