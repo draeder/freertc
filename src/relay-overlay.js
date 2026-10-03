@@ -4,13 +4,11 @@ import {
   DEFAULT_REPLICATION_FACTOR,
   bucketIndex,
   isNodeId,
-  peerRoutingKey,
   rankProviderRecords,
   scopeRoutingKey,
   selectClosestNodes,
 } from './kademlia.js';
 import {
-  PEER_PROVIDER_RECORD_KIND,
   PROVIDER_RECORD_KINDS,
   RELAY_NODE_RECORD_KIND,
   SCOPE_PROVIDER_RECORD_KIND,
@@ -33,8 +31,12 @@ const RPC_TIMEOUT_MS = 3_000;
 // starts. Node records live five minutes by default; rejoining at under half
 // that keeps this relay announced to its bootstraps without churning them.
 const BOOTSTRAP_REFRESH_INTERVAL_MS = 120_000;
-const PROVIDER_PUBLISH_INTERVAL_MS = 20_000;
-const PROVIDER_RECORD_TTL_MS = 45_000;
+// A relay announces that it serves a room, once a minute at most however many peers it holds
+// there. The record lives two minutes, the longest any relay accepts, so one missed
+// publication does not lapse it. Both are per relay and room, never per peer: a record per
+// peer republished on every peer's heartbeat made the overlay's work grow with the peers.
+const PROVIDER_PUBLISH_INTERVAL_MS = 60_000;
+const PROVIDER_RECORD_TTL_MS = 120_000;
 const MAX_RECENT_PROVIDER_PUBLISHES = 20_000;
 const PEER_PROVIDER_LOOKUP_CACHE_MS = 5_000;
 const MAX_RECENT_PEER_PROVIDER_LOOKUPS = 2_000;
@@ -512,37 +514,31 @@ export async function heartbeatKademlia(env, selfUrl, options = {}) {
   return { enabled: true, node_id: context.identity.nodeId, joined: true };
 }
 
-export async function publishPeerProviderRecords(env, selfUrl, network, room, peerId, options = {}) {
+/**
+ * Announce that this relay serves a room. Called on every peer's announce and heartbeat, it
+ * publishes at most once a minute per relay and room, whichever peer asks. Which relay holds
+ * one particular peer is not published: a sender asks the relays that serve the room, and
+ * only the one that holds the peer delivers (see handleRelayForward). `_peerId` stays in the
+ * signature for the callers that pass it.
+ */
+export async function publishPeerProviderRecords(env, selfUrl, network, room, _peerId, options = {}) {
   const context = await overlayContext(env, selfUrl, options);
   if (!context) return false;
-  const throttleKey = `${context.identity.nodeId}:${network}:${room}:${peerId}`;
+  const throttleKey = `${context.identity.nodeId}:${network}:${room}`;
   const now = Date.now();
   if (!markProviderPublish(throttleKey, now)) return true;
   await ensureRoutingContacts(context);
 
-  const shared = {
+  const scopeRecord = await createSignedProviderRecord(context.identity, {
     url: context.selfUrl,
     connections: options.connections || 0,
     capacity: Number(env.RELAY_CAPACITY || 10_000),
     ttlMs: PROVIDER_RECORD_TTL_MS,
     now,
-  };
-  const [scopeRecord, peerRecord] = await Promise.all([
-    createSignedProviderRecord(context.identity, {
-      ...shared,
-      kind: SCOPE_PROVIDER_RECORD_KIND,
-      key: await scopeRoutingKey(network, room),
-    }),
-    createSignedProviderRecord(context.identity, {
-      ...shared,
-      kind: PEER_PROVIDER_RECORD_KIND,
-      key: await peerRoutingKey(network, room, peerId),
-    }),
-  ]);
-  const [scopeLookup] = await Promise.all([
-    replicateProviderRecord(context, scopeRecord, Boolean(options.returnScopeProviders)),
-    replicateProviderRecord(context, peerRecord),
-  ]);
+    kind: SCOPE_PROVIDER_RECORD_KIND,
+    key: await scopeRoutingKey(network, room),
+  });
+  const scopeLookup = await replicateProviderRecord(context, scopeRecord, Boolean(options.returnScopeProviders));
   if (options.returnScopeProviders) {
     const records = [scopeRecord, ...scopeLookup.records]
       .filter((record) => record.kind === SCOPE_PROVIDER_RECORD_KIND && record.key === scopeRecord.key);
@@ -568,9 +564,15 @@ export async function lookupScopeProviders(env, selfUrl, network, room, options 
   return lookupProviders(env, selfUrl, await scopeRoutingKey(network, room), SCOPE_PROVIDER_RECORD_KIND, options);
 }
 
-export async function lookupPeerProviders(env, selfUrl, network, room, peerId, options = {}) {
-  const routingKey = await peerRoutingKey(network, room, peerId);
-  const cacheKey = JSON.stringify([selfUrl, network, room, peerId]);
+/**
+ * The relays that serve a room, which is where a message for any peer in it may be waiting.
+ * No relay publishes where one peer lives, so a sender asks these, and the one that does not
+ * hold the peer says so (handleRelayForward). Concurrent callers share one lookup: an offer
+ * and its burst of ICE packets all target the same room.
+ */
+export async function lookupRoomProviders(env, selfUrl, network, room, options = {}) {
+  const routingKey = await scopeRoutingKey(network, room);
+  const cacheKey = JSON.stringify([selfUrl, network, room]);
   const now = Date.now();
   const cached = recentPeerProviderLookups.get(cacheKey);
   if (cached?.promise) {
@@ -592,7 +594,7 @@ export async function lookupPeerProviders(env, selfUrl, network, room, peerId, o
   // They all target the same peer and must share one Kademlia lookup instead of
   // launching an expensive overlay walk per packet. Empty results are not
   // cached so a just-published provider can be found by the next packet.
-  const promise = lookupProviders(env, selfUrl, routingKey, PEER_PROVIDER_RECORD_KIND, options)
+  const promise = lookupProviders(env, selfUrl, routingKey, SCOPE_PROVIDER_RECORD_KIND, options)
     .then((records) => {
       if (records.length > 0) {
         rememberPeerProviderLookup(cacheKey, {

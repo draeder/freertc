@@ -3,7 +3,7 @@ import {
   heartbeatKademlia,
   isKademliaEnabled,
   listKnownRelays,
-  lookupPeerProviders,
+  lookupRoomProviders,
   lookupScopeProviders,
   publishPeerProviderRecords,
 } from "./relay-overlay.js";
@@ -37,7 +37,10 @@ const MAX_BATCH = 50;
 const RELAY_EXPIRY_MS = 5 * 60_000;       // relay entry expires after 5 min without heartbeat
 const FEDERATION_INTERVAL_MS = 2 * 60_000; // re-heartbeat every 2 min per isolate
 const DEFAULT_HUB_URL = "wss://peer.ooo/ws"; // default bootstrap hub
-const KADEMLIA_FORWARD_LIMIT = 2;
+// Relays asked to deliver a message when none is known to hold its peer. They are the relays
+// that serve the room, and each one that does not hold the peer says so, so asking all of
+// them (up to the most a lookup returns) costs requests, not queued copies.
+const KADEMLIA_FORWARD_LIMIT = 8;
 const FEDERATED_FORWARD_DEADLINE_MS = 15_000;
 const PEER_RELAY_HINT_TTL_MS = 60_000;
 
@@ -658,7 +661,7 @@ async function handleListPeers(request, env) {
   return jsonResponse({ ok: true, peers });
 }
 
-async function handleRelayForward(request, env) {
+export async function handleRelayForward(request, env) {
   if (!env.DB) return jsonResponse({ ok: false, error: "No database" }, 503);
   let body;
   try { body = await request.json(); } catch { return jsonResponse({ ok: false, error: "Invalid JSON" }, 400); }
@@ -690,10 +693,26 @@ async function handleRelayForward(request, env) {
       console.log(`[FED-IN] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} from ${viaRelayUrl}: live socket send failed (${error?.message})`);
     }
   } else {
-    console.log(`[FED-IN] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} from ${viaRelayUrl}: not live here (${livePeers.size} live); queued`);
+    console.log(`[FED-IN] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} from ${viaRelayUrl}: not live here (${livePeers.size} live)`);
+  }
+  // A relay that has never heard of the peer keeps nothing for it. The sender asks every relay
+  // that serves the room, so a copy queued at each would be a write apiece and a false
+  // "queued" to the sender. A peer announced here but momentarily without a socket is still
+  // held for, as before.
+  if (!live && !(await peerIsKnownHere(env.DB, message.network, room, message.to))) {
+    return jsonResponse({ ok: true, delivered: false, queued: false }, 200);
   }
   await insertRelayMessage(env.DB, message);
   return jsonResponse({ ok: true, delivered: false, queued: true }, 202);
+}
+
+async function peerIsKnownHere(db, network, room, peerId) {
+  const result = await db.prepare(`
+    SELECT 1 AS known FROM psp_announcements
+    WHERE network = ?1 AND peer_id = ?2 AND expires_at_ms > ?3
+    LIMIT 1
+  `).bind(scopeKey(network, room), peerId, Date.now()).all();
+  return (result.results || []).length > 0;
 }
 
 // POST to the global hub; cache returned relay list into own D1 so both sides know each other
@@ -920,12 +939,11 @@ export async function forwardFederatedMessage(
   let remoteUrls;
   let providerUrls = new Set();
   if (kademliaEnabled) {
-    const providers = await lookupPeerProviders(
+    const providers = await lookupRoomProviders(
       env,
       selfRelayUrl,
       network,
       room,
-      message.to,
       { connections },
     );
     providerUrls = new Set(providers.map((provider) => provider.url));

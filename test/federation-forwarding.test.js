@@ -7,6 +7,7 @@ import {
   forwardFederatedMessage,
   forwardToRelay,
   getPeerRelayHint,
+  handleRelayForward,
   rememberPeerRelayHint,
 } from '../src/index.js';
 
@@ -150,6 +151,87 @@ test('fresh discovery route hints bypass a Kademlia lookup in both relay directi
       message,
       via: 'wss://relay-a.example/ws',
     });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+/** A D1 stand-in that knows whether a peer is announced here and records what is queued for it. */
+function relayDb({ announced }) {
+  const queued = [];
+  return {
+    queued,
+    prepare(sql) {
+      return {
+        bind: (...values) => ({
+          async all() {
+            return { results: announced && sql.includes('FROM psp_announcements') ? [{ known: 1 }] : [] };
+          },
+          async run() {
+            if (sql.includes('INSERT INTO psp_relay')) queued.push(values);
+            return { success: true };
+          },
+        }),
+      };
+    },
+  };
+}
+
+const forwardedOffer = (to) => ({
+  psp_version: '1.0',
+  type: 'offer',
+  network: 'network-host',
+  from: 'peer-a',
+  to,
+  session_id: 'room-host',
+  message_id: `message-${to}`,
+  timestamp: Date.now(),
+  ttl_ms: null,
+  reply_to: null,
+  body: {},
+});
+
+const receiveForward = (db, message) => handleRelayForward(
+  new Request('https://relay-b.example/api/v1/relay', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message, via: 'wss://relay-a.example/ws' }),
+  }),
+  { DB: db },
+);
+
+test('a relay that does not hold the peer says so and keeps nothing', async () => {
+  const db = relayDb({ announced: false });
+  const response = await receiveForward(db, forwardedOffer('peer-elsewhere'));
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true, delivered: false, queued: false });
+  assert.equal(db.queued.length, 0);
+});
+
+test('a relay that holds the peer, announced but without a live socket, still queues for it', async () => {
+  const db = relayDb({ announced: true });
+  const response = await receiveForward(db, forwardedOffer('peer-here'));
+  assert.equal(response.status, 202);
+  assert.deepEqual(await response.json(), { ok: true, delivered: false, queued: true });
+  assert.equal(db.queued.length, 1);
+});
+
+test('a sender treats "not here" as a failed route, not a queued one', async () => {
+  const originalFetch = globalThis.fetch;
+  const db = relayDb({ announced: false });
+  // The sender's request goes straight to the receiving relay's handler.
+  globalThis.fetch = async (input, init) => handleRelayForward(new Request(input, init), { DB: db });
+  try {
+    const now = Date.now();
+    rememberPeerRelayHint('network-host', 'room-host', 'peer-gone', 'wss://relay-b.example/ws', now);
+    assert.equal(await forwardFederatedMessage(
+      {},
+      'wss://relay-a.example/ws',
+      'network-host',
+      'room-host',
+      forwardedOffer('peer-gone'),
+    ), false);
+    assert.equal(db.queued.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }

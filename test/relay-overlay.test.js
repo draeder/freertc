@@ -17,7 +17,7 @@ import {
   handleKademliaRequest,
   heartbeatKademlia,
   isKademliaEnabled,
-  lookupPeerProviders,
+  lookupRoomProviders,
   lookupScopeProviders,
   publishPeerProviderRecords,
 } from '../src/relay-overlay.js';
@@ -156,7 +156,7 @@ test('two relays join, replicate, and resolve signed scope and peer providers', 
 
     const [scopeProviders, peerProviders] = await Promise.all([
       lookupScopeProviders(envB, urlB, 'network-z', 'room-z'),
-      lookupPeerProviders(envB, urlB, 'network-z', 'room-z', 'peer-z'),
+      lookupRoomProviders(envB, urlB, 'network-z', 'room-z'),
     ]);
     assert.deepEqual(scopeProviders.map((record) => record.url), [urlA]);
     assert.deepEqual(peerProviders.map((record) => record.url), [urlA]);
@@ -202,7 +202,7 @@ test('concurrent signal bursts share one peer-provider lookup', async () => {
     findCalls = 0;
 
     const results = await Promise.all(Array.from({ length: 12 }, () => (
-      lookupPeerProviders(envB, urlB, 'network-burst', 'room-burst', 'peer-burst')
+      lookupRoomProviders(envB, urlB, 'network-burst', 'room-burst')
     )));
     const afterBurst = findCalls;
 
@@ -210,7 +210,7 @@ test('concurrent signal bursts share one peer-provider lookup', async () => {
     assert.ok(afterBurst > 0);
     assert.ok(afterBurst <= 2, `expected one coalesced lookup, received ${afterBurst} overlay requests`);
 
-    await lookupPeerProviders(envB, urlB, 'network-burst', 'room-burst', 'peer-burst');
+    await lookupRoomProviders(envB, urlB, 'network-burst', 'room-burst');
     assert.equal(findCalls, afterBurst);
   } finally {
     globalThis.fetch = originalFetch;
@@ -395,6 +395,60 @@ test('a heartbeat on an empty table joins; once a contact is live it makes no RP
     }
     assert.equal(calls.count, rpcsAfterJoin, 'a relay with a live contact must not poll on a heartbeat');
     assert.equal(envA.DB.nodeWrites, writesAfterJoin);
+  } finally {
+    restore();
+  }
+});
+
+test('many peers in one room are one publication of the room, and none of any single peer', async () => {
+  const { envA, envB, urlA, restore } = await twoRelays();
+  const stores = [];
+  const inner = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    if (new URL(request.url).pathname === '/api/v1/kad/store') stores.push((await request.clone().json()).record.kind);
+    return inner(input, init);
+  };
+  try {
+    await withClock(1_800_000_000_000, async (clock) => {
+      await heartbeatKademlia(envA, urlA);
+      stores.length = 0;
+      // Thirty peers announcing and heartbeating inside one minute.
+      for (let i = 0; i < 30; i += 1) {
+        await publishPeerProviderRecords(envA, urlA, 'network-room', 'room-one', `peer-${i}`, { connections: i });
+        clock.advance(1_900);
+      }
+      assert.equal(stores.length, 1, 'one relay holds the closest copy, written once');
+      assert.ok(!stores.includes(PEER_PROVIDER_RECORD_KIND), 'no record is published for a single peer');
+      assert.ok([...envB.DB.records.values()].every((row) => row.kind !== PEER_PROVIDER_RECORD_KIND));
+
+      clock.advance(61_000); // past the publish interval, still inside the record's life
+      await publishPeerProviderRecords(envA, urlA, 'network-room', 'room-one', 'peer-3', { connections: 3 });
+      assert.equal(stores.length, 2, 'the room is announced again after a minute');
+
+      // A different room is its own announcement.
+      await publishPeerProviderRecords(envA, urlA, 'network-room', 'room-two', 'peer-3', { connections: 3 });
+      assert.equal(stores.length, 3);
+    });
+  } finally {
+    globalThis.fetch = inner;
+    restore();
+  }
+});
+
+test('the room record outlives the gap between publications, so a room never lapses while it is in use', async () => {
+  const { envA, envB, urlA, urlB, restore } = await twoRelays();
+  try {
+    await withClock(1_800_000_000_000, async (clock) => {
+      await heartbeatKademlia(envA, urlA);
+      await publishPeerProviderRecords(envA, urlA, 'network-live', 'room-live', 'peer-a', { connections: 1 });
+      // Just under two minutes later, a peer elsewhere still finds the room.
+      clock.advance(110_000);
+      assert.deepEqual((await lookupRoomProviders(envB, urlB, 'network-live', 'room-live')).map((r) => r.url), [urlA]);
+      // Past it, a room nobody re-announced is gone.
+      clock.advance(20_000);
+      assert.deepEqual(await lookupRoomProviders(envB, urlB, 'network-live', 'room-live'), []);
+    });
   } finally {
     restore();
   }
