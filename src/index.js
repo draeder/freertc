@@ -11,7 +11,7 @@ import {
 import { relayPeerIdFor } from "./relay-id.js";
 
 const PSP_VERSION = "1.0";
-const WORKER_VERSION = "0.4.3";
+const WORKER_VERSION = "0.4.4";
 
 const DISCOVERY_TYPES = new Set(["announce", "withdraw", "discover", "peer_list", "redirect"]);
 const NEGOTIATION_TYPES = new Set(["connect_request", "connect_accept", "connect_reject", "offer", "answer", "ice_candidate", "ice_end", "renegotiate"]);
@@ -417,6 +417,19 @@ let lastFederationMs = 0; // tracks last heartbeat time within this isolate
 
 export default {
   async fetch(request, env, ctx) {
+    try {
+      return await handleFetch(request, env, ctx);
+    } catch (error) {
+      // An error that escapes a handler (a D1 call, a Durable Object hand-off) is logged
+      // with its path and answered with a 503, instead of failing the invocation.
+      console.error(`[FETCH] ${request.method} ${new URL(request.url).pathname}: ${error?.stack || error}`);
+      return jsonResponse({ ok: false, error: "Relay temporarily unavailable" }, 503);
+    }
+  }
+};
+
+async function handleFetch(request, env, ctx) {
+  {
     const url = new URL(request.url);
     const upgrade = request.headers.get("Upgrade");
     const selfRelayUrl = resolveSelfRelayUrl(request, env.RELAY_URL);
@@ -430,7 +443,10 @@ export default {
         ctx.waitUntil((async () => {
           const relayName = env.RELAY_NAME || relayHostname(selfRelayUrl);
           if (isKademliaEnabled(env)) {
-            await heartbeatKademlia(env, selfRelayUrl, { connections: livePeers.size });
+            // A failed join is retried on the next heartbeat. Left uncaught, the rejection
+            // marked the request that happened to start it as a script exception.
+            await heartbeatKademlia(env, selfRelayUrl, { connections: livePeers.size })
+              .catch((error) => console.error(`[KAD] heartbeat failed: ${error?.stack || error}`));
             return;
           }
 
@@ -531,7 +547,7 @@ export default {
 
     return env.ASSETS?.fetch(request) ?? new Response("Not Found", { status: 404 });
   }
-};
+}
 
 // Cloudflare may run an HTTP federation request in a different Worker isolate
 // from the destination WebSocket. A single Durable Object per relay owns both
