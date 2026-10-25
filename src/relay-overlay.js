@@ -31,14 +31,18 @@ const RPC_TIMEOUT_MS = 3_000;
 // starts. Node records live five minutes by default; rejoining at under half
 // that keeps this relay announced to its bootstraps without churning them.
 const BOOTSTRAP_REFRESH_INTERVAL_MS = 120_000;
-// A relay announces that it serves a room, once a minute at most however many peers it holds
-// there. The record lives two minutes, the longest any relay accepts, so one missed
-// publication does not lapse it. Both are per relay and room, never per peer: a record per
-// peer republished on every peer's heartbeat made the overlay's work grow with the peers.
-const PROVIDER_PUBLISH_INTERVAL_MS = 60_000;
-const PROVIDER_RECORD_TTL_MS = 120_000;
+// A relay announces that it serves a room when it starts serving it, and again only as the
+// record nears expiry, never on a peer's heartbeat: a record that has not changed is not
+// published again. Nothing withdraws a record, so a room a relay stops serving, or a relay
+// that goes away, lapses when the record expires. Both are per relay and room, never per peer.
+const PROVIDER_RECORD_TTL_MS = 30 * 60_000;
+const PROVIDER_PUBLISH_INTERVAL_MS = 20 * 60_000;
 const MAX_RECENT_PROVIDER_PUBLISHES = 20_000;
-const PEER_PROVIDER_LOOKUP_CACHE_MS = 5_000;
+// Which relays serve a room changes only when a relay starts serving it or its record lapses,
+// so a lookup is trusted for minutes. A forward that the cached relays cannot deliver asks
+// again (refreshRoomProviders), at most once per room per PEER_PROVIDER_REFRESH_MIN_AGE_MS.
+const PEER_PROVIDER_LOOKUP_CACHE_MS = 10 * 60_000;
+const PEER_PROVIDER_REFRESH_MIN_AGE_MS = 30_000;
 const MAX_RECENT_PEER_PROVIDER_LOOKUPS = 2_000;
 // A shared pending promise must never park every caller forever. A join or a
 // lookup started on behalf of one socket can be abandoned by the platform when
@@ -577,7 +581,22 @@ async function lookupProviders(env, selfUrl, routingKey, kind, options = {}) {
 }
 
 export async function lookupScopeProviders(env, selfUrl, network, room, options = {}) {
-  return lookupProviders(env, selfUrl, await scopeRoutingKey(network, room), SCOPE_PROVIDER_RECORD_KIND, options);
+  return lookupRoomProviders(env, selfUrl, network, room, options);
+}
+
+/**
+ * Forget a room's cached providers so the next lookup asks the overlay, unless they were
+ * fetched within PEER_PROVIDER_REFRESH_MIN_AGE_MS. Returns whether they were forgotten: a
+ * forward the cached relays could not deliver calls this, and a peer that is simply gone
+ * cannot make every message for it a fresh lookup.
+ */
+export function refreshRoomProviders(selfUrl, network, room, now = Date.now()) {
+  const cacheKey = JSON.stringify([selfUrl, network, room]);
+  const cached = recentPeerProviderLookups.get(cacheKey);
+  if (!cached?.records) return false;
+  if (now - cached.fetchedAt < PEER_PROVIDER_REFRESH_MIN_AGE_MS) return false;
+  recentPeerProviderLookups.delete(cacheKey);
+  return true;
 }
 
 /**
@@ -615,7 +634,12 @@ export async function lookupRoomProviders(env, selfUrl, network, room, options =
       if (records.length > 0) {
         rememberPeerProviderLookup(cacheKey, {
           records,
-          expiresAt: Date.now() + PEER_PROVIDER_LOOKUP_CACHE_MS,
+          fetchedAt: Date.now(),
+          // Never trusted past the first of its records to lapse.
+          expiresAt: Math.min(
+            Date.now() + PEER_PROVIDER_LOOKUP_CACHE_MS,
+            ...records.map((record) => Number(record.expires_at_ms) || Infinity),
+          ),
         });
       } else {
         recentPeerProviderLookups.delete(cacheKey);

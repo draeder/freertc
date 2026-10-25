@@ -7,11 +7,12 @@ import {
   lookupRoomProviders,
   lookupScopeProviders,
   publishPeerProviderRecords,
+  refreshRoomProviders,
 } from "./relay-overlay.js";
 import { relayPeerIdFor } from "./relay-id.js";
 
 const PSP_VERSION = "1.0";
-const WORKER_VERSION = "0.4.4";
+const WORKER_VERSION = "0.4.5";
 
 const DISCOVERY_TYPES = new Set(["announce", "withdraw", "discover", "peer_list", "redirect"]);
 const NEGOTIATION_TYPES = new Set(["connect_request", "connect_accept", "connect_reject", "offer", "answer", "ice_candidate", "ice_end", "renegotiate"]);
@@ -935,11 +936,12 @@ export async function forwardFederatedMessage(
   room,
   message,
   connections = 0,
+  options = {},
 ) {
-  const attempted = new Set();
+  const attempted = new Set(options.attempted || []);
   const queued = new Set();
   const hintedRelay = getPeerRelayHint(network, room, message.to);
-  if (hintedRelay && hintedRelay !== selfRelayUrl) {
+  if (hintedRelay && hintedRelay !== selfRelayUrl && !attempted.has(hintedRelay)) {
     attempted.add(hintedRelay);
     const result = await forwardToRelayResult(hintedRelay, message, selfRelayUrl);
     if (result === "delivered") return true;
@@ -972,7 +974,7 @@ export async function forwardFederatedMessage(
     if ([...queued].some((relayUrl) => providerUrls.has(relayUrl))) return true;
   }
 
-  if (!remoteUrls.length) return false;
+  if (!remoteUrls.length && !kademliaEnabled) return false;
   const results = await Promise.all(remoteUrls.map(async (relayUrl) => ({
     relayUrl,
     result: await forwardToRelayResult(relayUrl, message, selfRelayUrl),
@@ -984,6 +986,12 @@ export async function forwardFederatedMessage(
   }
   if (kademliaEnabled && results.some(({ result }) => result === "queued")) {
     return true;
+  }
+  // The room's relays are cached for minutes, so a relay that started serving it since then
+  // is missing from them. Ask the overlay again once and try only the relays that are new.
+  if (kademliaEnabled && !options.refreshed && refreshRoomProviders(selfRelayUrl, network, room)) {
+    for (const relayUrl of remoteUrls) attempted.add(relayUrl);
+    return forwardFederatedMessage(env, selfRelayUrl, network, room, message, connections, { refreshed: true, attempted });
   }
   return false;
 }

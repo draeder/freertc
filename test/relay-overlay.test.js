@@ -18,6 +18,7 @@ import {
   heartbeatKademlia,
   isKademliaEnabled,
   lookupRoomProviders,
+  refreshRoomProviders,
   lookupScopeProviders,
   publishPeerProviderRecords,
 } from '../src/relay-overlay.js';
@@ -502,9 +503,13 @@ test('many peers in one room are one publication of the room, and none of any si
       assert.ok(!stores.includes(PEER_PROVIDER_RECORD_KIND), 'no record is published for a single peer');
       assert.ok([...envB.DB.records.values()].every((row) => row.kind !== PEER_PROVIDER_RECORD_KIND));
 
-      clock.advance(61_000); // past the publish interval, still inside the record's life
+      clock.advance(61_000); // a heartbeat a minute later changes nothing, so nothing is published
       await publishPeerProviderRecords(envA, urlA, 'network-room', 'room-one', 'peer-3', { connections: 3 });
-      assert.equal(stores.length, 2, 'the room is announced again after a minute');
+      assert.equal(stores.length, 1, 'an unchanged room is not announced again');
+
+      clock.advance(20 * 60_000); // nearing the record's expiry, it is renewed
+      await publishPeerProviderRecords(envA, urlA, 'network-room', 'room-one', 'peer-3', { connections: 3 });
+      assert.equal(stores.length, 2, 'the room is announced again before its record lapses');
 
       // A different room is its own announcement.
       await publishPeerProviderRecords(envA, urlA, 'network-room', 'room-two', 'peer-3', { connections: 3 });
@@ -522,12 +527,39 @@ test('the room record outlives the gap between publications, so a room never lap
     await withClock(1_800_000_000_000, async (clock) => {
       await heartbeatKademlia(envA, urlA);
       await publishPeerProviderRecords(envA, urlA, 'network-live', 'room-live', 'peer-a', { connections: 1 });
-      // Just under two minutes later, a peer elsewhere still finds the room.
-      clock.advance(110_000);
+      // Twenty-nine minutes later, past the renewal interval, a peer elsewhere still finds it.
+      clock.advance(29 * 60_000);
       assert.deepEqual((await lookupRoomProviders(envB, urlB, 'network-live', 'room-live')).map((r) => r.url), [urlA]);
-      // Past it, a room nobody re-announced is gone.
-      clock.advance(20_000);
+      // Past thirty minutes, a room nobody renewed is gone, even from the lookup cache.
+      clock.advance(2 * 60_000);
       assert.deepEqual(await lookupRoomProviders(envB, urlB, 'network-live', 'room-live'), []);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test('a room lookup is reused for minutes, and asked again on a miss at most every thirty seconds', async () => {
+  const { envA, envB, urlA, urlB, calls, restore } = await twoRelays();
+  try {
+    await withClock(1_800_000_000_000, async (clock) => {
+      await heartbeatKademlia(envA, urlA);
+      await heartbeatKademlia(envB, urlB);
+      await publishPeerProviderRecords(envA, urlA, 'network-cache', 'room-cache', 'peer-a', { connections: 1 });
+      assert.deepEqual((await lookupRoomProviders(envB, urlB, 'network-cache', 'room-cache')).map((r) => r.url), [urlA]);
+
+      const afterFirst = calls.count;
+      clock.advance(5 * 60_000);
+      assert.deepEqual((await lookupRoomProviders(envB, urlB, 'network-cache', 'room-cache')).map((r) => r.url), [urlA]);
+      assert.equal(calls.count, afterFirst, 'a cached lookup asks no relay');
+
+      assert.equal(refreshRoomProviders(urlB, 'network-cache', 'room-cache'), true, 'a miss forgets a lookup older than thirty seconds');
+      assert.deepEqual((await lookupRoomProviders(envB, urlB, 'network-cache', 'room-cache')).map((r) => r.url), [urlA]);
+
+      clock.advance(10_000);
+      assert.equal(refreshRoomProviders(urlB, 'network-cache', 'room-cache'), false, 'the lookup was made again, and one under thirty seconds old is kept');
+      clock.advance(25_000);
+      assert.equal(refreshRoomProviders(urlB, 'network-cache', 'room-cache'), true);
     });
   } finally {
     restore();

@@ -9,7 +9,9 @@ export const PROVIDER_RECORD_KINDS = new Set([SCOPE_PROVIDER_RECORD_KIND, PEER_P
 const RECORD_VERSION = 1;
 const MAX_CLOCK_SKEW_MS = 60_000;
 const MAX_NODE_RECORD_TTL_MS = 10 * 60_000;
-const MAX_PROVIDER_RECORD_TTL_MS = 2 * 60_000;
+// A room record is republished only when its relay starts serving the room, or as it nears
+// expiry; it is never withdrawn, so a relay that goes away lapses within this window.
+const MAX_PROVIDER_RECORD_TTL_MS = 30 * 60_000;
 const IDENTITY_SECRET_VERSION = 1;
 
 export function encodeRelayIdentitySecret(publicKey, privateKey) {
