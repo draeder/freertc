@@ -35,6 +35,25 @@ export function decodeRelayIdentitySecret(value) {
   return { publicKey: parsed.pub, privateKey: parsed.priv };
 }
 
+// A relay address only a local network can reach: loopback, a private or
+// link-local range, carrier-grade NAT, or a .local / .localhost name. A record
+// carrying one is meaningless to relays elsewhere, and accepting it sends them
+// calls to an address that answers nobody (or the wrong machine).
+export function isPrivateRelayUrl(value) {
+  let host;
+  try { host = new URL(String(value)).hostname.toLowerCase().replace(/^\[|\]$/g, ''); } catch { return true; }
+  if (!host || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) return true;
+  if (host === '::1' || host === '::' || /^f[cd][0-9a-f]{2}:/.test(host) || /^fe[89ab][0-9a-f]:/.test(host)) return true;
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!v4) return false;
+  const [a, b] = [Number(v4[1]), Number(v4[2])];
+  return a === 0 || a === 10 || a === 127
+    || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && b === 168)
+    || (a === 100 && b >= 64 && b <= 127);
+}
+
 function unsignedRecord(record) {
   const { signature: _signature, ...payload } = record;
   return payload;
@@ -48,8 +67,22 @@ function normalizeRelayUrl(value) {
   if (url.protocol !== 'wss:' && url.protocol !== 'ws:') throw new TypeError('Relay URL must use ws:// or wss://');
   url.hash = '';
   url.search = '';
-  url.pathname = '/ws';
+  // A relay behind NAT is reached through a tunnel on a public relay, at
+  // /t/<its node id>/ws there (src/tunnel). Every other path is /ws.
+  url.pathname = TUNNEL_PATH_RE.test(url.pathname) ? url.pathname : '/ws';
   return url.toString();
+}
+
+const TUNNEL_PATH_RE = /^\/t\/[0-9a-f]{64}\/ws$/;
+
+/** The node id a tunnel relay URL names, or null for a direct one. */
+export function tunnelNodeIdOf(value) {
+  try {
+    const match = /^\/t\/([0-9a-f]{64})\/ws$/.exec(new URL(value).pathname);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
 }
 
 async function signRecord(payload, privateKey) {
@@ -126,9 +159,32 @@ export async function verifySignedRelayRecord(record, options = {}) {
     if (!Number.isFinite(issuedAt) || !Number.isFinite(expiresAt)) return false;
     if (issuedAt > now + MAX_CLOCK_SKEW_MS || expiresAt <= now || expiresAt - issuedAt > maxTtl) return false;
     if (normalizeRelayUrl(record.url) !== record.url) return false;
+    // A relay can only claim its own tunnel.
+    const tunnelId = tunnelNodeIdOf(record.url);
+    if (tunnelId && tunnelId !== record.node_id) return false;
     if (record.kind !== RELAY_NODE_RECORD_KIND && !isNodeId(record.key)) return false;
 
     return await verifyMessage(canonicalJson(unsignedRecord(record)), record.signature, record.public_key);
+  } catch {
+    return false;
+  }
+}
+
+// A tunnel home proves the relay on the other end of a tunnel holds the key
+// its node id comes from: it sends a fresh nonce, and the relay signs it
+// together with the home's host, so a signature is good for one home and one
+// connection only.
+function tunnelChallengeMessage(nonce, host) {
+  return canonicalJson(['freertc-tunnel', 1, String(nonce), String(host).toLowerCase()]);
+}
+
+export async function signTunnelChallenge(identity, nonce, host) {
+  return signMessage(tunnelChallengeMessage(nonce, host), identity.privateKey);
+}
+
+export async function verifyTunnelChallenge(publicKey, nonce, host, signature) {
+  try {
+    return await verifyMessage(tunnelChallengeMessage(nonce, host), signature, publicKey);
   } catch {
     return false;
   }

@@ -10,6 +10,8 @@ import {
   refreshRoomProviders,
 } from "./relay-overlay.js";
 import { relayPeerIdFor } from "./relay-id.js";
+import { tunnelRoute } from "./tunnel/frames.js";
+export { RelayTunnel } from "./tunnel/home.js";
 
 const PSP_VERSION = "1.0";
 const WORKER_VERSION = "0.4.6";
@@ -463,6 +465,14 @@ async function handleFetch(request, env, ctx) {
           }
         })());
       }
+    }
+
+    // /t/<node id>/... is a relay behind NAT that tunnels through this one
+    // (src/tunnel): its federation calls and peer WebSockets go down the tunnel.
+    const tunnel = tunnelRoute(url.pathname);
+    if (tunnel) {
+      if (!env.RELAY_TUNNEL) return jsonResponse({ ok: false, error: "This relay is not a tunnel home" }, 404);
+      return env.RELAY_TUNNEL.get(env.RELAY_TUNNEL.idFromName(tunnel.nodeId)).fetch(request);
     }
 
     if (request.method === "OPTIONS" && url.pathname.startsWith("/api/")) {

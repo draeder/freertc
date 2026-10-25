@@ -1,4 +1,4 @@
-FROM node:20-alpine
+FROM node:22-alpine
 
 WORKDIR /app
 
@@ -45,4 +45,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD node -e "require('https').get({hostname:'localhost',port:8443,path:'/health',rejectUnauthorized:false},(r)=>process.exit(r.statusCode===200?0:1))"
 
 # Run production server
-CMD ["node", "scripts/prod-server.mjs"]
+CMD ["node", "--env-file=.env.local.prod", "scripts/node-relay.mjs"]

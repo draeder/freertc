@@ -104,7 +104,7 @@ if (subcommand === 'deploy') {
 }
 
 if (subcommand === 'dev') {
-  runInProject(process.execPath, [path.join(PACKAGE_ROOT, 'scripts', 'non-cloudflare-server.mjs'), ...rest], { bootstrap: true });
+  runInProject(process.execPath, [path.join(PACKAGE_ROOT, 'scripts', 'node-relay.mjs'), ...rest], { bootstrap: true });
 }
 
 if (subcommand === 'dev:cf' || subcommand === 'dev-cf') {
