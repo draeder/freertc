@@ -424,6 +424,22 @@ server.on('upgrade', (req, socket, head) => {
 
 setInterval(cleanExpired, 5000).unref();
 
+// Reachable from the public internet without a forwarded port: register with
+// a rendezvous and accept hole-punched data channels, each handled exactly
+// like a WebSocket client. Off unless PUNCH_RENDEZVOUS_URL is set.
+if (process.env.PUNCH_RENDEZVOUS_URL) {
+  const { listenForPunches } = await import('../src/punch/transport.js');
+  const listenerId = process.env.PUNCH_LISTENER_ID || `freertc-${crypto.randomUUID()}`;
+  listenForPunches({
+    rendezvousUrl: process.env.PUNCH_RENDEZVOUS_URL,
+    listenerId,
+    name: process.env.RELAY_NAME || listenerId,
+    onSocket: (socket) => attachSocketHandlers(socket),
+    log: (line) => console.log(`[node-relay:punch] ${line}`),
+  });
+  console.log(`[node-relay] accepting punched connections as ${listenerId}`);
+}
+
 server.listen(PORT, HOST, () => {
   console.log(`[node-relay] listening on http://${HOST}:${PORT}`);
   console.log(`[node-relay] ws endpoint ws://${HOST}:${PORT}/ws`);
