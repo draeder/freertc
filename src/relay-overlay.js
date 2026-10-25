@@ -580,8 +580,10 @@ async function lookupProviders(env, selfUrl, routingKey, kind, options = {}) {
   return rankProviderRecords(records, MAX_PROVIDER_RELAYS);
 }
 
+// Discovery always asks the overlay. A relay that looked a room up before any other relay served
+// it would otherwise keep "only me" for minutes and never find the peers that joined elsewhere.
 export async function lookupScopeProviders(env, selfUrl, network, room, options = {}) {
-  return lookupRoomProviders(env, selfUrl, network, room, options);
+  return lookupProviders(env, selfUrl, await scopeRoutingKey(network, room), SCOPE_PROVIDER_RECORD_KIND, options);
 }
 
 /**
