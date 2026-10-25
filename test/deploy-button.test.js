@@ -91,7 +91,7 @@ test("no config, script or source sets a relay peer ID by hand", () => {
   const files = [
     "wrangler.jsonc", "wrangler.template.jsonc", "wrangler.workers-dev.jsonc",
     "docker-compose.prod.yml", ".env.local.prod.example",
-    "src/index.js", "scripts/non-cloudflare-server.mjs", "scripts/prod-server.mjs",
+    "src/index.js", "scripts/node-relay.mjs",
     "scripts/generate-prod-config.mjs", "scripts/wrangler-install-wizard.mjs",
   ];
   for (const file of files) {

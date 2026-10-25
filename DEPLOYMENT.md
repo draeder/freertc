@@ -244,7 +244,7 @@ curl: (7) Failed to connect to localhost:8443
 
 #### CORS Issues
 
-Enable CORS in the server. Edit `scripts/prod-server.mjs` to add CORS headers if needed.
+Enable CORS in the server. The relay is `scripts/node-relay.mjs`, which serves the same responses (and CORS headers) as the worker.
 
 ### Security Considerations
 
@@ -282,3 +282,18 @@ See [wrangler documentation](https://developers.cloudflare.com/workers/) for det
 - [ ] Firewall rules configured
 - [ ] Monitoring/logging enabled
 - [ ] Backups configured (for data persistence)
+
+## Local relay federation
+
+Every local relay is `scripts/node-relay.mjs` (`npm run dev`, `freertc dev`, `npm run dev:prod`, Docker). It runs the same code as the Cloudflare worker, with SQLite in place of D1, and federates with other relays by default.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `FREERTC_FEDERATION` | `on` | `off` runs a standalone relay that joins no other relay. |
+| `FREERTC_PUBLIC` | `true` | A public relay joins the public relays and never federates a loopback or private address (127.x, 10.x, 192.168.x, 172.16–31.x, 169.254.x, 100.64/10, ::1, fc00::/7, fe80::/10, `localhost`, `*.local`), whether its own or one another relay announces. `false` is a private/LAN mesh that takes local addresses. |
+| `RELAY_URL` | `wss://PROD_DOMAIN/ws`, else `ws://HOST:PORT/ws` | The address other relays and peers use. A public relay with a private `RELAY_URL` stays out of federation and logs why. |
+| `KADEMLIA_BOOTSTRAP_URLS` | the public relays (public); none (private) | Relays to join through. |
+| `FREERTC_DATA_DIR`, `DB_PATH` | `./.freertc-relay` | The SQLite database and the generated relay identity. |
+| `TLS_CERT_PATH`, `TLS_KEY_PATH` | unset | Serve HTTPS/WSS. |
+
+Node 22.13 or later is required (`node:sqlite`).

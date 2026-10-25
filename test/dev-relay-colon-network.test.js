@@ -6,10 +6,13 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
 import WebSocket from 'ws';
 
-const SERVER = fileURLToPath(new URL('../scripts/non-cloudflare-server.mjs', import.meta.url));
+const SERVER = fileURLToPath(new URL('../scripts/node-relay.mjs', import.meta.url));
 const PORT = 18_700 + Math.floor(Math.random() * 200);
 const STARTUP_TIMEOUT_MS = 5000;
 const NETWORK = 'network:test';
@@ -29,10 +32,10 @@ const envelope = (type, from, body = {}) => JSON.stringify({
 });
 
 async function startRelay() {
-  const child = spawn(process.execPath, [SERVER], { env: { ...process.env, PORT: String(PORT) }, stdio: ['ignore', 'pipe', 'inherit'] });
+  const child = spawn(process.execPath, [SERVER], { env: { ...process.env, PORT: String(PORT), FREERTC_FEDERATION: 'off', FREERTC_DATA_DIR: mkdtempSync(path.join(tmpdir(), 'freertc-relay-')) }, stdio: ['ignore', 'pipe', 'inherit'] });
   const deadline = AbortSignal.timeout(STARTUP_TIMEOUT_MS);
   await new Promise((resolve, reject) => {
-    child.stdout.on('data', (chunk) => { if (String(chunk).includes('listening')) resolve(); });
+    child.stdout.on('data', (chunk) => { if (/\[node-relay\] .* on https?:\/\//.test(String(chunk))) resolve(); });
     child.once('exit', (code) => reject(new Error(`relay exited early with ${code}`)));
     deadline.addEventListener('abort', () => reject(new Error('relay did not start')));
   });
@@ -58,8 +61,9 @@ test('peers on a network whose name contains a colon find each other', async () 
     const b = await connect((ids) => seenByB.push(ids));
     sockets.push(a, b);
 
-    a.send(envelope('announce', 'peer-a-0000000000000001'));
-    b.send(envelope('announce', 'peer-b-0000000000000002'));
+    // As real peers do: the relay requires an announce's instance_id to name its network.
+    a.send(envelope('announce', 'peer-a-0000000000000001', { instance_id: NETWORK }));
+    b.send(envelope('announce', 'peer-b-0000000000000002', { instance_id: NETWORK }));
     b.send(envelope('discover', 'peer-b-0000000000000002', { limit: 16 }));
     await new Promise((resolve) => setTimeout(resolve, 500));
 

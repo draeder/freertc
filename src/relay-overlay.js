@@ -16,6 +16,7 @@ import {
   createSignedNodeRecord,
   createSignedProviderRecord,
   decodeRelayIdentitySecret,
+  isPrivateRelayUrl,
   verifySignedRelayRecord,
 } from './relay-identity.js';
 
@@ -145,6 +146,9 @@ async function configuredIdentity(env) {
 
 async function overlayContext(env, selfUrl, options = {}) {
   if (!env?.DB || !selfUrl || !isKademliaEnabled(env)) return null;
+  // A public relay whose own address is loopback or private has nothing it
+  // could announce that another relay could reach: it stays out.
+  if (isPublicRelay(env) && isPrivateRelayUrl(selfUrl)) return null;
   const identity = await configuredIdentity(env);
   if (!identity) return null;
   const nodeRecord = await createSignedNodeRecord(identity, {
@@ -221,10 +225,25 @@ function signedNodeRecord(record) {
   return signed;
 }
 
+/**
+ * A public relay (the default) never federates a loopback or private address:
+ * it neither stores nor passes on a record naming one. Only a relay configured
+ * as part of a private mesh (FREERTC_PUBLIC=false) accepts them.
+ */
+export function isPublicRelay(env) {
+  const value = String(env?.FREERTC_PUBLIC ?? 'true').trim().toLowerCase();
+  return !['false', '0', 'off', 'no'].includes(value);
+}
+
+function allowsPrivateRelays(context) {
+  return !isPublicRelay(context?.env);
+}
+
 async function acceptNodeRecord(context, record) {
   const signed = signedNodeRecord(record);
   const valid = await verifySignedRelayRecord(signed, { allowedKinds: new Set([RELAY_NODE_RECORD_KIND]) });
   if (!valid) return false;
+  if (isPrivateRelayUrl(signed.url) && !allowsPrivateRelays(context)) return false;
   await upsertNodeRecord(context, signed);
   return true;
 }
@@ -251,6 +270,7 @@ async function listActiveNodeRecords(context) {
 async function storeProviderRecord(context, record) {
   const valid = await verifySignedRelayRecord(record, { allowedKinds: PROVIDER_RECORD_KINDS });
   if (!valid) return false;
+  if (isPrivateRelayUrl(record.url) && !allowsPrivateRelays(context)) return false;
   await context.db.prepare(`
     INSERT INTO psp_kad_records
       (routing_key, owner_node_id, kind, sequence, record_json, expires_at_ms)

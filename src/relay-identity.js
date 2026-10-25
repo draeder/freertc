@@ -35,6 +35,25 @@ export function decodeRelayIdentitySecret(value) {
   return { publicKey: parsed.pub, privateKey: parsed.priv };
 }
 
+// A relay address only a local network can reach: loopback, a private or
+// link-local range, carrier-grade NAT, or a .local / .localhost name. A record
+// carrying one is meaningless to relays elsewhere, and accepting it sends them
+// calls to an address that answers nobody (or the wrong machine).
+export function isPrivateRelayUrl(value) {
+  let host;
+  try { host = new URL(String(value)).hostname.toLowerCase().replace(/^\[|\]$/g, ''); } catch { return true; }
+  if (!host || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) return true;
+  if (host === '::1' || host === '::' || /^f[cd][0-9a-f]{2}:/.test(host) || /^fe[89ab][0-9a-f]:/.test(host)) return true;
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!v4) return false;
+  const [a, b] = [Number(v4[1]), Number(v4[2])];
+  return a === 0 || a === 10 || a === 127
+    || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && b === 168)
+    || (a === 100 && b >= 64 && b <= 127);
+}
+
 function unsignedRecord(record) {
   const { signature: _signature, ...payload } = record;
   return payload;

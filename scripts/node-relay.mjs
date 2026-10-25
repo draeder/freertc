@@ -6,21 +6,34 @@
 // no Durable Object is needed.
 //
 // Environment:
+//   FREERTC_FEDERATION         on (default) | off — off runs a standalone relay
+//   FREERTC_PUBLIC             true (default) | false — a public relay joins the
+//                              public relays and never federates a loopback or
+//                              private address, its own or another's; false is a
+//                              private/LAN mesh where local addresses are allowed
 //   PORT, HOST                 where to listen (default 127.0.0.1:8788)
-//   RELAY_URL                  this relay's public ws(s):// URL (required for federation)
+//   RELAY_URL                  this relay's ws(s):// URL as others reach it
+//                              (default wss://PROD_DOMAIN/ws, else ws://HOST:PORT/ws)
 //   RELAY_NAME                 display name
-//   KADEMLIA_BOOTSTRAP_URLS    comma-separated relays to join through
+//   KADEMLIA_BOOTSTRAP_URLS    comma-separated relays to join through (public
+//                              default: the public relays; private default: none)
 //   RELAY_IDENTITY_SECRET      signing identity; generated and kept in the data dir if unset
 //   FREERTC_DATA_DIR           where the database and identity live (default ./.freertc-relay)
+//   DB_PATH                    database file (default <data dir>/relay.sqlite)
+//   TLS_CERT_PATH, TLS_KEY_PATH  serve HTTPS/WSS with this certificate
+//   PROD_DOMAIN                host[:port] this relay is served as
 //   PUNCH_RENDEZVOUS_URL       also accept hole-punched connections through this rendezvous
 //   PUNCH_LISTENER_ID          the id to register there
 import { createServer } from 'node:http';
+import { createServer as createTlsServer } from 'node:https';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, createReadStream } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { installWebSocketPair, serverSocketOf } from '../src/node/websocket-pair.js';
 import { openSqliteD1 } from '../src/node/d1-sqlite.js';
+import { isPrivateRelayUrl } from '../src/relay-identity.js';
+import { isPublicRelay } from '../src/relay-overlay.js';
 
 installWebSocketPair();
 const { default: worker } = await import('../src/index.js');
@@ -54,12 +67,42 @@ const ASSETS = {
   },
 };
 
+// The public relays a public relay joins through when none are configured.
+const PUBLIC_BOOTSTRAP_URLS = ['wss://peer.ooo/ws', 'wss://decentralize.ooo/ws', 'wss://oooooooooooooooooooooooooooo.ooo/ws'];
+const TLS_CERT_PATH = process.env.TLS_CERT_PATH;
+const TLS_KEY_PATH = process.env.TLS_KEY_PATH;
+const TLS = Boolean(TLS_CERT_PATH && TLS_KEY_PATH && existsSync(TLS_CERT_PATH) && existsSync(TLS_KEY_PATH));
+const FEDERATION = !['off', 'false', '0', 'no'].includes(String(process.env.FREERTC_FEDERATION ?? 'on').trim().toLowerCase());
+const PUBLIC = isPublicRelay(process.env);
+const RELAY_URL = process.env.RELAY_URL
+  || (process.env.PROD_DOMAIN ? `${TLS ? 'wss' : 'ws'}://${process.env.PROD_DOMAIN}/ws` : `${TLS ? 'wss' : 'ws'}://${HOST}:${PORT}/ws`);
+const configuredBootstrap = String(process.env.KADEMLIA_BOOTSTRAP_URLS ?? '').split(',').map((url) => url.trim()).filter(Boolean);
+// A public relay never federates a loopback or private address, so it never
+// joins through one either.
+const bootstrap = (configuredBootstrap.length ? configuredBootstrap : (PUBLIC ? PUBLIC_BOOTSTRAP_URLS : []))
+  .filter((url) => !(PUBLIC && isPrivateRelayUrl(url)));
+
+let federationNote;
+let federating = FEDERATION;
+if (!FEDERATION) {
+  federationNote = 'off (FREERTC_FEDERATION=off)';
+} else if (PUBLIC && isPrivateRelayUrl(RELAY_URL)) {
+  // Announcing ws://127.0.0.1 or a LAN address to public relays would send them
+  // to an address that reaches nobody. Stay out until there is a public one.
+  federating = false;
+  federationNote = `off: ${RELAY_URL} is a loopback/private address and this is a public relay; set RELAY_URL to a public address, or FREERTC_PUBLIC=false for a private mesh`;
+} else {
+  federationNote = `${PUBLIC ? 'public' : 'private mesh'}, joining through ${bootstrap.length ? bootstrap.join(', ') : '(no bootstrap: others join through this relay)'}`;
+}
+
 const env = {
-  DB: await openSqliteD1({ filename: path.join(DATA_DIR, 'relay.sqlite'), migrationsDir: path.join(ROOT, 'migrations') }),
-  RELAY_URL: process.env.RELAY_URL || `ws://${HOST}:${PORT}/ws`,
+  DB: await openSqliteD1({ filename: path.resolve(process.env.DB_PATH || path.join(DATA_DIR, 'relay.sqlite')), migrationsDir: path.join(ROOT, 'migrations') }),
+  RELAY_URL,
   RELAY_NAME: process.env.RELAY_NAME || `freertc-node-${HOST}-${PORT}`,
-  KADEMLIA_BOOTSTRAP_URLS: process.env.KADEMLIA_BOOTSTRAP_URLS || '',
-  RELAY_IDENTITY_SECRET: await relayIdentitySecret(),
+  FREERTC_PUBLIC: PUBLIC ? 'true' : 'false',
+  KADEMLIA_BOOTSTRAP_URLS: federating ? bootstrap.join(',') : '',
+  // Without an identity the worker code runs no overlay at all: that is what off means.
+  ...(federating ? { RELAY_IDENTITY_SECRET: await relayIdentitySecret() } : {}),
   ASSETS,
 };
 const ctx = { waitUntil: (work) => { Promise.resolve(work).catch((error) => console.error('[node-relay] background task failed:', error?.message || error)); } };
@@ -84,7 +127,7 @@ async function writeResponse(res, response) {
   res.end(Buffer.from(await response.arrayBuffer()));
 }
 
-const server = createServer(async (req, res) => {
+const handler = async (req, res) => {
   try {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -95,7 +138,10 @@ const server = createServer(async (req, res) => {
     if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: false, error: 'Relay error' }));
   }
-});
+};
+const server = TLS
+  ? createTlsServer({ cert: readFileSync(TLS_CERT_PATH), key: readFileSync(TLS_KEY_PATH) }, handler)
+  : createServer(handler);
 
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', async (req, socket, head) => {
@@ -135,6 +181,6 @@ if (process.env.PUNCH_RENDEZVOUS_URL) {
 }
 
 server.listen(PORT, HOST, () => {
-  console.log(`[node-relay] ${env.RELAY_NAME} on http://${HOST}:${PORT} (relay ${env.RELAY_URL})`);
-  console.log(`[node-relay] federation: ${env.KADEMLIA_BOOTSTRAP_URLS ? `bootstrap ${env.KADEMLIA_BOOTSTRAP_URLS}` : 'no bootstrap configured'}; data in ${DATA_DIR}`);
+  console.log(`[node-relay] ${env.RELAY_NAME} on ${TLS ? 'https' : 'http'}://${HOST}:${PORT} (relay ${env.RELAY_URL})`);
+  console.log(`[node-relay] federation: ${federationNote}; data in ${DATA_DIR}`);
 });

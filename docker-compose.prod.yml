@@ -14,6 +14,12 @@ services:
       - RELAY_URL=${RELAY_URL:-}
       - GLOBAL_RELAY_URL=${GLOBAL_RELAY_URL:-wss://peer.ooo/ws}
       - LOG_LEVEL=${LOG_LEVEL:-info}
+      - HOST=0.0.0.0
+      - PORT=8443
+      - FREERTC_FEDERATION=${FREERTC_FEDERATION:-on}
+      - FREERTC_PUBLIC=${FREERTC_PUBLIC:-true}
+      - FREERTC_DATA_DIR=/data
+      - DB_PATH=/data/db/freertc.db
     volumes:
       - ./certs:/app/certs:ro
       - freertc-data:/data

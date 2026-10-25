@@ -27,7 +27,7 @@
   "type": "module",
   "license": "MIT",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13"
   },
   "files": [
     "README.md",
@@ -38,7 +38,6 @@
     "scripts/deploy-cloudflare.mjs",
     "scripts/dev-server.mjs",
     "scripts/generate-relay-identity.mjs",
-    "scripts/non-cloudflare-server.mjs",
     "scripts/postinstall-message.mjs",
     "scripts/project-bootstrap.mjs",
     "scripts/wrangler-install-wizard.mjs",
@@ -49,15 +48,18 @@
     "src/relay-identity.js",
     "src/relay-overlay.js",
     "wrangler.template.jsonc",
-    "wrangler.workers-dev.jsonc"
+    "wrangler.workers-dev.jsonc",
+    "scripts/node-relay.mjs",
+    "src/node/",
+    "src/punch/"
   ],
   "scripts": {
     "test": "node --test test/*.test.js",
     "build": "wrangler deploy --dry-run --outdir dist",
     "build:rust": "worker-build --release",
-    "dev": "node scripts/non-cloudflare-server.mjs",
+    "dev": "node scripts/node-relay.mjs",
     "dev:cf": "node scripts/dev-server.mjs",
-    "dev:node": "node scripts/non-cloudflare-server.mjs",
+    "dev:node": "node scripts/node-relay.mjs",
     "dev:local": "npm run dev:node",
     "relay:keygen": "node scripts/generate-relay-identity.mjs",
     "deploy": "node scripts/deploy-cloudflare.mjs",
@@ -69,7 +71,7 @@
     "wizard": "node scripts/wrangler-install-wizard.mjs",
     "config:validate": "node scripts/validate-config.mjs",
     "config:gen": "node scripts/generate-prod-config.mjs",
-    "dev:prod": "npm run config:validate && npm run config:gen && node scripts/prod-server.mjs",
+    "dev:prod": "npm run config:validate && npm run config:gen && node --env-file=.env.local.prod scripts/node-relay.mjs",
     "deploy:local-prod": "npm run config:validate && npm run config:gen && docker-compose -f docker-compose.prod.yml up -d",
     "deploy:local-prod:logs": "docker-compose -f docker-compose.prod.yml logs -f",
     "deploy:local-prod:stop": "docker-compose -f docker-compose.prod.yml down"

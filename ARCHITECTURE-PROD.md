@@ -61,7 +61,7 @@ scripts/generate-prod-config.mjs (config:gen)
     ↓ [Creates directories]
     ↓ [Validates TLS certs exist]
     ↓
-scripts/prod-server.mjs (dev:prod)
+scripts/node-relay.mjs (dev:prod)
     ↓ [Starts HTTPS server]
     ↓
 Server listening on wss://PROD_DOMAIN/ws
@@ -332,7 +332,7 @@ openssl req -x509 -newkey rsa:4096 \
 ### New Files
 - `scripts/validate-config.mjs` - Config validation
 - `scripts/generate-prod-config.mjs` - Config generation  
-- `scripts/prod-server.mjs` - Production HTTPS server
+- `scripts/node-relay.mjs` - The local relay (HTTP or HTTPS with TLS_CERT_PATH/TLS_KEY_PATH), running the worker code with SQLite and federation
 - `.env.local.prod.example` - Production template
 - `Dockerfile.prod` - Docker production image
 - `docker-compose.prod.yml` - Docker Compose setup
