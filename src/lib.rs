@@ -150,10 +150,22 @@ fn new_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// A relay's peer ID is the SHA-256 of the domain it is deployed on (from RELAY_URL), as
+/// 64 lowercase hex characters. It is derived, never configured; a relay with no RELAY_URL
+/// hashes "localhost". Matches `relayPeerIdFor` in src/relay-id.js.
 fn relay_id(env: &Env) -> String {
-    env.var("RELAY_PEER_ID")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|_| "relay".to_string())
+    use sha2::{Digest, Sha256};
+    let domain = env
+        .var("RELAY_URL")
+        .ok()
+        .and_then(|v| url::Url::parse(&v.to_string()).ok())
+        .and_then(|u| u.host_str().map(|h| h.trim_end_matches('.').to_ascii_lowercase()))
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "localhost".to_string());
+    Sha256::digest(domain.as_bytes())
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 /// Build a JSON PSP envelope string.  `to = None` serialises to `"to": null`
@@ -323,7 +335,7 @@ async fn handle_socket(server: WebSocket, env: Env) {
 
     if let Ok(db) = env.d1("DB") {
         let _ = db_delete_announcement(&db, &net, &pid).await;
-        let _ = db_broadcast_peer_list(&db, &net).await;
+        let _ = db_broadcast_peer_list(&db, &net, &relay_id(&env)).await;
     }
 }
 
@@ -413,7 +425,7 @@ async fn handle_message(
             let is_heartbeat = prev_key == Some(peer_key.as_str());
             if !is_heartbeat {
                 if let Some(ref db) = db {
-                    let _ = db_broadcast_peer_list(db, &network).await;
+                    let _ = db_broadcast_peer_list(db, &network, &rid).await;
                 }
             }
         }
@@ -422,13 +434,13 @@ async fn handle_message(
             LIVE_PEERS.with(|m| m.borrow_mut().remove(&peer_key));
             if let Some(ref db) = db {
                 db_delete_announcement(db, &network, &peer_id).await?;
-                let _ = db_broadcast_peer_list(db, &network).await;
+                let _ = db_broadcast_peer_list(db, &network, &rid).await;
             }
         }
 
         "discover" => {
             if let Some(ref db) = db {
-                let _ = db_broadcast_peer_list(db, &network).await;
+                let _ = db_broadcast_peer_list(db, &network, &rid).await;
             }
         }
 
@@ -444,7 +456,7 @@ async fn handle_message(
             LIVE_PEERS.with(|m| m.borrow_mut().remove(&peer_key));
             if let Some(ref db) = db {
                 db_delete_announcement(db, &network, &peer_id).await?;
-                let _ = db_broadcast_peer_list(db, &network).await;
+                let _ = db_broadcast_peer_list(db, &network, &rid).await;
             }
         }
 
@@ -539,7 +551,7 @@ async fn db_delete_announcement(db: &D1Database, network: &str, peer_id: &str) -
 }
 
 /// Push the current peer list to every subscriber in the network.
-async fn db_broadcast_peer_list(db: &D1Database, network: &str) -> Result<()> {
+async fn db_broadcast_peer_list(db: &D1Database, network: &str, rid: &str) -> Result<()> {
     let now = now_ms();
 
     let rows = db
@@ -573,7 +585,7 @@ async fn db_broadcast_peer_list(db: &D1Database, network: &str) -> Result<()> {
     let payload = make_envelope(
         "peer_list",
         network,
-        "bootstrap-relay",
+        rid,
         None,
         json!({ "peers": peers }),
     );

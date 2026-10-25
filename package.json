@@ -1,6 +1,6 @@
 {
   "name": "freertc",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "WebRTC browser client and Cloudflare Worker signaling relay with D1 storage.",
   "keywords": [
     "webrtc",
@@ -45,6 +45,7 @@
     "src/client.js",
     "src/index.js",
     "src/kademlia.js",
+    "src/relay-id.js",
     "src/relay-identity.js",
     "src/relay-overlay.js",
     "wrangler.template.jsonc",

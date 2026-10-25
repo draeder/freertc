@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { relayPeerIdFor } from '../src/relay-id.js';
 import { loadEnv, validateProdConfig } from './validate-config.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -28,7 +29,6 @@ function generateConfig() {
     name: 'freertc-local-prod',
     description: 'FreeRTC Local Production Relay',
     domain: env.PROD_DOMAIN,
-    relayPeerId: env.RELAY_PEER_ID || 'local-prod-relay',
     relayName: env.RELAY_NAME || 'Local Production Relay',
     relayUrl: env.RELAY_URL || generateRelayUrl(env.PROD_DOMAIN),
     globalRelayUrl: env.GLOBAL_RELAY_URL || null,
@@ -44,7 +44,7 @@ function generateConfig() {
   console.log('📋 Configuration:');
   console.log(`  Domain:      ${config.domain}`);
   console.log(`  Relay URL:   ${config.relayUrl}`);
-  console.log(`  Peer ID:     ${config.relayPeerId}`);
+  console.log(`  Peer ID:     ${relayPeerIdFor(config.relayUrl)}`);
   console.log(`  Relay Name:  ${config.relayName}`);
   console.log(`  Host:        ${config.host}`);
   console.log(`  Port:        ${config.port}`);

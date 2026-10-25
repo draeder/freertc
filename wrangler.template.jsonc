@@ -11,8 +11,6 @@
   },
 
   "vars": {
-    // Peer ID the relay server advertises as itself in PSP messages.
-    "RELAY_PEER_ID": "bootstrap-relay",
 
     // Set automatically by the wizard from your domain (wss://<domain>/ws).
     "RELAY_URL": "wss://YOUR_DOMAIN/ws",
@@ -70,7 +68,6 @@
     "production": {
       "name": "freertc",
       "vars": {
-        "RELAY_PEER_ID": "bootstrap-relay",
         "RELAY_URL": "wss://YOUR_DOMAIN/ws",
         "KADEMLIA_BOOTSTRAP_URLS": "wss://peer.ooo/ws,wss://decentralize.ooo/ws",
         // The deploy script installs the production relay identity secret.

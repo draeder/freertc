@@ -8,9 +8,10 @@ import {
   lookupScopeProviders,
   publishPeerProviderRecords,
 } from "./relay-overlay.js";
+import { relayPeerIdFor } from "./relay-id.js";
 
 const PSP_VERSION = "1.0";
-const WORKER_VERSION = "0.4.1";
+const WORKER_VERSION = "0.4.3";
 
 const DISCOVERY_TYPES = new Set(["announce", "withdraw", "discover", "peer_list", "redirect"]);
 const NEGOTIATION_TYPES = new Set(["connect_request", "connect_accept", "connect_reject", "offer", "answer", "ice_candidate", "ice_end", "renegotiate"]);
@@ -219,7 +220,7 @@ async function drainDeferredTasks(state, env) {
 async function runDeferredTask(env, task) {
   const db = env.DB;
   const { kind, network, room, peerId, selfRelayUrl } = task;
-  const relayPeerId = resolveRelayPeerId(env.RELAY_PEER_ID, selfRelayUrl);
+  const relayPeerId = resolveRelayPeerId(selfRelayUrl);
   const liveSocket = () => livePeers.get(peerScopeKey(network, room, peerId))?.socket ?? null;
 
   if (kind === "announce") {
@@ -483,7 +484,7 @@ export default {
         protocol_version: PSP_VERSION,
         peers: livePeers.size,
         relay_url: selfRelayUrl,
-        relay_peer_id: resolveRelayPeerId(env.RELAY_PEER_ID, selfRelayUrl),
+        relay_peer_id: resolveRelayPeerId(selfRelayUrl),
         kademlia_enabled: isKademliaEnabled(env),
         bootstrap_urls: configuredBootstrapUrls(env).filter((seed) => seed !== selfRelayUrl),
       }, 200);
@@ -583,7 +584,7 @@ export class RelayCoordinator {
         protocol_version: PSP_VERSION,
         peers: livePeers.size,
         relay_url: selfRelayUrl,
-        relay_peer_id: resolveRelayPeerId(this.env.RELAY_PEER_ID, selfRelayUrl),
+        relay_peer_id: resolveRelayPeerId(selfRelayUrl),
         kademlia_enabled: isKademliaEnabled(this.env),
         bootstrap_urls: configuredBootstrapUrls(this.env).filter((seed) => seed !== selfRelayUrl),
         coordinated: true,
@@ -776,12 +777,9 @@ function relayHostname(relayUrl) {
   }
 }
 
-function resolveRelayPeerId(configuredPeerId, selfRelayUrl) {
-  const configured = typeof configuredPeerId === "string" ? configuredPeerId.trim() : "";
-  if (configured) return configured;
-
-  const hostname = relayHostname(selfRelayUrl);
-  return hostname ? `bootstrap:${hostname}` : "bootstrap:local";
+// A relay's peer ID is the SHA-256 of its deployed domain. There is no setting for it.
+function resolveRelayPeerId(selfRelayUrl) {
+  return relayPeerIdFor(selfRelayUrl);
 }
 
 // Derive HTTP base URL from a wss:// relay URL (wss://peer.ooo/ws → https://peer.ooo)
@@ -1016,7 +1014,7 @@ function mergeDiscoveredPeers(...peerGroups) {
   return Array.from(merged.values()).sort((left, right) => left.peer_id.localeCompare(right.peer_id));
 }
 
-function sendPeerList(socket, network, room, peers, to = null, from = "bootstrap:local") {
+function sendPeerList(socket, network, room, peers, to = null, from = relayPeerIdFor(null)) {
   socket.send(JSON.stringify({
     psp_version: PSP_VERSION,
     type: "peer_list",
@@ -1031,7 +1029,7 @@ function sendPeerList(socket, network, room, peers, to = null, from = "bootstrap
   }));
 }
 
-function createRegistrationAck(message, relayPeerId = "bootstrap:local") {
+function createRegistrationAck(message, relayPeerId = relayPeerIdFor(null)) {
   return {
     psp_version: PSP_VERSION,
     type: "ack",
@@ -1218,7 +1216,7 @@ async function cleanupExpired(db) {
 
 function handleWebSocket(request, env, ctx, selfRelayUrl) {
   const { 0: client, 1: server } = new WebSocketPair();
-  const relayPeerId = resolveRelayPeerId(env.RELAY_PEER_ID, selfRelayUrl);
+  const relayPeerId = resolveRelayPeerId(selfRelayUrl);
   const socketGeneration = ++nextSocketGeneration;
 
   let peerKey = null;
@@ -1322,7 +1320,7 @@ async function handleClientMessage(
   prevRoom = null
 ) {
   try {
-    const relayPeerId = resolveRelayPeerId(env.RELAY_PEER_ID, selfRelayUrl);
+    const relayPeerId = resolveRelayPeerId(selfRelayUrl);
     if (!rawData) return null;
     if (rawData.length > MAX_MESSAGE_SIZE) return null;
 

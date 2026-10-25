@@ -5,6 +5,7 @@ import path from 'node:path';
 import { createServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
+import { relayPeerIdFor } from '../src/relay-id.js';
 
 const PSP_VERSION = '1.0';
 const DEFAULT_TTL_MS = 30_000;
@@ -134,7 +135,7 @@ function sendPeerList(network) {
     psp_version: PSP_VERSION,
     type: 'peer_list',
     network,
-    from: 'bootstrap-relay',
+    from: relayPeerIdFor(process.env.RELAY_URL || `ws://${HOST}:${PORT}/ws`),
     to: null,
     message_id: crypto.randomUUID(),
     timestamp: Date.now(),

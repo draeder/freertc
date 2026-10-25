@@ -22,6 +22,7 @@ const DEPLOY_LAYOUT_MARKER_BASE = {
 const PROJECT_FILE_MAPPINGS = [
   ['src/index.js', 'src/index.js'],
   ['src/kademlia.js', 'src/kademlia.js'],
+  ['src/relay-id.js', 'src/relay-id.js'],
   ['src/relay-identity.js', 'src/relay-identity.js'],
   ['src/relay-overlay.js', 'src/relay-overlay.js'],
   ['public/index.html', 'public/index.html'],

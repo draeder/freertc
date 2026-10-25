@@ -321,10 +321,10 @@ function patchVar(text, varName, value) {
   if (re.test(text)) {
     return text.replace(re, `$1"${value}"`);
   }
-  // If not found, inject after RELAY_PEER_ID line (best-effort)
+  // If not found, inject at the top of each vars block (best-effort)
   return text.replace(
-    /("RELAY_PEER_ID"\s*:\s*"[^"]*")/g,
-    `$1,\n    "${varName}": "${value}"`
+    /("vars"\s*:\s*\{)/g,
+    `$1\n    "${varName}": "${value}",`
   );
 }
 

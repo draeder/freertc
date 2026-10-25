@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
 import { loadEnv, validateProdConfig } from './validate-config.mjs';
+import { relayPeerIdFor } from '../src/relay-id.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -139,7 +140,7 @@ function handleHttpRequest(req, res) {
 
   if (pathname === '/config') {
     return json(res, {
-      relay_peer_id: config.relayPeerId,
+      relay_peer_id: relayPeerIdFor(config.relayUrl),
       relay_name: config.relayName,
       relay_url: config.relayUrl,
       global_relay_url: config.globalRelayUrl,
@@ -276,7 +277,7 @@ function startServer() {
   console.log(`📋 Configuration: ${CONFIG_FILE}`);
   console.log(`🌐 Domain:       ${config.domain}`);
   console.log(`🔗 Relay URL:    ${config.relayUrl}`);
-  console.log(`👤 Peer ID:      ${config.relayPeerId}`);
+  console.log(`👤 Peer ID:      ${relayPeerIdFor(config.relayUrl)}`);
   console.log(`📛 Relay Name:   ${config.relayName}`);
   console.log(`🖥️  Host:         ${config.host}:${config.port}`);
   console.log(`🔒 TLS:          ${fs.existsSync(path.join(ROOT, config.tlsCertPath)) ? 'enabled' : 'disabled'}`);

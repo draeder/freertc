@@ -36,7 +36,6 @@ PROD_DOMAIN=localhost:8443      # Your domain or IP
 HOST=0.0.0.0                     # 0.0.0.0 for network access, 127.0.0.1 for localhost only
 PORT=8443
 RELAY_NAME=My Production Relay
-RELAY_PEER_ID=my-relay
 ```
 
 #### 2. Generate TLS Certificates
@@ -193,7 +192,6 @@ See `.env.local.prod.example` for all available options:
 | `PROD_DOMAIN` | ✓ | Domain name (localhost, IP, or custom) |
 | `HOST` | | Server bind address (default: 0.0.0.0) |
 | `PORT` | | HTTPS port (default: 8443) |
-| `RELAY_PEER_ID` | | Unique relay identifier |
 | `RELAY_NAME` | | Relay display name |
 | `RELAY_URL` | | WSS URL (auto-generated if blank) |
 | `GLOBAL_RELAY_URL` | | Global relay for peer discovery |

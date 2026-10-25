@@ -178,6 +178,8 @@ Optional routing settings remain ordinary Wrangler variables:
 
 Every bootstrap URL must point to a FreeRTC relay with Kademlia enabled. List several: a joining relay asks one at a time, in a random order, and stops at the first that answers; relays it has learned of are tried only when every seed is down. Nothing is a default hub, and a relay with no seeds simply runs standalone. `GLOBAL_RELAY_URL` is still read as one more seed for compatibility, and, only when it is set and the relay has no signing keys, it names the hub for the legacy registry. Legacy deployments using separate `RELAY_SIGNING_PUBLIC_KEY` and `RELAY_SIGNING_PRIVATE_KEY` values continue to work during migration. `npx freertc relay:keygen` remains available only for manual identity recovery or migration.
 
+A relay's peer ID is the SHA-256 of the domain it is deployed on (`wss://peer.ooo/ws` → `sha256("peer.ooo")`). It is derived, not configured: there is no `RELAY_PEER_ID` setting, and an old one left in a Wrangler config is ignored.
+
 ## Runtime scope
 
 - The checked-in Cloudflare Worker runtime is `src/index.js` with Cloudflare D1 (`DB` binding).

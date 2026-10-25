@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { access, readFile } from "node:fs/promises";
 import test from "node:test";
+import fs from "node:fs";
+import { createHash } from "node:crypto";
 
 import {
   firstWorkersDevUrlFromText,
@@ -71,15 +73,32 @@ test("Deploy Button configuration provisions D1, migrations, and private relay i
   assert.doesNotMatch(deployScript, /console\.log\([^\n]*(pair\.priv|secretInput)/);
 });
 
-test("one-click relays derive a unique bootstrap peer ID from their workers.dev hostname", () => {
-  const relayUrl = "wss://freertc-relay.example-account.workers.dev/ws";
+test("a relay's peer ID is the SHA-256 of its deployed domain and cannot be configured", () => {
+  const sha = (text) => createHash("sha256").update(text).digest("hex");
 
+  assert.equal(resolveRelayPeerId("wss://peer.ooo/ws"), sha("peer.ooo"));
+  assert.equal(resolveRelayPeerId("wss://PEER.ooo:443/ws"), sha("peer.ooo"));
   assert.equal(
-    resolveRelayPeerId(undefined, relayUrl),
-    "bootstrap:freertc-relay.example-account.workers.dev"
+    resolveRelayPeerId("wss://freertc-relay.example-account.workers.dev/ws"),
+    sha("freertc-relay.example-account.workers.dev")
   );
-  assert.equal(resolveRelayPeerId("custom-relay", relayUrl), "custom-relay");
-  assert.equal(resolveRelayPeerId(undefined, null), "bootstrap:local");
+  assert.equal(resolveRelayPeerId(null), sha("localhost"));
+  assert.notEqual(resolveRelayPeerId("wss://peer.ooo/ws"), resolveRelayPeerId("wss://decentralize.ooo/ws"));
+  assert.match(resolveRelayPeerId("wss://peer.ooo/ws"), /^[0-9a-f]{64}$/);
+});
+
+test("no config, script or source sets a relay peer ID by hand", () => {
+  const files = [
+    "wrangler.jsonc", "wrangler.template.jsonc", "wrangler.workers-dev.jsonc",
+    "docker-compose.prod.yml", ".env.local.prod.example",
+    "src/index.js", "scripts/non-cloudflare-server.mjs", "scripts/prod-server.mjs",
+    "scripts/generate-prod-config.mjs", "scripts/wrangler-install-wizard.mjs",
+  ];
+  for (const file of files) {
+    const text = fs.readFileSync(new URL(`../${file}`, import.meta.url), "utf8");
+    assert.doesNotMatch(text, /RELAY_PEER_ID/, file);
+    assert.doesNotMatch(text, /bootstrap-relay|local-prod-relay|bootstrap:local/, file);
+  }
 });
 
 test("deployment helpers preserve Wrangler scope and detect an existing identity", () => {
@@ -158,7 +177,7 @@ test("the first workers.dev request registers that domain with the federation hu
     // from outside: the layout materializer only refreshes copies when this number changes.
     assert.equal(health.version, JSON.parse(await read("package.json")).version);
     assert.equal(health.relay_url, "wss://freertc-relay.example-account.workers.dev/ws");
-    assert.equal(health.relay_peer_id, "bootstrap:freertc-relay.example-account.workers.dev");
+    assert.equal(health.relay_peer_id, createHash("sha256").update("freertc-relay.example-account.workers.dev").digest("hex"));
     assert.deepEqual(health.bootstrap_urls, ["wss://peer.ooo/ws"]);
     assert.equal("federation_hub" in health, false);
     assert.equal(registration.url, "https://peer.ooo/api/v1/relays");

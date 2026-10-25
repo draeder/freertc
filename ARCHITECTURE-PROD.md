@@ -194,7 +194,6 @@ HOST=0.0.0.0              # 0.0.0.0 = all interfaces, 127.0.0.1 = localhost only
 PORT=8443
 
 # Relay identification
-RELAY_PEER_ID=local-prod-relay
 RELAY_NAME=Local Production Relay
 
 # WebSocket URL (auto-constructed if empty)

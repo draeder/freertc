@@ -44,6 +44,7 @@ test('postinstall isolates the deploy layout when project paths are occupied', (
     assert.equal(fs.existsSync(path.join(deployRoot, 'public/app.js')), true);
     assert.equal(fs.existsSync(path.join(deployRoot, 'src/index.js')), true);
     assert.equal(fs.existsSync(path.join(deployRoot, 'src/relay-overlay.js')), true);
+    assert.equal(fs.existsSync(path.join(deployRoot, 'src/relay-id.js')), true);
     assert.equal(fs.existsSync(path.join(deployRoot, 'migrations/0001_initial.sql')), true);
     assert.equal(fs.existsSync(path.join(projectRoot, 'wrangler.jsonc')), false);
     assert.equal(fs.existsSync(path.join(projectRoot, 'wrangler.workers-dev.jsonc')), false);
