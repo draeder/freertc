@@ -51,7 +51,8 @@
     "wrangler.workers-dev.jsonc",
     "scripts/node-relay.mjs",
     "src/node/",
-    "src/punch/"
+    "src/punch/",
+    "src/tunnel/"
   ],
   "scripts": {
     "test": "node --test test/*.test.js",

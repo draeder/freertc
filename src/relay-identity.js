@@ -67,8 +67,22 @@ function normalizeRelayUrl(value) {
   if (url.protocol !== 'wss:' && url.protocol !== 'ws:') throw new TypeError('Relay URL must use ws:// or wss://');
   url.hash = '';
   url.search = '';
-  url.pathname = '/ws';
+  // A relay behind NAT is reached through a tunnel on a public relay, at
+  // /t/<its node id>/ws there (src/tunnel). Every other path is /ws.
+  url.pathname = TUNNEL_PATH_RE.test(url.pathname) ? url.pathname : '/ws';
   return url.toString();
+}
+
+const TUNNEL_PATH_RE = /^\/t\/[0-9a-f]{64}\/ws$/;
+
+/** The node id a tunnel relay URL names, or null for a direct one. */
+export function tunnelNodeIdOf(value) {
+  try {
+    const match = /^\/t\/([0-9a-f]{64})\/ws$/.exec(new URL(value).pathname);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
 }
 
 async function signRecord(payload, privateKey) {
@@ -145,9 +159,32 @@ export async function verifySignedRelayRecord(record, options = {}) {
     if (!Number.isFinite(issuedAt) || !Number.isFinite(expiresAt)) return false;
     if (issuedAt > now + MAX_CLOCK_SKEW_MS || expiresAt <= now || expiresAt - issuedAt > maxTtl) return false;
     if (normalizeRelayUrl(record.url) !== record.url) return false;
+    // A relay can only claim its own tunnel.
+    const tunnelId = tunnelNodeIdOf(record.url);
+    if (tunnelId && tunnelId !== record.node_id) return false;
     if (record.kind !== RELAY_NODE_RECORD_KIND && !isNodeId(record.key)) return false;
 
     return await verifyMessage(canonicalJson(unsignedRecord(record)), record.signature, record.public_key);
+  } catch {
+    return false;
+  }
+}
+
+// A tunnel home proves the relay on the other end of a tunnel holds the key
+// its node id comes from: it sends a fresh nonce, and the relay signs it
+// together with the home's host, so a signature is good for one home and one
+// connection only.
+function tunnelChallengeMessage(nonce, host) {
+  return canonicalJson(['freertc-tunnel', 1, String(nonce), String(host).toLowerCase()]);
+}
+
+export async function signTunnelChallenge(identity, nonce, host) {
+  return signMessage(tunnelChallengeMessage(nonce, host), identity.privateKey);
+}
+
+export async function verifyTunnelChallenge(publicKey, nonce, host, signature) {
+  try {
+    return await verifyMessage(tunnelChallengeMessage(nonce, host), signature, publicKey);
   } catch {
     return false;
   }

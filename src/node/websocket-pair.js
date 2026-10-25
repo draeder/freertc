@@ -12,6 +12,17 @@ export class NodeServerSocket {
     this.socket = null;
     this.accepted = false;
     this.closed = false;
+    this.queued = [];
+    this.attachment = undefined;
+  }
+
+  // The Durable Object hibernation API keeps a small value with each socket.
+  serializeAttachment(value) {
+    this.attachment = value === undefined ? undefined : structuredClone(value);
+  }
+
+  deserializeAttachment() {
+    return this.attachment === undefined ? null : structuredClone(this.attachment);
   }
 
   addEventListener(type, listener) {
@@ -39,15 +50,24 @@ export class NodeServerSocket {
       emit('close', { code, reason: reason?.toString?.() ?? '' });
     });
     socket.on('error', (error) => emit('error', { error }));
+    // Sent before the upgrade completed, as a worker may do right after accepting.
+    for (const data of this.queued.splice(0)) socket.send(data);
+    if (this.pendingClose) socket.close(...this.pendingClose);
   }
 
   send(data) {
-    if (!this.socket || this.closed) throw new Error('WebSocket is not open');
-    this.socket.send(typeof data === 'string' ? data : String(data));
+    if (this.closed) throw new Error('WebSocket is not open');
+    const text = typeof data === 'string' ? data : String(data);
+    if (!this.socket) this.queued.push(text);
+    else this.socket.send(text);
   }
 
   close(code, reason) {
-    try { this.socket?.close(code, reason); } catch {}
+    if (!this.socket) {
+      this.pendingClose = [code, reason];
+      return;
+    }
+    try { this.socket.close(code, reason); } catch {}
   }
 }
 
@@ -67,6 +87,14 @@ export class NodeWebSocketPair {
  */
 export function installWebSocketPair() {
   if (typeof globalThis.WebSocketPair !== 'function') globalThis.WebSocketPair = NodeWebSocketPair;
+  if (typeof globalThis.WebSocketRequestResponsePair !== 'function') {
+    globalThis.WebSocketRequestResponsePair = class WebSocketRequestResponsePair {
+      constructor(request, response) {
+        this.request = request;
+        this.response = response;
+      }
+    };
+  }
   if (globalThis.Response.__freertcUpgradeAware) return;
   const BaseResponse = globalThis.Response;
   class UpgradeAwareResponse extends BaseResponse {

@@ -291,9 +291,20 @@ Every local relay is `scripts/node-relay.mjs` (`npm run dev`, `freertc dev`, `np
 | --- | --- | --- |
 | `FREERTC_FEDERATION` | `on` | `off` runs a standalone relay that joins no other relay. |
 | `FREERTC_PUBLIC` | `true` | A public relay joins the public relays and never federates a loopback or private address (127.x, 10.x, 192.168.x, 172.16–31.x, 169.254.x, 100.64/10, ::1, fc00::/7, fe80::/10, `localhost`, `*.local`), whether its own or one another relay announces. `false` is a private/LAN mesh that takes local addresses. |
-| `RELAY_URL` | `wss://PROD_DOMAIN/ws`, else `ws://HOST:PORT/ws` | The address other relays and peers use. A public relay with a private `RELAY_URL` stays out of federation and logs why. |
+| `RELAY_URL` | `wss://PROD_DOMAIN/ws`, else `ws://HOST:PORT/ws` | The address other relays and peers use. A public relay with a private `RELAY_URL` is behind NAT: it takes a public address through a tunnel (below), or, with tunnels off, stays out of federation and logs why. |
+| `FREERTC_TUNNEL` | `on` | A public relay behind NAT opens one outbound WebSocket to a public relay and is federated as `wss://<that relay>/t/<node id>/ws`. Federation calls and peer WebSockets sent there come down the tunnel. If the home goes away the relay moves to the next one. `off` disables this. |
+| `FREERTC_TUNNEL_HOMES` | the bootstrap relays | Public relays to tunnel through, tried in order. |
 | `KADEMLIA_BOOTSTRAP_URLS` | the public relays (public); none (private) | Relays to join through. |
 | `FREERTC_DATA_DIR`, `DB_PATH` | `./.freertc-relay` | The SQLite database and the generated relay identity. |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH` | unset | Serve HTTPS/WSS. |
 
 Node 22.13 or later is required (`node:sqlite`).
+
+### Tunnels through NAT
+
+A relay behind NAT reaches out, and everything else reaches it through its tunnel:
+
+- **Out of NAT:** its own federation calls are ordinary outbound HTTPS, to public relays and to other NAT'd relays at their tunnel addresses.
+- **Into NAT:** a public relay (the tunnel home) carries Kademlia `find`/`store`, `/api/v1/peers`, `/api/v1/relay` and peer WebSockets for `/t/<node id>/...` down the tunnel.
+- **Ownership:** a home gives the address only to the relay that signs a fresh challenge with the key its node id comes from, and a signed record may only name its own tunnel.
+- **Cost:** on Cloudflare the home is the `RelayTunnel` Durable Object (binding `RELAY_TUNNEL`, migration `relay-tunnel-v1`). It uses WebSocket hibernation, and keepalive pings are answered without waking it, so an idle tunnel uses no duration. Every Node relay is also a home.

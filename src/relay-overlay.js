@@ -564,7 +564,9 @@ export async function heartbeatKademlia(env, selfUrl, options = {}) {
 export async function publishPeerProviderRecords(env, selfUrl, network, room, _peerId, options = {}) {
   const context = await overlayContext(env, selfUrl, options);
   if (!context) return false;
-  const throttleKey = `${context.identity.nodeId}:${network}:${room}`;
+  // Keyed by address too: a relay whose address changes (a NAT'd relay moving to
+  // another tunnel home) republishes at once instead of leaving the old one up.
+  const throttleKey = `${context.identity.nodeId}:${context.selfUrl}:${network}:${room}`;
   const now = Date.now();
   if (!markProviderPublish(throttleKey, now)) return true;
   await ensureRoutingContacts(context);
