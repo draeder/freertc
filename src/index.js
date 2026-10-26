@@ -14,7 +14,7 @@ import { tunnelRoute } from "./tunnel/frames.js";
 export { RelayTunnel } from "./tunnel/home.js";
 
 const PSP_VERSION = "1.0";
-const WORKER_VERSION = "0.4.7";
+const WORKER_VERSION = "0.4.8";
 
 const DISCOVERY_TYPES = new Set(["announce", "withdraw", "discover", "peer_list", "redirect"]);
 const NEGOTIATION_TYPES = new Set(["connect_request", "connect_accept", "connect_reject", "offer", "answer", "ice_candidate", "ice_end", "renegotiate"]);
@@ -89,6 +89,10 @@ const DEFERRED_FORWARD_STALE_MS = 20_000;
 // out forwards left every cross-relay offer to expire unrun.
 const DEFERRED_TASK_PRIORITY = { forward: 0, discover: 1, announce: 1, "peer-left": 1, "relay-list": 2, "deliver-queued": 3 };
 const CLEANUP_INTERVAL_MS = 60_000;
+const ALARM_REARM_SLACK_MS = 1_000;
+// One queued task may not hold the queue: a lookup or a forward that never
+// settles would otherwise keep every later announce and discover waiting.
+const DEFERRED_TASK_TIMEOUT_MS = 25_000;
 let deferredTaskSequence = 0;
 let lastCleanupAt = 0;
 
@@ -121,7 +125,12 @@ async function deferWork(ctx, env, task) {
   deferredTaskSequence = (deferredTaskSequence + 1) % 1_000_000;
   const key = deferredTaskKey(task, Date.now(), deferredTaskSequence);
   await ctx.storage.put(key, task);
-  if ((await ctx.storage.getAlarm()) === null) {
+  // Re-arm an alarm that is not due now, not only a missing one. An alarm
+  // that kept failing (as every one did while the account was over its daily
+  // Durable Object limit) sits in the platform's retry backoff, and a queue
+  // that waited for it answered no announce or discover at all.
+  const alarm = await ctx.storage.getAlarm();
+  if (alarm === null || alarm > Date.now() + ALARM_REARM_SLACK_MS) {
     await ctx.storage.setAlarm(Date.now());
   }
 }
@@ -209,7 +218,10 @@ async function drainDeferredTasks(state, env) {
   await Promise.all(entries.map(async ([key, task]) => {
     const startedAt = Date.now();
     try {
-      await runDeferredTask(env, task);
+      await Promise.race([
+        runDeferredTask(env, task),
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`timed out after ${DEFERRED_TASK_TIMEOUT_MS} ms`)), DEFERRED_TASK_TIMEOUT_MS)),
+      ]);
     } catch (error) {
       debugNote({ op: "task-error", kind: task?.kind, error: String(error?.message || error).slice(0, 300), ms: Date.now() - startedAt });
       console.error(`[TASK] ${task?.kind} failed: ${error?.message}`);
@@ -595,9 +607,12 @@ export class RelayCoordinator {
     }
     if (url.pathname === "/debug/state") {
       const now = Date.now();
+      const queued = await this.state.storage.list({ prefix: DEFERRED_TASK_PREFIX, limit: 1000 }).catch(() => null);
+      const alarm = await this.state.storage.getAlarm().catch(() => null);
       return jsonResponse({
         ok: true,
         now,
+        queue: { tasks: queued ? queued.size : null, oldest: queued?.size ? [...queued.keys()][0] : null, alarm_in_ms: alarm === null ? null : alarm - now },
         peers: livePeers.size,
         peerKeys: [...livePeers.keys()].map((key) => key.slice(0, 80)),
         hints: [...peerRelayHints.entries()].map(([key, hint]) => ({ key: key.slice(0, 80), url: hint.url, expiresIn: hint.expiresAt - now })),
