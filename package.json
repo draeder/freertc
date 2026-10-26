@@ -27,7 +27,7 @@
   "type": "module",
   "license": "MIT",
   "engines": {
-    "node": ">=22.13"
+    "node": ">=22.5"
   },
   "files": [
     "README.md",

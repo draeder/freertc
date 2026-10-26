@@ -6,9 +6,45 @@ import path from 'node:path';
 
 const MIGRATIONS_TABLE = 'freertc_node_migrations';
 
-function statementApi(statement, values = []) {
+/**
+ * D1 SQL numbers its parameters (?1, ?2) and binds them by position. Node's
+ * SQLite before 22.13 refuses that ("column index out of range"), so each
+ * statement is rewritten to plain ? placeholders with the values reordered to
+ * match. Quoted text and identifiers are left alone.
+ */
+export function positionalSql(sql) {
+  const order = [];
+  let out = '';
+  let highest = 0;
+  for (let i = 0; i < sql.length; i += 1) {
+    const ch = sql[i];
+    if (ch === "'" || ch === '"' || ch === '`') {
+      const end = sql.indexOf(ch, i + 1);
+      const stop = end === -1 ? sql.length : end + 1;
+      out += sql.slice(i, stop);
+      i = stop - 1;
+      continue;
+    }
+    if (ch === '?') {
+      let j = i + 1;
+      while (j < sql.length && sql[j] >= '0' && sql[j] <= '9') j += 1;
+      const index = j > i + 1 ? Number(sql.slice(i + 1, j)) : highest + 1;
+      highest = Math.max(highest, index);
+      order.push(index - 1);
+      out += '?';
+      i = j - 1;
+      continue;
+    }
+    out += ch;
+  }
+  return { sql: out, order };
+}
+
+function statementApi(prepared, given = []) {
+  const { statement, order } = prepared;
+  const values = order.map((index) => given[index] ?? null);
   return {
-    bind: (...next) => statementApi(statement, next),
+    bind: (...next) => statementApi(prepared, next),
     async all() {
       return { success: true, results: statement.all(...values) };
     },
@@ -52,12 +88,13 @@ export async function openSqliteD1({ filename, migrationsDir }) {
   return {
     raw: db,
     prepare(sql) {
-      let statement = statements.get(sql);
-      if (!statement) {
-        statement = db.prepare(sql);
-        statements.set(sql, statement);
+      let prepared = statements.get(sql);
+      if (!prepared) {
+        const rewritten = positionalSql(sql);
+        prepared = { statement: db.prepare(rewritten.sql), order: rewritten.order };
+        statements.set(sql, prepared);
       }
-      return statementApi(statement);
+      return statementApi(prepared);
     },
     async batch(prepared) {
       const results = [];

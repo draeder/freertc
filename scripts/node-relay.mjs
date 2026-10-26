@@ -42,6 +42,19 @@ import { createRelayIdentity, decodeRelayIdentitySecret, isPrivateRelayUrl } fro
 import { heartbeatKademlia, isPublicRelay } from '../src/relay-overlay.js';
 import { RelayTunnel } from '../src/tunnel/home.js';
 
+// node:sqlite needs --experimental-sqlite before Node 22.13. Turn it on rather than fail.
+try {
+  await import('node:sqlite');
+} catch {
+  if (!process.execArgv.includes('--experimental-sqlite')) {
+    const { spawnSync } = await import('node:child_process');
+    const result = spawnSync(process.execPath, ['--experimental-sqlite', '--no-warnings', ...process.execArgv, fileURLToPath(import.meta.url), ...process.argv.slice(2)], { stdio: 'inherit' });
+    process.exit(result.status ?? 1);
+  }
+  console.error('[node-relay] this Node has no node:sqlite; use Node 22.5 or later');
+  process.exit(1);
+}
+
 installWebSocketPair();
 const { default: worker } = await import('../src/index.js');
 

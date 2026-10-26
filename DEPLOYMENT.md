@@ -298,7 +298,7 @@ Every local relay is `scripts/node-relay.mjs` (`npm run dev`, `freertc dev`, `np
 | `FREERTC_DATA_DIR`, `DB_PATH` | `./.freertc-relay` | The SQLite database and the generated relay identity. |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH` | unset | Serve HTTPS/WSS. |
 
-Node 22.13 or later is required (`node:sqlite`).
+Node 22.5 or later is required (`node:sqlite`); before 22.13 the relay turns on `--experimental-sqlite` itself.
 
 ### Tunnels through NAT
 
