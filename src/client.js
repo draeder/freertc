@@ -141,6 +141,11 @@ const NEGOTIATION_TYPES = new Set(['offer', 'answer', 'ice_candidate', 'ice_end'
 // Frames addressed to one peer that can travel over an established mesh
 // instead of the relay: everything a negotiation needs, plus the goodbye.
 const MESH_SIGNAL_TYPES = new Set(['offer', 'answer', 'ice_candidate', 'ice_end', 'renegotiate', 'bye'])
+// Sent on a data channel just before this side closes it, so the other side
+// closes its end at once instead of sending into a dead edge.
+const DATA_BYE_FRAME = 'freertc-bye'
+// How long a closing channel stays open so its bye frame is flushed first.
+const DATA_BYE_FLUSH_MS = 250
 const ANSWER_BURST_COOLDOWN_MS = 3000
 const ANSWER_BURST_DELAYS_MS = [200, 800, 2000]
 const SDP_DEDUP_WINDOW_MS = 15000
@@ -1260,6 +1265,18 @@ export function createSignalingClient(options = {}) {
         return
       }
 
+      // The other side is closing this edge (closePeerConnection): close ours now.
+      if (msg?.type === DATA_BYE_FRAME) {
+        const byeEntry = mesh.connections.get(remotePeerId)
+        if (byeEntry?.connection === pc) {
+          const reason = typeof msg.reason === 'string' ? msg.reason.slice(0, 120) : 'remote_close'
+          log(`[webrtc] ${remotePeerId} closed this edge (${reason})`)
+          closePeerConnection(remotePeerId, reason, false)
+          onConnectionStateChangeCb?.({ peerId: remotePeerId, state: 'closed', reason, ts: Date.now() })
+        }
+        return
+      }
+
       // A neighbour's word on which peers it can vouch for as closest to the room. Control
       // traffic for the relay-on-demand election: never handed to the host as data.
       if (msg?.type === RELAY_ANCHOR_FRAME) {
@@ -1977,8 +1994,22 @@ export function createSignalingClient(options = {}) {
 
     // Tell the other owner first so it cancels offer retries and cannot revive
     // an edge that this side intentionally shed for capacity/topology reasons.
-    if (notifyRemote && registered) {
-      relaySignal(id, 'bye', { reason })
+    //
+    // The bye goes over the mesh when it can, and the mesh route is often this
+    // very edge. It used to be closed in the next line, before the frame was
+    // flushed: the other side never heard, kept the edge open, and everything
+    // it sent into it vanished (one-sided links; routed direct messages lost).
+    // Now the bye also goes on the edge's own channel, and the edge closes a
+    // moment later, so both copies are out first.
+    let byeOnChannel = false
+    if (notifyRemote) {
+      if (entry?.channel?.readyState === 'open') {
+        try {
+          entry.channel.send(JSON.stringify({ type: DATA_BYE_FRAME, reason }))
+          byeOnChannel = true
+        } catch {}
+      }
+      if (registered) relaySignal(id, 'bye', { reason })
     }
 
     if (!entry) return false
@@ -1988,8 +2019,12 @@ export function createSignalingClient(options = {}) {
     pendingCandidates.delete(id)
     pendingAnswers.delete(id)
     offerProcessingQueues.delete(id)
-    try { entry.channel?.close?.() } catch {}
-    try { entry.connection?.close?.() } catch {}
+    const closeTransport = () => {
+      try { entry.channel?.close?.() } catch {}
+      try { entry.connection?.close?.() } catch {}
+    }
+    if (byeOnChannel) setTimeout(closeTransport, DATA_BYE_FLUSH_MS)
+    else closeTransport()
     return true
   }
 
