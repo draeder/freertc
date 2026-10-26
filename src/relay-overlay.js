@@ -144,6 +144,21 @@ async function configuredIdentity(env) {
   return identityPromises.get(env);
 }
 
+/**
+ * This relay's Kademlia node ID (sha256 of its signing key), or null when it
+ * has no federation identity. One relay ID everywhere: the overlay, tunnel
+ * paths, the relay list clients rank, and the relay's own PSP peer ID.
+ */
+export async function relayNodeIdOf(env) {
+  if (!isKademliaEnabled(env)) return null;
+  try {
+    const identity = await configuredIdentity(env);
+    return identity?.nodeId ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function overlayContext(env, selfUrl, options = {}) {
   if (!env?.DB || !selfUrl || !isKademliaEnabled(env)) return null;
   // A public relay whose own address is loopback or private has nothing it

@@ -9,6 +9,7 @@ import {
   lookupScopeProviders,
   publishPeerProviderRecords,
   refreshRoomProviders,
+  relayNodeIdOf,
 } from "./relay-overlay.js";
 import { relayPeerIdFor } from "./relay-id.js";
 import { tunnelRoute } from "./tunnel/frames.js";
@@ -241,6 +242,7 @@ async function drainDeferredTasks(state, env) {
 async function runDeferredTask(env, task) {
   const db = env.DB;
   const { kind, network, room, peerId, selfRelayUrl } = task;
+  await primeRelayNodeId(env, selfRelayUrl);
   const relayPeerId = resolveRelayPeerId(selfRelayUrl);
   const liveSocket = () => livePeers.get(peerScopeKey(network, room, peerId))?.socket ?? null;
 
@@ -454,6 +456,7 @@ async function handleFetch(request, env, ctx) {
     const url = new URL(request.url);
     const upgrade = request.headers.get("Upgrade");
     const selfRelayUrl = resolveSelfRelayUrl(request, env.RELAY_URL);
+    await primeRelayNodeId(env, selfRelayUrl);
 
     // Heartbeat: join the bounded Kademlia overlay when signing keys are
     // configured. Older deployments retain the legacy registry fallback.
@@ -530,6 +533,7 @@ async function handleFetch(request, env, ctx) {
         peers: livePeers.size,
         relay_url: selfRelayUrl,
         relay_peer_id: resolveRelayPeerId(selfRelayUrl),
+        node_id: relayNodeIdsByUrl.get(selfRelayUrl) ?? null,
         kademlia_enabled: isKademliaEnabled(env),
         bootstrap_urls: await listBootstrapUrls(env, selfRelayUrl).catch(() => configuredBootstrapUrls(env).filter((seed) => seed !== selfRelayUrl)),
       }, 200);
@@ -604,6 +608,7 @@ export class RelayCoordinator {
     const url = new URL(request.url);
     const upgrade = request.headers.get("Upgrade");
     const selfRelayUrl = resolveSelfRelayUrl(request, this.env.RELAY_URL);
+    await primeRelayNodeId(this.env, selfRelayUrl);
 
     if (upgrade && upgrade.toLowerCase() === "websocket" && url.pathname === "/ws") {
       return handleWebSocket(request, this.env, this.state, selfRelayUrl);
@@ -633,6 +638,7 @@ export class RelayCoordinator {
         peers: livePeers.size,
         relay_url: selfRelayUrl,
         relay_peer_id: resolveRelayPeerId(selfRelayUrl),
+        node_id: relayNodeIdsByUrl.get(selfRelayUrl) ?? null,
         kademlia_enabled: isKademliaEnabled(this.env),
         bootstrap_urls: await listBootstrapUrls(this.env, selfRelayUrl).catch(() => configuredBootstrapUrls(this.env).filter((seed) => seed !== selfRelayUrl)),
         coordinated: true,
@@ -826,8 +832,20 @@ function relayHostname(relayUrl) {
 }
 
 // A relay's peer ID is the SHA-256 of its deployed domain. There is no setting for it.
+// A relay's PSP peer ID is its Kademlia node ID when it has a federation
+// identity, so the relay is one ID everywhere (and a relay behind NAT no
+// longer signs as its tunnel home's domain). A relay without one keeps the
+// SHA-256 of its domain. Synchronous for every frame: primeRelayNodeId fills
+// the cache, keyed by the relay's own URL, before a request is handled.
+const relayNodeIdsByUrl = new Map();
+
+async function primeRelayNodeId(env, selfRelayUrl) {
+  if (!selfRelayUrl || relayNodeIdsByUrl.has(selfRelayUrl)) return;
+  relayNodeIdsByUrl.set(selfRelayUrl, await relayNodeIdOf(env));
+}
+
 function resolveRelayPeerId(selfRelayUrl) {
-  return relayPeerIdFor(selfRelayUrl);
+  return relayNodeIdsByUrl.get(selfRelayUrl) ?? relayPeerIdFor(selfRelayUrl);
 }
 
 // Derive HTTP base URL from a wss:// relay URL (wss://peer.ooo/ws → https://peer.ooo)
@@ -836,7 +854,7 @@ function relayHttpBase(wsUrl) {
 }
 
 // Query a remote relay's HTTP peer-list endpoint.
-async function queryRelayForPeers(relayUrl, network, room, requesterPeerId) {
+async function queryRelayForPeers(relayUrl, network, room, requesterPeerId, relayNodeId = null) {
   try {
     const base = relayHttpBase(relayUrl);
     const params = new URLSearchParams({ network, room });
@@ -850,7 +868,7 @@ async function queryRelayForPeers(relayUrl, network, room, requesterPeerId) {
     if (!resp.ok) return [];
     const data = await resp.json();
     const peers = Array.isArray(data?.peers) ? data.peers : [];
-    return peers.map(p => ({ ...p, relay_url: relayUrl }));
+    return peers.map(p => ({ ...p, relay_url: relayUrl, ...(relayNodeId ? { relay_node_id: relayNodeId } : {}) }));
   } catch {
     return [];
   }
@@ -872,6 +890,9 @@ async function findFederatedPeers(
   if (!selfRelayUrl || !env.DB) return localPeers;
 
   let remoteUrls;
+  // Which relay holds each remote peer, by node ID as well as URL (the URL of a
+  // relay behind NAT is its tunnel home's; the node ID is its own).
+  const nodeIdByUrl = new Map();
   if (isKademliaEnabled(env)) {
     const providers = Array.isArray(publishedScopeProviders)
       ? publishedScopeProviders
@@ -882,6 +903,9 @@ async function findFederatedPeers(
         room,
         { connections },
       );
+    for (const provider of providers) {
+      if (provider?.url && provider?.node_id) nodeIdByUrl.set(provider.url, provider.node_id);
+    }
     remoteUrls = [...new Set(providers.map((provider) => provider.url))]
       .filter((relayUrl) => relayUrl !== selfRelayUrl);
   } else {
@@ -891,7 +915,7 @@ async function findFederatedPeers(
 
   const remotePeers = remoteUrls.length
     ? (await Promise.all(
-      remoteUrls.map((relayUrl) => queryRelayForPeers(relayUrl, network, room, requesterPeerId)),
+      remoteUrls.map((relayUrl) => queryRelayForPeers(relayUrl, network, room, requesterPeerId, nodeIdByUrl.get(relayUrl) ?? null)),
     )).flat()
     : [];
 
