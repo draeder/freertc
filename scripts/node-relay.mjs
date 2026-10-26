@@ -37,6 +37,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { installWebSocketPair, serverSocketOf } from '../src/node/websocket-pair.js';
 import { openSqliteD1 } from '../src/node/d1-sqlite.js';
+import { createCostMeter } from '../src/node/cost-meter.js';
 import { nodeDurableNamespace } from '../src/node/durable-object.js';
 import { createRelayIdentity, decodeRelayIdentitySecret, isPrivateRelayUrl } from '../src/relay-identity.js';
 import { heartbeatKademlia, isPublicRelay } from '../src/relay-overlay.js';
@@ -133,8 +134,10 @@ if (!FEDERATION) {
   federationNote = `${PUBLIC ? 'public' : 'private mesh'}, joining through ${bootstrap.length ? bootstrap.join(', ') : '(no bootstrap: others join through this relay)'}`;
 }
 
+// What this relay would cost as a Cloudflare worker (src/node/cost-meter.js); GET /debug/cost.
+const meter = createCostMeter();
 const env = {
-  DB: await openSqliteD1({ filename: path.resolve(process.env.DB_PATH || path.join(DATA_DIR, 'relay.sqlite')), migrationsDir: path.join(ROOT, 'migrations') }),
+  DB: meter.wrapD1(await openSqliteD1({ filename: path.resolve(process.env.DB_PATH || path.join(DATA_DIR, 'relay.sqlite')), migrationsDir: path.join(ROOT, 'migrations') })),
   RELAY_URL,
   RELAY_NAME: process.env.RELAY_NAME || `freertc-node-${HOST}-${PORT}`,
   FREERTC_PUBLIC: PUBLIC ? 'true' : 'false',
@@ -169,6 +172,13 @@ async function writeResponse(res, response) {
 
 const handler = async (req, res) => {
   try {
+    const pathname = new URL(req.url, 'http://x').pathname;
+    if (pathname === '/debug/cost' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ ok: true, relay: env.RELAY_URL, name: env.RELAY_NAME, cost: meter.snapshot() }));
+      return;
+    }
+    meter.request(req.method, pathname, false);
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const response = await worker.fetch(toRequest(req, chunks.length ? Buffer.concat(chunks) : undefined), env, ctx);
@@ -186,13 +196,17 @@ const server = TLS
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', async (req, socket, head) => {
   try {
+    meter.request(req.method, new URL(req.url, 'http://x').pathname, true);
     const response = await worker.fetch(toRequest(req), env, ctx);
     const serverSocket = serverSocketOf(response);
     if (!serverSocket) {
       socket.end(`HTTP/1.1 ${response.status} ${response.statusText || 'Error'}\r\nConnection: close\r\n\r\n`);
       return;
     }
-    wss.handleUpgrade(req, socket, head, (ws) => serverSocket.attach(ws));
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      ws.on('message', (data) => meter.wsMessage(data));
+      serverSocket.attach(ws);
+    });
   } catch (error) {
     console.error('[node-relay] upgrade failed:', error?.stack || error);
     socket.destroy();
