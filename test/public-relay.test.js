@@ -69,3 +69,16 @@ test('relays in a private mesh federate on local addresses', async (t) => {
   assert.equal((await heartbeatKademlia(b.env, b.url)).enabled, true);
   assert.deepEqual((await listKnownRelays(a.env, a.url)).map((relay) => relay.url).sort(), [a.url, b.url].sort());
 });
+
+test('every federated relay is a bootstrap, not only the configured ones', async (t) => {
+  const { listBootstrapUrls } = await import('../src/relay-overlay.js');
+  const a = { url: 'wss://a.example/ws', env: await relayEnv() };
+  const b = { url: 'wss://b.example/ws', env: await relayEnv({ KADEMLIA_BOOTSTRAP_URLS: 'wss://a.example/ws' }) };
+  const c = { url: 'wss://c.example/ws', env: await relayEnv({ KADEMLIA_BOOTSTRAP_URLS: 'wss://a.example/ws' }) };
+  wire([a, b, c], t);
+  await heartbeatKademlia(b.env, b.url);
+  await heartbeatKademlia(c.env, c.url);
+  // a was configured with no seeds at all, and b only with a; both list every relay they federate with.
+  assert.deepEqual((await listBootstrapUrls(a.env, a.url)).sort(), [b.url, c.url].sort());
+  assert.ok((await listBootstrapUrls(c.env, c.url)).includes(a.url));
+});

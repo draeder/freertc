@@ -3,6 +3,7 @@ import {
   handleKademliaRequest,
   heartbeatKademlia,
   isKademliaEnabled,
+  listBootstrapUrls,
   listKnownRelays,
   lookupRoomProviders,
   lookupScopeProviders,
@@ -14,7 +15,7 @@ import { tunnelRoute } from "./tunnel/frames.js";
 export { RelayTunnel } from "./tunnel/home.js";
 
 const PSP_VERSION = "1.0";
-const WORKER_VERSION = "0.4.8";
+const WORKER_VERSION = "0.4.9";
 
 const DISCOVERY_TYPES = new Set(["announce", "withdraw", "discover", "peer_list", "redirect"]);
 const NEGOTIATION_TYPES = new Set(["connect_request", "connect_accept", "connect_reject", "offer", "answer", "ice_candidate", "ice_end", "renegotiate"]);
@@ -525,7 +526,7 @@ async function handleFetch(request, env, ctx) {
         relay_url: selfRelayUrl,
         relay_peer_id: resolveRelayPeerId(selfRelayUrl),
         kademlia_enabled: isKademliaEnabled(env),
-        bootstrap_urls: configuredBootstrapUrls(env).filter((seed) => seed !== selfRelayUrl),
+        bootstrap_urls: await listBootstrapUrls(env, selfRelayUrl).catch(() => configuredBootstrapUrls(env).filter((seed) => seed !== selfRelayUrl)),
       }, 200);
     }
 
@@ -628,7 +629,7 @@ export class RelayCoordinator {
         relay_url: selfRelayUrl,
         relay_peer_id: resolveRelayPeerId(selfRelayUrl),
         kademlia_enabled: isKademliaEnabled(this.env),
-        bootstrap_urls: configuredBootstrapUrls(this.env).filter((seed) => seed !== selfRelayUrl),
+        bootstrap_urls: await listBootstrapUrls(this.env, selfRelayUrl).catch(() => configuredBootstrapUrls(this.env).filter((seed) => seed !== selfRelayUrl)),
         coordinated: true,
       }, 200);
     }

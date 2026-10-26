@@ -427,6 +427,24 @@ async function learnedBootstrapUrls(context, exclude) {
     .filter((url) => typeof url === 'string' && url && !exclude.has(url) && url !== context.selfUrl);
 }
 
+/**
+ * Every relay this one can join or rejoin through: the configured seeds and
+ * every live federated relay it knows. Any federated relay is a bootstrap;
+ * the configured ones are only where a relay that knows nobody yet starts.
+ */
+export async function listBootstrapUrls(env, selfUrl, options = {}) {
+  const urls = new Set(configuredBootstrapUrls(env));
+  const context = await overlayContext(env, selfUrl, options).catch(() => null);
+  if (context) {
+    for (const node of await listActiveNodeRecords(context)) {
+      if (typeof node?.url === 'string' && node.url) urls.add(node.url);
+    }
+  }
+  urls.delete(selfUrl);
+  if (context) urls.delete(context.selfUrl);
+  return [...urls];
+}
+
 // The standard Kademlia join. No relay is the hub: any relay can be a seed, and a seed answers
 // with the relays closest to the joiner's own id, which is how a new relay is directed to the
 // ones near it. So one seed is asked, in random order, and the first to answer is enough;
@@ -453,7 +471,8 @@ async function joinBootstrap(context) {
     }
     return false;
   };
-  const joined = await askOneOf(seeds) || await askOneOf(await learnedBootstrapUrls(context, new Set(seeds)));
+  // Every federated relay is a bootstrap: a relay rejoins through any one it knows, configured or not.
+  const joined = await askOneOf(seeds) || await askOneOf(shuffled(await learnedBootstrapUrls(context, new Set(seeds))));
   return { bootstrapUrls: tried, joined: joined ? 1 : 0 };
 }
 
