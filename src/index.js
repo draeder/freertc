@@ -15,7 +15,7 @@ import { tunnelRoute } from "./tunnel/frames.js";
 export { RelayTunnel } from "./tunnel/home.js";
 
 const PSP_VERSION = "1.0";
-const WORKER_VERSION = "0.4.9";
+const WORKER_VERSION = "0.4.10";
 
 const DISCOVERY_TYPES = new Set(["announce", "withdraw", "discover", "peer_list", "redirect"]);
 const NEGOTIATION_TYPES = new Set(["connect_request", "connect_accept", "connect_reject", "offer", "answer", "ice_candidate", "ice_end", "renegotiate"]);
@@ -91,6 +91,8 @@ const DEFERRED_FORWARD_STALE_MS = 20_000;
 const DEFERRED_TASK_PRIORITY = { forward: 0, discover: 1, announce: 1, "peer-left": 1, "relay-list": 2, "deliver-queued": 3 };
 const CLEANUP_INTERVAL_MS = 60_000;
 const ALARM_REARM_SLACK_MS = 1_000;
+// A due alarm normally runs within moments; one this far past due will not run by itself.
+const ALARM_STUCK_AFTER_MS = 30_000;
 // One queued task may not hold the queue: a lookup or a forward that never
 // settles would otherwise keep every later announce and discover waiting.
 const DEFERRED_TASK_TIMEOUT_MS = 25_000;
@@ -130,9 +132,12 @@ async function deferWork(ctx, env, task) {
   // that kept failing (as every one did while the account was over its daily
   // Durable Object limit) sits in the platform's retry backoff, and a queue
   // that waited for it answered no announce or discover at all.
+  // An alarm long overdue is stuck the same way: ooo's was 17 days past due
+  // with over a thousand tasks waiting behind it.
   const alarm = await ctx.storage.getAlarm();
-  if (alarm === null || alarm > Date.now() + ALARM_REARM_SLACK_MS) {
-    await ctx.storage.setAlarm(Date.now());
+  const now = Date.now();
+  if (alarm === null || alarm > now + ALARM_REARM_SLACK_MS || alarm < now - ALARM_STUCK_AFTER_MS) {
+    await ctx.storage.setAlarm(now);
   }
 }
 
