@@ -47,9 +47,15 @@ try {
   await import('node:sqlite');
 } catch {
   if (!process.execArgv.includes('--experimental-sqlite')) {
-    const { spawnSync } = await import('node:child_process');
-    const result = spawnSync(process.execPath, ['--experimental-sqlite', '--no-warnings', ...process.execArgv, fileURLToPath(import.meta.url), ...process.argv.slice(2)], { stdio: 'inherit' });
-    process.exit(result.status ?? 1);
+    // Run this relay again with the flag, as a child that lives and dies with
+    // this process: a signal sent here (Ctrl-C, a test stopping the relay) is
+    // passed on, so the child never outlives it holding the port and the
+    // parent's output.
+    const { spawn } = await import('node:child_process');
+    const child = spawn(process.execPath, ['--experimental-sqlite', '--no-warnings', ...process.execArgv, fileURLToPath(import.meta.url), ...process.argv.slice(2)], { stdio: 'inherit' });
+    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal));
+    child.on('exit', (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
+    await new Promise(() => {});
   }
   console.error('[node-relay] this Node has no node:sqlite; use Node 22.5 or later');
   process.exit(1);
