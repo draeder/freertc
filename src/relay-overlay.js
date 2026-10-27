@@ -17,6 +17,7 @@ import {
   createSignedProviderRecord,
   decodeRelayIdentitySecret,
   isPrivateRelayUrl,
+  tunnelNodeIdOf,
   verifySignedRelayRecord,
 } from './relay-identity.js';
 
@@ -159,6 +160,40 @@ export async function relayNodeIdOf(env) {
   }
 }
 
+/** 'cloud' unless the relay says otherwise (a Node relay says 'local'). */
+export function relayKindOf(env) {
+  const kind = String(env?.RELAY_KIND ?? 'cloud').trim().toLowerCase();
+  return kind === 'local' ? 'local' : 'cloud';
+}
+
+/**
+ * The pointers this relay signs into its node record. A relay behind NAT is
+ * reached through its tunnel, and, when it accepts punched connections
+ * (PUNCH_OFFER=on, a Node relay with WebRTC), directly over a data channel
+ * introduced through that tunnel. A relay with a public address is reached there.
+ */
+export function relayReachOf(env, selfUrl) {
+  if (!selfUrl) return [];
+  const tunnelId = tunnelNodeIdOf(selfUrl);
+  if (!tunnelId) return [{ via: 'direct', url: selfUrl }];
+  const reach = [];
+  if (String(env?.PUNCH_OFFER ?? '').toLowerCase() === 'on') {
+    reach.push({ via: 'punch', url: punchOfferUrlFor(selfUrl) });
+  }
+  reach.push({ via: 'tunnel', url: selfUrl });
+  return reach;
+}
+
+/** wss://<home>/t/<id>/ws → https://<home>/t/<id>/api/v1/punch/offer */
+export function punchOfferUrlFor(relayUrl) {
+  const url = new URL(relayUrl);
+  url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
+  url.pathname = url.pathname.replace(/\/ws$/, '/api/v1/punch/offer');
+  url.search = '';
+  url.hash = '';
+  return url.toString();
+}
+
 async function overlayContext(env, selfUrl, options = {}) {
   if (!env?.DB || !selfUrl || !isKademliaEnabled(env)) return null;
   // A public relay whose own address is loopback or private has nothing it
@@ -171,6 +206,8 @@ async function overlayContext(env, selfUrl, options = {}) {
     name: env.RELAY_NAME || null,
     connections: options.connections || 0,
     capacity: Number(env.RELAY_CAPACITY || 10_000),
+    relayKind: relayKindOf(env),
+    reach: relayReachOf(env, selfUrl),
   });
   return { env, db: env.DB, identity, nodeRecord, selfUrl: nodeRecord.url };
 }
@@ -559,6 +596,8 @@ export async function listKnownRelays(env, selfUrl, options = {}) {
       node_id: node.node_id,
       connections: Number(node.connections || 0),
       capacity: Number(node.capacity || 0),
+      relay_kind: node.relay_kind ?? 'cloud',
+      reach: Array.isArray(node.reach) ? node.reach : [],
     });
   }
   return relays;
@@ -638,8 +677,33 @@ async function lookupProviders(env, selfUrl, routingKey, kind, options = {}) {
 
 // Discovery always asks the overlay. A relay that looked a room up before any other relay served
 // it would otherwise keep "only me" for minutes and never find the peers that joined elsewhere.
+// Asking means asking recently, not once per peer: discovers for one room within
+// SCOPE_LOOKUP_SHARE_MS share one lookup (a room filling up was one overlay walk per joining
+// peer, two find RPCs at every relay each time), and a relay that starts serving the room is
+// still found within that window.
+const SCOPE_LOOKUP_SHARE_MS = 5_000;
+const MAX_SHARED_SCOPE_LOOKUPS = 2_000;
+const sharedScopeLookups = new Map();
+
 export async function lookupScopeProviders(env, selfUrl, network, room, options = {}) {
-  return lookupProviders(env, selfUrl, await scopeRoutingKey(network, room), SCOPE_PROVIDER_RECORD_KIND, options);
+  const cacheKey = JSON.stringify([selfUrl, network, room]);
+  const now = Date.now();
+  const shared = sharedScopeLookups.get(cacheKey);
+  if (shared && now - shared.startedAt < SCOPE_LOOKUP_SHARE_MS) {
+    try {
+      return await withTimeout(shared.promise, SHARED_WAIT_TIMEOUT_MS * 2, 'Scope provider lookup');
+    } catch {
+      // A failed or stuck shared lookup: fall through to one of our own.
+    }
+  }
+  const promise = (async () => lookupProviders(env, selfUrl, await scopeRoutingKey(network, room), SCOPE_PROVIDER_RECORD_KIND, options))();
+  sharedScopeLookups.set(cacheKey, { promise, startedAt: now });
+  if (sharedScopeLookups.size > MAX_SHARED_SCOPE_LOOKUPS) {
+    const oldest = sharedScopeLookups.keys().next().value;
+    if (oldest !== undefined) sharedScopeLookups.delete(oldest);
+  }
+  promise.catch(() => { if (sharedScopeLookups.get(cacheKey)?.promise === promise) sharedScopeLookups.delete(cacheKey); });
+  return promise;
 }
 
 /**

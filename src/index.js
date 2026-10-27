@@ -9,6 +9,7 @@ import {
   lookupScopeProviders,
   publishPeerProviderRecords,
   refreshRoomProviders,
+  relayKindOf,
   relayNodeIdOf,
 } from "./relay-overlay.js";
 import { relayPeerIdFor } from "./relay-id.js";
@@ -534,6 +535,7 @@ async function handleFetch(request, env, ctx) {
         relay_url: selfRelayUrl,
         relay_peer_id: resolveRelayPeerId(selfRelayUrl),
         node_id: relayNodeIdsByUrl.get(selfRelayUrl) ?? null,
+        relay_kind: relayKindOf(env),
         kademlia_enabled: isKademliaEnabled(env),
         bootstrap_urls: await listBootstrapUrls(env, selfRelayUrl).catch(() => configuredBootstrapUrls(env).filter((seed) => seed !== selfRelayUrl)),
       }, 200);
@@ -639,6 +641,7 @@ export class RelayCoordinator {
         relay_url: selfRelayUrl,
         relay_peer_id: resolveRelayPeerId(selfRelayUrl),
         node_id: relayNodeIdsByUrl.get(selfRelayUrl) ?? null,
+        relay_kind: relayKindOf(this.env),
         kademlia_enabled: isKademliaEnabled(this.env),
         bootstrap_urls: await listBootstrapUrls(this.env, selfRelayUrl).catch(() => configuredBootstrapUrls(this.env).filter((seed) => seed !== selfRelayUrl)),
         coordinated: true,

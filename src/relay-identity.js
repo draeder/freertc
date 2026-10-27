@@ -101,6 +101,38 @@ export async function createRelayIdentity(publicKey, privateKey) {
   return { publicKey, privateKey, nodeId: await relayNodeId(publicKey) };
 }
 
+export const RELAY_KINDS = new Set(['cloud', 'local']);
+const REACH_VIAS = new Set(['punch', 'tunnel', 'direct']);
+const MAX_REACH_ENTRIES = 4;
+
+/**
+ * How a relay can be reached, most preferred first, as it signs it in its node
+ * record (a pointer: whoever holds the record can reach the relay without the
+ * holder carrying its traffic):
+ *   { via: 'punch',  url: https://<home>/t/<node id>/api/v1/punch/offer }  a direct data channel
+ *   { via: 'tunnel', url: wss://<home>/t/<node id>/ws }                     through the tunnel home
+ *   { via: 'direct', url: wss://host/ws }                                   a public address
+ * A relay can only point at its own tunnel.
+ */
+export function normalizeReach(reach, nodeId) {
+  if (!Array.isArray(reach)) return [];
+  const out = [];
+  for (const entry of reach) {
+    if (out.length >= MAX_REACH_ENTRIES) break;
+    const via = String(entry?.via ?? '');
+    if (!REACH_VIAS.has(via) || typeof entry?.url !== 'string' || entry.url.length > 512) continue;
+    let url;
+    try { url = new URL(entry.url); } catch { continue; }
+    if (!['https:', 'http:', 'wss:', 'ws:'].includes(url.protocol)) continue;
+    const tunnel = /^\/t\/([0-9a-f]{64})\//.exec(url.pathname);
+    if (tunnel && tunnel[1] !== nodeId) continue;
+    if (via !== 'direct' && !tunnel) continue;
+    url.hash = '';
+    out.push({ via, url: url.toString() });
+  }
+  return out;
+}
+
 export async function createSignedNodeRecord(identity, options) {
   const now = Number(options.now ?? Date.now());
   const ttlMs = Math.min(MAX_NODE_RECORD_TTL_MS, Math.max(30_000, Number(options.ttlMs ?? 5 * 60_000)));
@@ -113,6 +145,8 @@ export async function createSignedNodeRecord(identity, options) {
     name: typeof options.name === 'string' && options.name ? options.name.slice(0, 128) : null,
     connections: Math.max(0, Number(options.connections || 0)),
     capacity: Math.max(1, Number(options.capacity || 10_000)),
+    ...(RELAY_KINDS.has(options.relayKind) ? { relay_kind: options.relayKind } : {}),
+    ...(Array.isArray(options.reach) && options.reach.length ? { reach: normalizeReach(options.reach, identity.nodeId) } : {}),
     issued_at_ms: now,
     expires_at_ms: now + ttlMs,
   }, identity.privateKey);
@@ -163,6 +197,11 @@ export async function verifySignedRelayRecord(record, options = {}) {
     const tunnelId = tunnelNodeIdOf(record.url);
     if (tunnelId && tunnelId !== record.node_id) return false;
     if (record.kind !== RELAY_NODE_RECORD_KIND && !isNodeId(record.key)) return false;
+    // Pointers: a relay kind from the known set, and reach entries that are
+    // already in normal form (so a signed record means exactly one thing).
+    if (record.relay_kind !== undefined && !RELAY_KINDS.has(record.relay_kind)) return false;
+    if (record.reach !== undefined
+      && canonicalJson(normalizeReach(record.reach, record.node_id)) !== canonicalJson(record.reach)) return false;
 
     return await verifyMessage(canonicalJson(unsignedRecord(record)), record.signature, record.public_key);
   } catch {

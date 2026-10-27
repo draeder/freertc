@@ -27,6 +27,11 @@
 //                              tunnel to a public relay: wss://<home>/t/<node id>/ws
 //   FREERTC_TUNNEL_HOMES       comma-separated relays to tunnel through, tried in order
 //                              (default: the bootstrap relays)
+//   FREERTC_PUNCH              on (default) | off — accept punched connections: a client posts
+//                              its offer to POST /api/v1/punch/offer (through the tunnel when
+//                              behind NAT) and talks to this relay over a direct data channel;
+//                              needs WebRTC (the optional werift dependency)
+//   RELAY_KIND                 local (default) | cloud — what this relay tells clients it is
 //   PUNCH_RENDEZVOUS_URL       also accept hole-punched connections through this rendezvous
 //   PUNCH_LISTENER_ID          the id to register there
 import { createServer } from 'node:http';
@@ -38,6 +43,7 @@ import { WebSocketServer } from 'ws';
 import { installWebSocketPair, serverSocketOf } from '../src/node/websocket-pair.js';
 import { openSqliteD1 } from '../src/node/d1-sqlite.js';
 import { createCostMeter } from '../src/node/cost-meter.js';
+import { PUNCH_OFFER_PATH, createPunchOfferHandler, punchOfferAvailable } from '../src/punch/offer.js';
 import { nodeDurableNamespace } from '../src/node/durable-object.js';
 import { createRelayIdentity, decodeRelayIdentitySecret, isPrivateRelayUrl } from '../src/relay-identity.js';
 import { heartbeatKademlia, isPublicRelay } from '../src/relay-overlay.js';
@@ -136,7 +142,11 @@ if (!FEDERATION) {
 
 // What this relay would cost as a Cloudflare worker (src/node/cost-meter.js); GET /debug/cost.
 const meter = createCostMeter();
+// Punched connections need WebRTC in this process (werift, an optional dependency).
+const PUNCH = !isOff(process.env.FREERTC_PUNCH) && await punchOfferAvailable();
 const env = {
+  RELAY_KIND: process.env.RELAY_KIND === 'cloud' ? 'cloud' : 'local',
+  ...(PUNCH ? { PUNCH_OFFER: 'on' } : {}),
   DB: meter.wrapD1(await openSqliteD1({ filename: path.resolve(process.env.DB_PATH || path.join(DATA_DIR, 'relay.sqlite')), migrationsDir: path.join(ROOT, 'migrations') })),
   RELAY_URL,
   RELAY_NAME: process.env.RELAY_NAME || `freertc-node-${HOST}-${PORT}`,
@@ -170,9 +180,19 @@ async function writeResponse(res, response) {
   res.end(Buffer.from(await response.arrayBuffer()));
 }
 
+// Set once acceptSocket exists (below); requests can't arrive before the server listens.
+let handlePunchOffer = null;
+
 const handler = async (req, res) => {
   try {
     const pathname = new URL(req.url, 'http://x').pathname;
+    if (pathname === PUNCH_OFFER_PATH && handlePunchOffer) {
+      meter.request(req.method, pathname, false);
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      await writeResponse(res, await handlePunchOffer(toRequest(req, chunks.length ? Buffer.concat(chunks) : undefined)));
+      return;
+    }
     if (pathname === '/debug/cost' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
       res.end(JSON.stringify({ ok: true, relay: env.RELAY_URL, name: env.RELAY_NAME, cost: meter.snapshot() }));
@@ -227,6 +247,13 @@ async function acceptSocket(socket, pathname = '/ws', headers = []) {
   else socket.close(1011, `Relay answered ${response.status}`);
 }
 
+if (PUNCH) {
+  handlePunchOffer = createPunchOfferHandler({
+    onSocket: (socket) => acceptSocket(socket),
+    log: (line) => console.log(`[node-relay:punch] ${line}`),
+  });
+}
+
 // The worker only heartbeats when a request comes in; a relay behind NAT may
 // see none for a while, so keep its federation alive from here too.
 async function heartbeat() {
@@ -241,7 +268,9 @@ if (tunneling) {
     homes: tunnelHomes,
     identity: await createRelayIdentity(publicKey, privateKey),
     name: env.RELAY_NAME,
-    handleRequest: (request) => worker.fetch(request, env, ctx),
+    handleRequest: (request) => (handlePunchOffer && new URL(request.url).pathname === PUNCH_OFFER_PATH
+      ? handlePunchOffer(request)
+      : worker.fetch(request, env, ctx)),
     handleStream: (socket, { path: streamPath, headers }) => acceptSocket(socket, new URL(streamPath, 'http://x').pathname, headers),
     onUrl: (url) => {
       env.RELAY_URL = url ?? RELAY_URL;
@@ -269,5 +298,6 @@ if (process.env.PUNCH_RENDEZVOUS_URL) {
 server.listen(PORT, HOST, () => {
   console.log(`[node-relay] ${env.RELAY_NAME} on ${TLS ? 'https' : 'http'}://${HOST}:${PORT} (relay ${env.RELAY_URL})`);
   console.log(`[node-relay] federation: ${federationNote}; data in ${DATA_DIR}`);
+  console.log(`[node-relay] punched connections: ${PUNCH ? `on (POST ${PUNCH_OFFER_PATH})` : (isOff(process.env.FREERTC_PUNCH) ? 'off (FREERTC_PUNCH=off)' : 'off: no WebRTC here (npm install werift)')}`);
   heartbeat();
 });

@@ -242,6 +242,169 @@ const DEFAULT_ICE_SERVERS = [
   { urls: 'stun:stun.nextcloud.com:443' },
 ]
 
+// ── Punched relay sockets ───────────────────────────────────────────────────
+// A relay behind NAT is reached at wss://<home>/t/<node id>/ws, through its
+// tunnel home. Every frame over that socket is a request the home pays for. So
+// when the client has WebRTC, it first asks the relay, through the tunnel, for
+// a direct data channel: one POST of a complete offer to
+// https://<home>/t/<node id>/api/v1/punch/offer, one answer back, and the relay
+// protocol runs over the channel with the home out of the loop. If the punch
+// does not open (no WebRTC there, a NAT that will not punch), the client uses
+// the tunnel socket instead and does not try that relay again for a while.
+const PUNCH_OFFER_TIMEOUT_MS = 12_000
+const PUNCH_GATHER_TIMEOUT_MS = 3_000
+const PUNCH_RETRY_AFTER_MS = 10 * 60_000
+const PUNCH_CHANNEL_LABEL = 'freertc-relay'
+const punchFailures = new Map()
+const SOCKET_CONNECTING = 0
+const SOCKET_OPEN = 1
+const SOCKET_CLOSED = 3
+
+/** wss://<home>/t/<node id>/ws → https://<home>/t/<node id>/api/v1/punch/offer, else null. */
+export function punchOfferUrlForRelay(relayUrl) {
+  try {
+    const url = new URL(relayUrl)
+    if (!/^\/t\/[0-9a-f]{64}\/ws$/.test(url.pathname)) return null
+    url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:'
+    url.pathname = url.pathname.replace(/\/ws$/, '/api/v1/punch/offer')
+    url.search = ''
+    url.hash = ''
+    return url.toString()
+  } catch {
+    return null
+  }
+}
+
+function waitForIceGathering(pc, timeoutMs) {
+  if (pc.iceGatheringState === 'complete') return Promise.resolve()
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs)
+    const done = () => { clearTimeout(timer); resolve() }
+    pc.onicecandidate = (event) => { if (!event?.candidate) done() }
+    pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') done() }
+  })
+}
+
+/** Open a data channel to a relay through its punch endpoint. Resolves { pc, channel }. */
+async function punchRelayChannel(offerUrl, { PeerConnection, iceServers, fetchImpl, timeoutMs = PUNCH_OFFER_TIMEOUT_MS }) {
+  const pc = new PeerConnection({ iceServers })
+  const channel = pc.createDataChannel(PUNCH_CHANNEL_LABEL)
+  let openTimer = null
+  try {
+    const opened = new Promise((resolve, reject) => {
+      openTimer = setTimeout(() => reject(new Error('punched channel did not open')), timeoutMs)
+      channel.onopen = () => { clearTimeout(openTimer); resolve() }
+    })
+    // An offer the relay refuses ends this attempt before the channel could
+    // open; that later timeout must not surface as an unhandled rejection.
+    opened.catch(() => {})
+    const gathered = waitForIceGathering(pc, PUNCH_GATHER_TIMEOUT_MS)
+    await pc.setLocalDescription(await pc.createOffer())
+    await gathered
+    // text/plain keeps this a simple request: no CORS preflight, so the home
+    // sees exactly one request per introduction.
+    const response = await fetchImpl(offerUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify({ sdp: pc.localDescription.sdp }),
+    })
+    const body = await response.json().catch(() => null)
+    if (!response.ok || !body?.ok || typeof body.sdp !== 'string') {
+      throw new Error(body?.error || `punch offer answered ${response.status}`)
+    }
+    await pc.setRemoteDescription({ type: 'answer', sdp: body.sdp })
+    await opened
+    return { pc, channel }
+  } catch (error) {
+    clearTimeout(openTimer)
+    try { channel.close() } catch {}
+    try { pc.close() } catch {}
+    throw error
+  }
+}
+
+/**
+ * A socket to the relay at relayUrl with the WebSocket surface the client uses
+ * (readyState, send, close, onopen/onmessage/onclose/onerror): a punched data
+ * channel when the relay is behind NAT and WebRTC is here, else a WebSocket.
+ */
+export function openRelaySocket(relayUrl, {
+  punch = true,
+  WebSocketImpl = globalThis.WebSocket,
+  PeerConnection = globalThis.RTCPeerConnection,
+  iceServers = [],
+  fetchImpl = globalThis.fetch,
+  log = () => {},
+} = {}) {
+  const offerUrl = punch && typeof PeerConnection === 'function' && typeof fetchImpl === 'function'
+    ? punchOfferUrlForRelay(relayUrl)
+    : null
+  const failedAt = offerUrl ? punchFailures.get(offerUrl) : null
+  if (!offerUrl || (failedAt && Date.now() - failedAt < PUNCH_RETRY_AFTER_MS)) {
+    return new WebSocketImpl(relayUrl)
+  }
+
+  const socket = {
+    readyState: SOCKET_CONNECTING,
+    transport: 'punch',
+    onopen: null,
+    onmessage: null,
+    onclose: null,
+    onerror: null,
+    send(data) {
+      if (inner) return inner.send(data)
+      if (socket.readyState !== SOCKET_OPEN || !channel) throw new Error('relay socket is not open')
+      channel.send(typeof data === 'string' ? data : String(data))
+    },
+    close(code = 1000, reason = '') {
+      if (inner) return inner.close(code, reason)
+      if (socket.readyState === SOCKET_CLOSED) return
+      closedByUser = true
+      finish(code, reason)
+    },
+  }
+  let channel = null
+  let pc = null
+  let inner = null
+  let closedByUser = false
+  const finish = (code = 1006, reason = '') => {
+    if (socket.readyState === SOCKET_CLOSED) return
+    socket.readyState = SOCKET_CLOSED
+    try { channel?.close() } catch {}
+    try { pc?.close() } catch {}
+    socket.onclose?.({ code, reason, wasClean: code === 1000 })
+  }
+  const fallBack = (why) => {
+    if (closedByUser) return
+    punchFailures.set(offerUrl, Date.now())
+    log(`[relay] no punched channel to ${relayUrl} (${why}); using the tunnel`)
+    socket.transport = 'tunnel'
+    inner = new WebSocketImpl(relayUrl)
+    inner.onopen = (event) => { socket.readyState = inner.readyState; socket.onopen?.(event) }
+    inner.onmessage = (event) => socket.onmessage?.(event)
+    inner.onerror = (event) => socket.onerror?.(event)
+    inner.onclose = (event) => { socket.readyState = SOCKET_CLOSED; socket.onclose?.(event) }
+  }
+
+  punchRelayChannel(offerUrl, { PeerConnection, iceServers, fetchImpl })
+    .then((opened) => {
+      if (closedByUser) { try { opened.channel.close() } catch {} try { opened.pc.close() } catch {} return }
+      ;({ pc, channel } = opened)
+      punchFailures.delete(offerUrl)
+      log(`[relay] punched a direct channel to ${relayUrl}`)
+      channel.onmessage = (event) => socket.onmessage?.({ data: typeof event.data === 'string' ? event.data : String(event.data) })
+      channel.onclose = () => finish(1006, 'punched channel closed')
+      channel.onerror = (event) => socket.onerror?.(event)
+      const watch = () => { if (['failed', 'closed'].includes(pc.connectionState)) finish(1006, `connection ${pc.connectionState}`) }
+      pc.onconnectionstatechange = watch
+      socket.readyState = SOCKET_OPEN
+      socket.onopen?.({})
+    })
+    .catch((error) => fallBack(error?.message ?? String(error)))
+
+  return socket
+}
+
 export function createSignalingClient(options = {}) {
   const {
     peerId: initialPeerId,
@@ -250,6 +413,9 @@ export function createSignalingClient(options = {}) {
     sessionId: legacyRoomId,
     signalUrl,
     iceServers: configuredIceServers,
+    // Reach a relay behind NAT over a punched data channel instead of its
+    // tunnel home (see openRelaySocket). On by default where WebRTC exists.
+    relayPunch = true,
     trickleIce = true,
     capabilities = {},
     auth,
@@ -2208,7 +2374,7 @@ export function createSignalingClient(options = {}) {
     }
 
     setStatus('connecting')
-    ws = new WebSocket(wsUrl.toString())
+    ws = openRelaySocket(wsUrl.toString(), { punch: relayPunch, iceServers: preferredIceServers, log })
 
     ws.onopen = () => {
       if (stoppedByUser) {
