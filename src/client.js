@@ -285,10 +285,10 @@ function waitForIceGathering(pc, timeoutMs) {
   })
 }
 
-/** Open a data channel to a relay through its punch endpoint. Resolves { pc, channel }. */
-async function punchRelayChannel(offerUrl, { PeerConnection, iceServers, fetchImpl, timeoutMs = PUNCH_OFFER_TIMEOUT_MS }) {
+/** Open a data channel to a relay through its punch endpoint. Resolves { pc, channel }. A relay also uses it to link to another relay (label freertc-federation). */
+export async function punchRelayChannel(offerUrl, { PeerConnection, iceServers, fetchImpl, timeoutMs = PUNCH_OFFER_TIMEOUT_MS, label = PUNCH_CHANNEL_LABEL }) {
   const pc = new PeerConnection({ iceServers })
-  const channel = pc.createDataChannel(PUNCH_CHANNEL_LABEL)
+  const channel = pc.createDataChannel(label)
   let openTimer = null
   try {
     const opened = new Promise((resolve, reject) => {

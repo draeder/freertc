@@ -32,6 +32,12 @@
 //                              behind NAT) and talks to this relay over a direct data channel;
 //                              needs WebRTC (the optional werift dependency)
 //   RELAY_KIND                 local (default) | cloud — what this relay tells clients it is
+//   FREERTC_LINKS              on (default) | off — link to other local relays (punched data
+//                              channels, or the LAN) and send federation calls to them over the
+//                              link instead of out through a cloud tunnel home
+//   FREERTC_LAN                on (default) | off — find relays on this network by UDP broadcast
+//                              (only when HOST is a LAN address, e.g. 0.0.0.0; never loopback)
+//   FREERTC_LAN_PORT           UDP port for LAN beacons (default 41235)
 //   PUNCH_RENDEZVOUS_URL       also accept hole-punched connections through this rendezvous
 //   PUNCH_LISTENER_ID          the id to register there
 import { createServer } from 'node:http';
@@ -39,14 +45,17 @@ import { createServer as createTlsServer } from 'node:https';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, createReadStream } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { WebSocketServer } from 'ws';
+import WsClient, { WebSocketServer } from 'ws';
 import { installWebSocketPair, serverSocketOf } from '../src/node/websocket-pair.js';
 import { openSqliteD1 } from '../src/node/d1-sqlite.js';
 import { createCostMeter } from '../src/node/cost-meter.js';
 import { PUNCH_OFFER_PATH, createPunchOfferHandler, punchOfferAvailable } from '../src/punch/offer.js';
+import { DataChannelSocket } from '../src/punch/transport.js';
+import { LINK_CHANNEL_LABEL, LINK_PATH, createRelayLinks } from '../src/node/relay-links.js';
+import { hasLanAddress, startLanBeacon, DEFAULT_LAN_PORT } from '../src/node/lan-beacon.js';
 import { nodeDurableNamespace } from '../src/node/durable-object.js';
-import { createRelayIdentity, decodeRelayIdentitySecret, isPrivateRelayUrl } from '../src/relay-identity.js';
-import { heartbeatKademlia, isPublicRelay } from '../src/relay-overlay.js';
+import { createRelayIdentity, createSignedNodeRecord, decodeRelayIdentitySecret, isPrivateRelayUrl } from '../src/relay-identity.js';
+import { heartbeatKademlia, isPublicRelay, listKnownRelays, relayReachOf } from '../src/relay-overlay.js';
 import { RelayTunnel } from '../src/tunnel/home.js';
 
 // node:sqlite needs --experimental-sqlite before Node 22.13. Turn it on rather than fail.
@@ -216,6 +225,11 @@ const server = TLS
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', async (req, socket, head) => {
   try {
+    if (new URL(req.url, 'http://x').pathname === LINK_PATH) {
+      if (!relayLinks) { socket.end('HTTP/1.1 404 No links here\r\n\r\n'); return; }
+      wss.handleUpgrade(req, socket, head, (ws) => relayLinks.accept(ws, { via: 'lan' }));
+      return;
+    }
     meter.request(req.method, new URL(req.url, 'http://x').pathname, true);
     const response = await worker.fetch(toRequest(req), env, ctx);
     const serverSocket = serverSocketOf(response);
@@ -247,9 +261,63 @@ async function acceptSocket(socket, pathname = '/ws', headers = []) {
   else socket.close(1011, `Relay answered ${response.status}`);
 }
 
+// Links to other local relays (src/node/relay-links.js): federation calls to
+// a linked relay go over the link, not out through a cloud tunnel home.
+let relayLinks = null;
+const LINKS = federating && !isOff(process.env.FREERTC_LINKS);
+if (LINKS) {
+  const { publicKey, privateKey } = decodeRelayIdentitySecret(env.RELAY_IDENTITY_SECRET);
+  const linkIdentity = await createRelayIdentity(publicKey, privateKey);
+  const directFetch = globalThis.fetch;
+  const PeerConnection = PUNCH ? (await import('werift')).RTCPeerConnection : null;
+  const { punchRelayChannel } = await import('../src/client.js');
+  relayLinks = createRelayLinks({
+    identity: linkIdentity,
+    nodeRecord: () => createSignedNodeRecord(linkIdentity, {
+      url: env.RELAY_URL,
+      name: env.RELAY_NAME,
+      relayKind: env.RELAY_KIND,
+      reach: relayReachOf(env, env.RELAY_URL),
+    }),
+    handleRequest: (request) => worker.fetch(request, env, ctx),
+    dialPunch: PeerConnection
+      ? async (offerUrl) => {
+        const { pc, channel } = await punchRelayChannel(offerUrl, {
+          PeerConnection,
+          iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }],
+          fetchImpl: directFetch,
+          label: LINK_CHANNEL_LABEL,
+        });
+        return new DataChannelSocket(channel, pc, { link: true });
+      }
+      : null,
+    dialLan: (url) => new Promise((resolve, reject) => {
+      const ws = new WsClient(url);
+      ws.once('open', () => resolve(ws));
+      ws.once('error', reject);
+    }),
+    listRelays: () => listKnownRelays(env, env.RELAY_URL),
+    log: (line) => console.log(`[node-relay:links] ${line}`),
+  });
+  globalThis.fetch = relayLinks.wrapFetch(directFetch);
+  setTimeout(() => relayLinks.maintain().catch(() => {}), 5_000).unref();
+  const lanHost = !['127.0.0.1', 'localhost', '::1'].includes(HOST);
+  if (!isOff(process.env.FREERTC_LAN) && lanHost && hasLanAddress()) {
+    startLanBeacon({
+      nodeId: linkIdentity.nodeId,
+      port: PORT,
+      lanPort: Number(process.env.FREERTC_LAN_PORT || DEFAULT_LAN_PORT),
+      onRelay: (nodeId, url) => relayLinks.lanSeen(nodeId, url),
+      log: (line) => console.log(`[node-relay:links] ${line}`),
+    });
+  }
+}
+
 if (PUNCH) {
   handlePunchOffer = createPunchOfferHandler({
-    onSocket: (socket) => acceptSocket(socket),
+    onSocket: (socket) => (socket.channel?.label === LINK_CHANNEL_LABEL && relayLinks
+      ? relayLinks.accept(socket, { via: 'punch' })
+      : acceptSocket(socket)),
     log: (line) => console.log(`[node-relay:punch] ${line}`),
   });
 }
@@ -276,6 +344,7 @@ if (tunneling) {
       env.RELAY_URL = url ?? RELAY_URL;
       console.log(url ? `[node-relay] federating as ${url}` : `[node-relay] tunnel lost; out of federation until it is back`);
       heartbeat();
+      if (url) setTimeout(() => relayLinks?.maintain().catch(() => {}), 5_000).unref();
     },
     log: (line) => console.log(`[node-relay:tunnel] ${line}`),
   });

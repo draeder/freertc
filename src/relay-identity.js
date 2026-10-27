@@ -228,3 +228,23 @@ export async function verifyTunnelChallenge(publicKey, nonce, host, signature) {
     return false;
   }
 }
+
+// A link between two relays (src/node/relay-links.js) is authenticated the same
+// way: each side sends a fresh nonce, and the other answers with its signed
+// node record and a signature over that nonce, so a link is bound to the key
+// its node ID comes from and a recorded answer is good for one link only.
+function linkChallengeMessage(nonce) {
+  return canonicalJson(['freertc-link', 1, String(nonce)]);
+}
+
+export async function signLinkChallenge(identity, nonce) {
+  return signMessage(linkChallengeMessage(nonce), identity.privateKey);
+}
+
+export async function verifyLinkChallenge(publicKey, nonce, signature) {
+  try {
+    return await verifyMessage(linkChallengeMessage(nonce), signature, publicKey);
+  } catch {
+    return false;
+  }
+}
