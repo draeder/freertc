@@ -148,6 +148,22 @@ The browser UI uses two distinct scopes:
 
 Peers are discoverable and relay messages are deliverable only when both Network and Room match. The relay domain is not an isolation boundary: `peer.ooo` and `decentralize.ooo` can federate peers that deliberately use the same Network and Room.
 
+## Local relays
+
+A local relay runs the same relay code under Node, on your own machine:
+
+```bash
+node scripts/node-relay.mjs
+```
+
+It federates with the cloud relays by default. Behind NAT it takes a public
+address through a tunnel to a public relay. Clients with WebRTC reach it over a
+punched data channel introduced through that tunnel, instead of through the
+tunnel itself. It also links to other local relays directly, so federation
+between local relays does not pass through the cloud. PeerPigeon clients prefer
+a healthy local relay over a cloud one. See [docs/RELAYS.md](docs/RELAYS.md) for
+the design, the settings, and measured costs.
+
 ## Kademlia relay overlay
 
 FreeRTC uses Kademlia between federated relays—not between browser peers. Relay IDs, scope keys, and exact-peer keys are deterministic 256-bit SHA-256 values produced by UnSEA. Relay and provider records are signed with stable UnSEA P-256 identities before they are accepted or replicated.

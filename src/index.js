@@ -17,7 +17,7 @@ import { tunnelRoute } from "./tunnel/frames.js";
 export { RelayTunnel } from "./tunnel/home.js";
 
 const PSP_VERSION = "1.0";
-const WORKER_VERSION = "0.4.10";
+const WORKER_VERSION = "0.5.0";
 
 const DISCOVERY_TYPES = new Set(["announce", "withdraw", "discover", "peer_list", "redirect"]);
 const NEGOTIATION_TYPES = new Set(["connect_request", "connect_accept", "connect_reject", "offer", "answer", "ice_candidate", "ice_end", "renegotiate"]);
