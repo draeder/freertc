@@ -144,6 +144,8 @@ const MESH_SIGNAL_TYPES = new Set(['offer', 'answer', 'ice_candidate', 'ice_end'
 // Sent on a data channel just before this side closes it, so the other side
 // closes its end at once instead of sending into a dead edge.
 const DATA_BYE_FRAME = 'freertc-bye'
+// PSP Revision 3 (19.7) names the link bye `~bye`; both are accepted.
+const DATA_BYE_FRAMES = new Set([DATA_BYE_FRAME, '~bye'])
 // How long a closing channel stays open so its bye frame is flushed first.
 const DATA_BYE_FLUSH_MS = 250
 const ANSWER_BURST_COOLDOWN_MS = 3000
@@ -1432,7 +1434,7 @@ export function createSignalingClient(options = {}) {
       }
 
       // The other side is closing this edge (closePeerConnection): close ours now.
-      if (msg?.type === DATA_BYE_FRAME) {
+      if (DATA_BYE_FRAMES.has(msg?.type)) {
         const byeEntry = mesh.connections.get(remotePeerId)
         if (byeEntry?.connection === pc) {
           const reason = typeof msg.reason === 'string' ? msg.reason.slice(0, 120) : 'remote_close'

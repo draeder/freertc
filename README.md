@@ -10,7 +10,7 @@ This project provides a Cloudflare Worker signaling relay for WebRTC peers using
 
 Immediately after deployment, the install script requests the new Worker's `/health` endpoint. The Worker derives `wss://<worker>.<account>.workers.dev/ws` from that request and joins the Kademlia overlay through its seed relays. No custom domain is required. Cloudflare lets you customize the Worker and database names before deployment.
 
-There is no hub. Every one-click relay joins the network through the seeds in `KADEMLIA_BOOTSTRAP_URLS`, asking one at a time in random order; the seed answers with the relays closest to the newcomer's own ID, and the newcomer carries on from those. Any relay can be a seed for the next, and `/health` lists the seeds a relay was given. Each relay derives a unique PSP relay sender ID from its deployed hostname (`bootstrap:<worker>.<account>.workers.dev`).
+There is no hub. Every one-click relay joins the network through the seeds in `KADEMLIA_BOOTSTRAP_URLS`, asking one at a time in random order; the seed answers with the relays closest to the newcomer's own ID, and the newcomer carries on from those. Any relay can be a seed for the next, and `/health` lists the seeds a relay was given. Each federated relay's PSP sender ID is its relay ID: the SHA-256 of its signing key, the same ID it has in the overlay and in its tunnel address (a relay without a signing key uses the SHA-256 of its domain).
 
 See [Cloudflare's Deploy Button documentation](https://developers.cloudflare.com/workers/platform/deploy-buttons/) for details about the account and repository flow.
 

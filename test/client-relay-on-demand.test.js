@@ -346,3 +346,20 @@ test('the anchor count and minimum mesh size cannot be configured to zero', asyn
     assert.equal(decision.isolated, true, 'and a peer with no neighbours is still isolated')
   } finally { h.restore() }
 })
+
+// A link bye on the link's own channel (PSP Revision 3, 19.7) closes the link
+// at once; both the PSP name and freertc's earlier name are accepted.
+for (const type of ['~bye', 'freertc-bye']) {
+  test(`a ${type} frame on a link's own channel closes that link`, async () => {
+    const pool = await poolByCloseness()
+    const h = harness(pool[10])
+    try {
+      const { channel } = await h.addLiveNeighbour(pool[0])
+      assert.equal(h.client.mesh.connections.has(pool[0]), true)
+      channel.deliver({ type, reason: 'test' })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      const entry = h.client.mesh.connections.get(pool[0])
+      assert.ok(!entry || entry.state === 'closed' || entry.state === 'dead', `link closed after ${type}`)
+    } finally { h.restore() }
+  })
+}
