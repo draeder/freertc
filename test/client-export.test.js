@@ -490,18 +490,23 @@ test("a silent signaling socket is detected without continually resetting its pi
     sockets[0].open();
     sockets[0].receive({ type: "ack", body: { status: "ok" } });
 
-    now = 1_000;
-    t.mock.timers.tick(1_000);
-    assert.equal(sockets[0].sent.filter((message) => message.type === "ping").length, 1);
     // A second at a time: one large jump reads as a machine sleep to the
-    // suspend watch, which is its own verdict.
-    for (let second = 2; second <= 20; second += 1) {
-      now = second * 1_000;
-      t.mock.timers.tick(1_000);
-    }
+    // suspend watch, which is its own verdict. Since 0.4.2 the client pings
+    // every 25 s and gives up on a ping unanswered for 60 s, so the ping goes
+    // out at 25 s, the checks at 50 s and 75 s find it unanswered but younger
+    // than 60 s, and the one at 100 s closes the socket.
+    const tickTo = (second) => {
+      while (now < second * 1_000) {
+        now += 1_000;
+        t.mock.timers.tick(1_000);
+      }
+    };
+    tickTo(25);
+    assert.equal(sockets[0].sent.filter((message) => message.type === "ping").length, 1);
+    tickTo(99);
+    assert.equal(sockets[0].sent.filter((message) => message.type === "ping").length, 1, "no second ping while one is unanswered");
     assert.equal(sockets[0].closeCode, null);
-    now = 21_000;
-    t.mock.timers.tick(1_000);
+    tickTo(100);
     assert.equal(sockets[0].closeCode, 4000);
   } finally {
     client?.disconnect();

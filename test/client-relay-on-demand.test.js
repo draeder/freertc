@@ -25,7 +25,9 @@ async function poolByCloseness(size = 40) {
   return scored.map((entry) => entry.id)
 }
 
-function harness(localPeerId, { relay = { mode: 'on-demand', settleMs: 0, evalMs: 3_600_000 }, signalTransport = () => false, onDataMessage } = {}) {
+// These tests were written for two mesh peers and three anchors, so the
+// harness asks for them; 0.4.2 ships 1 and 1 (see RELAY_DEFAULTS in the client).
+function harness(localPeerId, { relay = { mode: 'on-demand', settleMs: 0, evalMs: 3_600_000, minMeshPeers: 2, anchors: 3 }, signalTransport = () => false, onDataMessage } = {}) {
   const originalWebSocket = globalThis.WebSocket
   const originalRTCPeerConnection = globalThis.RTCPeerConnection
   const sockets = []
