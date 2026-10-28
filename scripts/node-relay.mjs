@@ -324,9 +324,25 @@ if (PUNCH) {
 
 // The worker only heartbeats when a request comes in; a relay behind NAT may
 // see none for a while, so keep its federation alive from here too.
+// Say whether federation actually holds: which relays answered this relay's
+// announcement, logged whenever that changes.
+let federationState = null;
 async function heartbeat() {
   if (!federating) return;
-  await heartbeatKademlia(env, env.RELAY_URL).catch((error) => console.error('[node-relay] heartbeat failed:', error?.message || error));
+  const result = await heartbeatKademlia(env, env.RELAY_URL)
+    .catch((error) => ({ error: error?.message || String(error) }));
+  const hosts = (urls) => urls.map((url) => { try { return new URL(url).host; } catch { return url; } }).sort();
+  const state = result?.error
+    ? `not federated: heartbeat failed (${result.error})`
+    : !result?.enabled
+      ? 'not federated: federation is off for this address'
+      : result.confirmed_by.length
+        ? `federated as ${env.RELAY_URL}: known to ${hosts(result.confirmed_by).join(', ')}`
+        : `not federated: no relay answered (asked ${hosts(result.asked).join(', ') || 'none'})`;
+  if (state !== federationState) {
+    federationState = state;
+    console.log(`[node-relay] ${state}`);
+  }
 }
 
 if (tunneling) {
@@ -342,7 +358,7 @@ if (tunneling) {
     handleStream: (socket, { path: streamPath, headers }) => acceptSocket(socket, new URL(streamPath, 'http://x').pathname, headers),
     onUrl: (url) => {
       env.RELAY_URL = url ?? RELAY_URL;
-      console.log(url ? `[node-relay] federating as ${url}` : `[node-relay] tunnel lost; out of federation until it is back`);
+      console.log(url ? `[node-relay] joining federation as ${url}` : `[node-relay] tunnel lost; out of federation until it is back`);
       heartbeat();
       if (url) setTimeout(() => relayLinks?.maintain().catch(() => {}), 5_000).unref();
     },

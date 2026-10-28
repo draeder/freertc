@@ -617,14 +617,48 @@ async function hasLiveContacts(context) {
  * every isolate the platform starts repeated the join and a walk toward its own id every
  * two minutes, and each repeat was a fan-out of RPCs that the receivers wrote down.
  */
+/** How many relays one heartbeat announces itself to. */
+const MAX_HEARTBEAT_ANNOUNCE = 16;
+
+/**
+ * Stay federated. Other relays drop a node record that isn't refreshed before it
+ * expires (MAX_NODE_RECORD_TTL_MS), so every heartbeat announces this relay: it
+ * pings each relay it knows and its bootstrap relays, and every ping carries
+ * this relay's signed record. A relay that knows nobody joins first. The
+ * answers say who confirmed it: `confirmed_by` lists the relays that answered.
+ */
 export async function heartbeatKademlia(env, selfUrl, options = {}) {
   const context = await overlayContext(env, selfUrl, options);
   if (!context) return { enabled: false };
-  if (await hasLiveContacts(context)) return { enabled: true, node_id: context.identity.nodeId, joined: false };
   await cleanupExpiredOverlay(context);
-  await ensureRoutingContacts(context);
-  await iterativeLookup(context, context.identity.nodeId, false);
-  return { enabled: true, node_id: context.identity.nodeId, joined: true };
+  let joined = false;
+  if (!await hasLiveContacts(context)) {
+    await ensureRoutingContacts(context);
+    await iterativeLookup(context, context.identity.nodeId, false);
+    joined = true;
+  }
+
+  const targets = new Set();
+  for (const node of await listActiveNodeRecords(context)) {
+    if (typeof node.url === 'string' && node.url !== context.selfUrl) targets.add(node.url);
+  }
+  for (const url of configuredBootstrapUrls(context.env)) {
+    if (url !== context.selfUrl) targets.add(url);
+  }
+  const asked = [...targets].slice(0, MAX_HEARTBEAT_ANNOUNCE);
+  const answers = await Promise.all(asked.map(async (url) => {
+    const response = await postRpc(url, '/api/v1/kad/ping', { requester: context.nodeRecord });
+    if (!response?.ok) return null;
+    if (response.node) await acceptNodeRecord(context, response.node).catch(() => false);
+    return url;
+  }));
+  return {
+    enabled: true,
+    node_id: context.identity.nodeId,
+    joined,
+    asked,
+    confirmed_by: answers.filter(Boolean),
+  };
 }
 
 /**

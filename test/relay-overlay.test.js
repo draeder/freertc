@@ -380,7 +380,7 @@ async function twoRelays() {
   return { envA, envB, urlA, urlB, calls, restore: () => { globalThis.fetch = realFetch; } };
 }
 
-test('a heartbeat on an empty table joins; once a contact is live it makes no RPCs and writes nothing', async () => {
+test('a heartbeat on an empty table joins; after that it only announces itself, one ping per known relay', async () => {
   const { envA, urlA, calls, restore } = await twoRelays();
   try {
     const first = await heartbeatKademlia(envA, urlA);
@@ -394,7 +394,9 @@ test('a heartbeat on an empty table joins; once a contact is live it makes no RP
       const again = await heartbeatKademlia(envA, urlA);
       assert.equal(again.joined, false);
     }
-    assert.equal(calls.count, rpcsAfterJoin, 'a relay with a live contact must not poll on a heartbeat');
+    // Each heartbeat pings the one relay it knows (its bootstrap), so the other side
+    // keeps it listed; no lookups, and the contact it already holds isn't rewritten.
+    assert.equal(calls.count, rpcsAfterJoin + 5, 'one announcement ping per heartbeat');
     assert.equal(envA.DB.nodeWrites, writesAfterJoin);
   } finally {
     restore();
@@ -441,7 +443,8 @@ test('a joining relay asks one seed, not every seed', async () => {
     assert.equal((await heartbeatKademlia(envA, urlA)).joined, true);
     const asked = seeds.filter((url) => finds.get(new URL(url.replace('wss://', 'https://')).hostname) > 0);
     assert.equal(asked.length, 1, `expected one seed to be asked, asked ${asked.join(', ')}`);
-    assert.equal(envA.DB.nodes.size, 1);
+    // The announcement afterwards pings every seed, so all three are known.
+    assert.equal(envA.DB.nodes.size, 3);
   } finally {
     restore();
   }
@@ -454,7 +457,8 @@ test('a seed that is down is skipped, and the next one is enough', async () => {
     assert.equal((await heartbeatKademlia(envA, urlA)).joined, true);
     const liveAsked = ['seed-2.example', 'seed-3.example'].filter((host) => finds.get(host) > 0);
     assert.equal(liveAsked.length, 1, 'once a seed has answered, the others are not asked');
-    assert.equal(envA.DB.nodes.size, 1);
+    // The announcement afterwards reaches both live seeds.
+    assert.equal(envA.DB.nodes.size, 2);
   } finally {
     restore();
   }
@@ -575,11 +579,31 @@ test('a heartbeat joins again once every contact it knew has expired', async () 
 
       clock.advance(60_000);
       assert.equal((await heartbeatKademlia(envA, urlA)).joined, false);
-      assert.equal(calls.count, rpcsAfterJoin);
+      assert.equal(calls.count, rpcsAfterJoin + 1, 'only the announcement ping');
 
       clock.advance(11 * 60_000); // past the longest a node record can live
       assert.equal((await heartbeatKademlia(envA, urlA)).joined, true);
       assert.ok(calls.count > rpcsAfterJoin);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test('a relay stays listed: each heartbeat refreshes its record on the relays it knows', async () => {
+  const { envA, urlA, restore } = await twoRelays();
+  try {
+    await withClock(1_800_000_000_000, async (clock) => {
+      const first = await heartbeatKademlia(envA, urlA);
+      assert.ok(first.confirmed_by.length > 0, 'the bootstrap confirms it');
+      // Ten minutes of two-minute heartbeats: longer than any node record lives,
+      // yet the relay is still answered every time.
+      for (let i = 0; i < 5; i += 1) {
+        clock.advance(2 * 60_000);
+        const again = await heartbeatKademlia(envA, urlA);
+        assert.equal(again.joined, false);
+        assert.ok(again.confirmed_by.length > 0);
+      }
     });
   } finally {
     restore();
