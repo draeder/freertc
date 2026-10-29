@@ -15,7 +15,9 @@ import {
   MAX_TUNNEL_BODY_BYTES, TUNNEL_PING, TUNNEL_PONG, decodeBody, encodeBody, forwardHeaders, tunnelRoute,
 } from './frames.js';
 
-const REQUEST_TIMEOUT_MS = 15_000;
+// A tunneled request with no reply by then is answered 504, and the tunnel it
+// went down is treated as dead: it is closed so the relay reconnects at once.
+const REQUEST_TIMEOUT_MS = 10_000;
 const NODE_RECORD_KINDS = new Set([RELAY_NODE_RECORD_KIND]);
 
 function json(body, status) {
@@ -29,6 +31,11 @@ function closeQuietly(socket, code = 1000, reason = '') {
   try {
     socket.close(code >= 1000 && code < 5000 && code !== 1005 && code !== 1006 ? code : 1000, reason);
   } catch {}
+}
+
+/** Open, as far as the runtime says (the Node test shim has no readyState). */
+function isOpen(socket) {
+  return socket.readyState === undefined || socket.readyState === 1;
 }
 
 function attachmentOf(socket) {
@@ -49,9 +56,54 @@ export class RelayTunnel {
     } catch {}
   }
 
-  /** The authenticated tunnel socket, if the relay is connected. */
+  /**
+   * The relay's tunnel: the newest signed-in tunnel socket that is still open.
+   * A replaced or closed socket can stay listed by the runtime for a while (its
+   * close is never acknowledged when the old connection is dead), so the first
+   * signed-in socket in the list may be one that goes nowhere.
+   */
   tunnelSocket() {
-    return this.state.getWebSockets('tunnel').find((socket) => attachmentOf(socket)?.authed) ?? null;
+    let best = null;
+    let bestSince = -1;
+    for (const socket of this.state.getWebSockets('tunnel')) {
+      const meta = attachmentOf(socket);
+      if (!meta?.authed || !isOpen(socket)) continue;
+      const since = meta.since ?? 0;
+      if (since > bestSince) {
+        best = socket;
+        bestSince = since;
+      }
+    }
+    return best;
+  }
+
+  /** A tunnel that cannot carry a request is dead: sign it out and close it, so the relay reconnects. */
+  dropTunnel(socket, reason) {
+    const meta = attachmentOf(socket);
+    try {
+      if (meta) socket.serializeAttachment({ ...meta, authed: false });
+    } catch {}
+    closeQuietly(socket, 1011, reason);
+    this.closePeersOf(meta?.gen);
+  }
+
+  /** Peers that came in through a tunnel have nothing on the other end once it is gone. */
+  closePeersOf(gen) {
+    if (!gen) return;
+    for (const peer of this.state.getWebSockets('peer')) {
+      if (attachmentOf(peer)?.gen === gen) closeQuietly(peer, 1011, 'Relay tunnel closed');
+    }
+  }
+
+  /** Sends one frame down the tunnel; false (and the tunnel dropped) when it cannot. */
+  sendToTunnel(tunnel, frame) {
+    try {
+      tunnel.send(JSON.stringify(frame));
+      return true;
+    } catch {
+      this.dropTunnel(tunnel, 'Tunnel send failed');
+      return false;
+    }
   }
 
   async fetch(request) {
@@ -80,7 +132,10 @@ export class RelayTunnel {
       const sid = crypto.randomUUID();
       this.state.acceptWebSocket(server, ['peer', `sid:${sid}`]);
       server.serializeAttachment({ role: 'peer', sid, gen });
-      tunnel.send(JSON.stringify({ t: 'open', sid, path, headers: forwardHeaders(request.headers) }));
+      if (!this.sendToTunnel(tunnel, { t: 'open', sid, path, headers: forwardHeaders(request.headers) })) {
+        closeQuietly(server, 1011, 'Relay tunnel closed');
+        return json({ ok: false, error: 'That relay is not connected through this tunnel' }, 502);
+      }
       return new Response(null, { status: 101, webSocket: client });
     }
 
@@ -94,6 +149,8 @@ export class RelayTunnel {
     const reply = new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        // Nothing came back: the connection to the relay is dead, though neither end was told.
+        if (this.tunnelSocket() === tunnel) this.dropTunnel(tunnel, 'Tunnel stopped answering');
         resolve(null);
       }, REQUEST_TIMEOUT_MS);
       this.pending.set(id, (frame) => {
@@ -102,7 +159,10 @@ export class RelayTunnel {
         resolve(frame);
       });
     });
-    tunnel.send(JSON.stringify({ t: 'req', id, method: request.method, path, headers: forwardHeaders(request.headers), body }));
+    if (!this.sendToTunnel(tunnel, { t: 'req', id, method: request.method, path, headers: forwardHeaders(request.headers), body })) {
+      this.pending.get(id)?.(null);
+      return json({ ok: false, error: 'That relay is not connected through this tunnel' }, 502);
+    }
     const frame = await reply;
     if (!frame) return json({ ok: false, error: 'The tunneled relay did not answer' }, 504);
     const status = Number(frame.status) || 502;
@@ -121,7 +181,7 @@ export class RelayTunnel {
         closeQuietly(socket, 1011, 'Relay tunnel closed');
         return;
       }
-      tunnel.send(JSON.stringify({ t: 'data', sid: meta.sid, data: text }));
+      if (!this.sendToTunnel(tunnel, { t: 'data', sid: meta.sid, data: text })) closeQuietly(socket, 1011, 'Relay tunnel closed');
       return;
     }
 
@@ -157,10 +217,17 @@ export class RelayTunnel {
         return;
       }
       // The newest tunnel for a node wins: a relay that reconnects replaces its old one.
+      // The old one is signed out first: it may stay listed until its close is acknowledged.
       for (const other of this.state.getWebSockets('tunnel')) {
-        if (other !== socket) closeQuietly(other, 1012, 'Replaced by a newer tunnel');
+        if (other === socket) continue;
+        const old = attachmentOf(other);
+        try {
+          if (old) other.serializeAttachment({ ...old, authed: false });
+        } catch {}
+        closeQuietly(other, 1012, 'Replaced by a newer tunnel');
+        this.closePeersOf(old?.gen);
       }
-      socket.serializeAttachment({ ...meta, nonce: null, authed: true, gen: crypto.randomUUID() });
+      socket.serializeAttachment({ ...meta, nonce: null, authed: true, gen: crypto.randomUUID(), since: Date.now() });
       socket.send(JSON.stringify({ t: 'ready', url: record.url }));
       return;
     }
@@ -195,12 +262,7 @@ export class RelayTunnel {
       }
       return;
     }
-    if (meta.authed) {
-      // Peers that came in through this tunnel have nothing on the other end now.
-      for (const peer of this.state.getWebSockets('peer')) {
-        if (attachmentOf(peer)?.gen === meta.gen) closeQuietly(peer, 1011, 'Relay tunnel closed');
-      }
-    }
+    this.closePeersOf(meta.gen);
   }
 
   async webSocketError(socket) {

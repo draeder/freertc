@@ -362,7 +362,7 @@ if (tunneling) {
       heartbeat();
       if (url) setTimeout(() => relayLinks?.maintain().catch(() => {}), 5_000).unref();
     },
-    log: (line) => console.log(`[node-relay:tunnel] ${line}`),
+    log: (line) => console.log(`${new Date().toLocaleTimeString([], { hour12: false })} [node-relay:tunnel] ${line}`),
   });
 }
 if (federating) setInterval(heartbeat, 2 * 60_000).unref();

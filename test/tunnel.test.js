@@ -147,3 +147,27 @@ test('a signed record may name only its own tunnel address', async () => {
   const plain = await createSignedNodeRecord(mine, { url: 'wss://peer.ooo/some/other/path' });
   assert.equal(plain.url, 'wss://peer.ooo/ws', 'any other path is still /ws');
 });
+
+test('a tunnel that stops answering is dropped, and the relay comes back on a new one', async (t) => {
+  const home = await startHome(t);
+  const id = await identity();
+  let calls = 0;
+  const logs = [];
+  const { tunnel } = relayBehindNat(t, home, id, {
+    // The first request is swallowed, as by a connection that died without either end being told.
+    handleRequest: async () => (++calls === 1 ? new Promise(() => {}) : new Response('back', { status: 200 })),
+    log: (line) => logs.push(line),
+  });
+  const url = await tunnel.ready;
+  const base = url.replace(/^ws/, 'http').replace(/\/ws$/, '');
+  const first = await fetch(`${base}/health`);
+  assert.equal(first.status, 504);
+  let text = null;
+  for (let i = 0; i < 40 && text !== 'back'; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const response = await fetch(`${base}/health`);
+    if (response.status === 200) text = await response.text();
+  }
+  assert.equal(text, 'back');
+  assert.ok(logs.some((line) => /closed \(1011 Tunnel stopped answering\) after \d+s; reconnecting/.test(line)), logs.join('\n'));
+});

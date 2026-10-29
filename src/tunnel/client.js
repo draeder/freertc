@@ -14,6 +14,15 @@ function connectUrl(homeUrl, nodeId) {
   return tunnelUrlFor(homeUrl, nodeId).replace(/\/ws$/, '/connect');
 }
 
+/** "41m", "3h12m", "18s": how long a tunnel stayed open. */
+function formatUptime(ms) {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, '0')}m`;
+}
+
 function httpOrigin(tunnelUrl) {
   return tunnelUrl.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:').replace(/\/t\/[0-9a-f]{64}\/ws$/, '');
 }
@@ -96,6 +105,7 @@ export function startTunnel({ homes, identity, name, handleRequest, handleStream
     current = socket;
     const streams = new Map();
     let isReady = false;
+    let openedAt = 0;
     let lastPong = Date.now();
     let pinger = null;
     const kill = () => (socket.terminate ? socket.terminate() : socket.close());
@@ -124,6 +134,7 @@ export function startTunnel({ homes, identity, name, handleRequest, handleStream
       }
       if (frame.t === 'ready') {
         isReady = true;
+        openedAt = Date.now();
         failures = 0;
         clearTimeout(connectTimer);
         lastPong = Date.now();
@@ -189,7 +200,8 @@ export function startTunnel({ homes, identity, name, handleRequest, handleStream
       if (current === socket) current = null;
       if (stopped) return;
       if (isReady) {
-        log(`tunnel to ${homeUrl} closed (${code} ${String(reason || '')}); reconnecting`);
+        const why = String(reason || '').trim();
+        log(`tunnel to ${homeUrl} closed (${code}${why ? ` ${why}` : ''}) after ${formatUptime(Date.now() - openedAt)}; reconnecting`);
         failures = 1;
       } else {
         failures += 1;
