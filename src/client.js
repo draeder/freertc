@@ -437,8 +437,10 @@ export function createSignalingClient(options = {}) {
     // relay socket exactly as before.
     signalTransport = null,
     // Relay on demand (opt-in). { mode: 'on-demand', minMeshPeers, anchors, settleMs, lingerMs,
-    // evalMs, gossipTtlMs }. Takes effect only when the host also supplies signalTransport,
+    // evalMs, gossipTtlMs, hold }. Takes effect only when the host also supplies signalTransport,
     // because a released relay is only safe when the host can carry signaling over the mesh.
+    // hold: () => boolean, asked at each evaluation; true keeps (or wakes) the relay socket. A host
+    // whose overlay is still missing a link it needs uses it to stay reachable until that forms.
     relay: relayOptions = {},
     // Called with { state: 'up' | 'idle' | 'waking', ts } as the relay socket is released and woken.
     onRelayStateChange,
@@ -505,6 +507,7 @@ export function createSignalingClient(options = {}) {
   // Off unless the caller asks for it and can carry signaling over the mesh. Everything below
   // is inert in 'always' mode, which is how the client has always behaved.
   const relayMode = relayOptions?.mode === 'on-demand' && typeof signalTransport === 'function' ? 'on-demand' : 'always'
+  const relayHold = typeof relayOptions?.hold === 'function' ? relayOptions.hold : null
   const relayConfig = { ...RELAY_DEFAULTS }
   for (const [name, value] of Object.entries(relayOptions ?? {})) {
     if (name in RELAY_DEFAULTS && Number.isFinite(value) && value >= 0) relayConfig[name] = value
@@ -964,7 +967,9 @@ export function createSignalingClient(options = {}) {
     const isolated = neighbours.length < relayConfig.minMeshPeers
     const isAnchor = anchors.includes(peerId)
     const awake = relayWakeUntil > now
-    return { neighbours, direct, anchors, isolated, isAnchor, awake, wantRelay: isolated || isAnchor || awake }
+    let held = false
+    try { held = relayHold?.() === true } catch { held = false }
+    return { neighbours, direct, anchors, isolated, isAnchor, awake, held, wantRelay: isolated || isAnchor || awake || held }
   }
 
   // Tell each live neighbour which ids this peer can vouch for. Sent when the answer changes and
@@ -1035,7 +1040,7 @@ export function createSignalingClient(options = {}) {
       broadcastAnchors(decision.neighbours, decision.direct)
       if (decision.wantRelay) {
         relayReleasableSince = 0
-        if (relayIdle) wakeRelay(decision.isolated ? 'cut off from the mesh' : 'anchor')
+        if (relayIdle) wakeRelay(decision.isolated ? 'cut off from the mesh' : decision.held ? 'held by the host' : 'anchor')
       } else if (!relayIdle && registered && !negotiationInFlight()) {
         const now = Date.now()
         if (!relayReleasableSince) relayReleasableSince = now

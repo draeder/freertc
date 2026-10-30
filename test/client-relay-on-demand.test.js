@@ -363,3 +363,18 @@ for (const type of ['~bye', 'freertc-bye']) {
     } finally { h.restore() }
   })
 }
+
+test('a host that still needs the relay holds it, and lets it go when it no longer does', async () => {
+  const pool = await poolByCloseness()
+  let hold = true
+  const h = harness(pool[10], { relay: { mode: 'on-demand', settleMs: 0, evalMs: 3_600_000, minMeshPeers: 2, anchors: 3, hold: () => hold } })
+  try {
+    for (const id of pool.slice(0, 3)) await h.addLiveNeighbour(id)
+    const held = await h.client.evaluateRelay()
+    assert.equal(held.held, true)
+    assert.equal(h.client.relayIdle, false, 'held: the relay stays')
+    hold = false
+    await h.client.evaluateRelay()
+    assert.equal(h.client.relayIdle, true, 'released once the host lets go')
+  } finally { h.restore() }
+})
