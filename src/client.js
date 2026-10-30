@@ -1,3 +1,8 @@
+import { isDirectRelayUrl } from './direct/common.js'
+import { directRelayChannel } from './direct/dial.js'
+export { directRelayChannel }
+export { isDirectRelayUrl, parseDirectRelayUrl } from './direct/common.js'
+export { lookupDirectRelays, DEFAULT_DIRECTORY_NAME } from './direct/lookup.js'
 // Backoff config for reconnect
 const BACKOFF_BASE_MS = 1000
 const BACKOFF_MAX_MS = 30000
@@ -201,7 +206,9 @@ export function withdrawSignalingIdentity(options = {}) {
     if (!wsUrl.searchParams.get('networkId')) wsUrl.searchParams.set('networkId', networkId)
     if (!wsUrl.searchParams.get('room')) wsUrl.searchParams.set('room', roomId)
 
-    socket = new WebSocket(wsUrl.toString())
+    socket = isDirectRelayUrl(String(signalUrl).split('?')[0])
+      ? openRelaySocket(wsUrl.toString(), { punch: false })
+      : new WebSocket(wsUrl.toString())
     socket.onopen = () => {
       try {
         const bytes = new Uint8Array(8)
@@ -330,6 +337,86 @@ export async function punchRelayChannel(offerUrl, { PeerConnection, iceServers, 
  * (readyState, send, close, onopen/onmessage/onclose/onerror): a punched data
  * channel when the relay is behind NAT and WebRTC is here, else a WebSocket.
  */
+// Direct relays (src/direct): a relay with a public address that browsers reach
+// with a WebRTC data channel and no signaling. URL:
+//   webrtc-direct://<ip>:<port>/sha256/<fingerprint>[?tunnel=<its tunnel URL>]
+// A failed direct attempt falls back to the tunnel when the URL names one, and
+// that relay is not tried directly again for a while.
+const directFailures = new Map()
+
+function openDirectRelaySocket(relayUrl, { WebSocketImpl, PeerConnection, log }) {
+  const [directUrl, query = ''] = String(relayUrl).split('?')
+  const tunnelUrl = new URLSearchParams(query).get('tunnel')
+  const failedAt = directFailures.get(directUrl)
+  if (tunnelUrl && (typeof PeerConnection !== 'function' || (failedAt && Date.now() - failedAt < PUNCH_RETRY_AFTER_MS))) {
+    return new WebSocketImpl(tunnelUrl)
+  }
+
+  const socket = {
+    readyState: SOCKET_CONNECTING,
+    transport: 'direct',
+    onopen: null,
+    onmessage: null,
+    onclose: null,
+    onerror: null,
+    send(data) {
+      if (inner) return inner.send(data)
+      if (socket.readyState !== SOCKET_OPEN || !channel) throw new Error('relay socket is not open')
+      channel.send(typeof data === 'string' ? data : String(data))
+    },
+    close(code = 1000, reason = '') {
+      if (inner) return inner.close(code, reason)
+      if (socket.readyState === SOCKET_CLOSED) return
+      closedByUser = true
+      finish(code, reason)
+    },
+  }
+  let channel = null
+  let pc = null
+  let inner = null
+  let closedByUser = false
+  const finish = (code = 1006, reason = '') => {
+    if (socket.readyState === SOCKET_CLOSED) return
+    socket.readyState = SOCKET_CLOSED
+    try { channel?.close() } catch {}
+    try { pc?.close() } catch {}
+    socket.onclose?.({ code, reason, wasClean: code === 1000 })
+  }
+  const fallBack = (why) => {
+    if (closedByUser) return
+    directFailures.set(directUrl, Date.now())
+    if (!tunnelUrl) {
+      log(`[relay] no direct channel to ${directUrl} (${why})`)
+      finish(1006, `direct: ${why}`)
+      return
+    }
+    log(`[relay] no direct channel to ${directUrl} (${why}); using its tunnel`)
+    socket.transport = 'tunnel'
+    inner = new WebSocketImpl(tunnelUrl)
+    inner.onopen = (event) => { socket.readyState = inner.readyState; socket.onopen?.(event) }
+    inner.onmessage = (event) => socket.onmessage?.(event)
+    inner.onerror = (event) => socket.onerror?.(event)
+    inner.onclose = (event) => { socket.readyState = SOCKET_CLOSED; socket.onclose?.(event) }
+  }
+
+  directRelayChannel(directUrl, { PeerConnection })
+    .then((opened) => {
+      if (closedByUser) { try { opened.channel.close() } catch {} try { opened.pc.close() } catch {} return }
+      ;({ pc, channel } = opened)
+      directFailures.delete(directUrl)
+      log(`[relay] direct channel to ${directUrl}`)
+      channel.onmessage = (event) => socket.onmessage?.({ data: typeof event.data === 'string' ? event.data : String(event.data) })
+      channel.onclose = () => finish(1006, 'direct channel closed')
+      channel.onerror = (event) => socket.onerror?.(event)
+      pc.onconnectionstatechange = () => { if (['failed', 'closed'].includes(pc.connectionState)) finish(1006, `connection ${pc.connectionState}`) }
+      socket.readyState = SOCKET_OPEN
+      socket.onopen?.({})
+    })
+    .catch((error) => fallBack(error?.message ?? String(error)))
+
+  return socket
+}
+
 export function openRelaySocket(relayUrl, {
   punch = true,
   WebSocketImpl = globalThis.WebSocket,
@@ -338,6 +425,9 @@ export function openRelaySocket(relayUrl, {
   fetchImpl = globalThis.fetch,
   log = () => {},
 } = {}) {
+  if (isDirectRelayUrl(String(relayUrl).split('?')[0])) {
+    return openDirectRelaySocket(relayUrl, { WebSocketImpl, PeerConnection, log })
+  }
   const offerUrl = punch && typeof PeerConnection === 'function' && typeof fetchImpl === 'function'
     ? punchOfferUrlForRelay(relayUrl)
     : null

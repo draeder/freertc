@@ -14,6 +14,7 @@ import {
 } from "./relay-overlay.js";
 import { relayPeerIdFor } from "./relay-id.js";
 import { tunnelRoute } from "./tunnel/frames.js";
+import { DIRECTORY_PATH, directoryEnabled, handleDirectoryRequest } from "./direct/directory.js";
 export { RelayTunnel } from "./tunnel/home.js";
 
 const PSP_VERSION = "1.0";
@@ -524,6 +525,13 @@ async function handleFetch(request, env, ctx) {
     if (tunnel) {
       if (!env.RELAY_TUNNEL) return jsonResponse({ ok: false, error: "This relay is not a tunnel home" }, 404);
       return env.RELAY_TUNNEL.get(env.RELAY_TUNNEL.idFromName(tunnel.nodeId)).fetch(request);
+    }
+
+    // The DNS relay directory (src/direct/directory.js): relays list and
+    // withdraw themselves here; only this Worker holds the DNS token.
+    if (url.pathname === DIRECTORY_PATH) {
+      if (!directoryEnabled(env)) return jsonResponse({ ok: false, error: "No relay directory here" }, 404);
+      return handleDirectoryRequest(request, env);
     }
 
     if (request.method === "OPTIONS" && url.pathname.startsWith("/api/")) {

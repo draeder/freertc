@@ -50,6 +50,7 @@
     "wrangler.workers-dev.jsonc",
     "scripts/node-relay.mjs",
     "src/node/",
+    "src/direct/",
     "src/punch/",
     "src/tunnel/"
   ],
@@ -80,6 +81,7 @@
     "ws": "^8.18.0"
   },
   "optionalDependencies": {
+    "node-datachannel": "^0.33.4",
     "werift": "^0.24.4"
   },
   "devDependencies": {

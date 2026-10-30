@@ -28,6 +28,12 @@
 //                              tunnel to a public relay: wss://<home>/t/<node id>/ws
 //   FREERTC_TUNNEL_HOMES       comma-separated relays to tunnel through, tried in order
 //                              (default: the bootstrap relays)
+//   FREERTC_DIRECT             on (default) | off — accept direct WebRTC connections from browsers
+//                              on a UDP port the router forwards (UPnP / NAT-PMP), listed in the
+//                              DNS relay directory (needs node-datachannel 0.33+)
+//   FREERTC_DIRECT_PORT        UDP port for direct connections (default 9443)
+//   FREERTC_DIRECT_PUBLIC_IP   this machine's public address, when no router needs asking
+//   FREERTC_DIRECTORY_URL      the cloud relay that keeps the directory (default: the tunnel home)
 //   FREERTC_PUNCH              on (default) | off — accept punched connections: a client posts
 //                              its offer to POST /api/v1/punch/offer (through the tunnel when
 //                              behind NAT) and talks to this relay over a direct data channel;
@@ -55,7 +61,7 @@ import { DataChannelSocket } from '../src/punch/transport.js';
 import { LINK_CHANNEL_LABEL, LINK_PATH, createRelayLinks } from '../src/node/relay-links.js';
 import { hasLanAddress, startLanBeacon, DEFAULT_LAN_PORT } from '../src/node/lan-beacon.js';
 import { nodeDurableNamespace } from '../src/node/durable-object.js';
-import { createRelayIdentity, createSignedNodeRecord, decodeRelayIdentitySecret, isPrivateRelayUrl } from '../src/relay-identity.js';
+import { createRelayIdentity, createSignedNodeRecord, decodeRelayIdentitySecret, isPrivateRelayUrl, tunnelNodeIdOf } from '../src/relay-identity.js';
 import { heartbeatKademlia, isPublicRelay, listKnownRelays, relayReachOf } from '../src/relay-overlay.js';
 import { RelayTunnel } from '../src/tunnel/home.js';
 
@@ -363,6 +369,7 @@ if (tunneling) {
     handleStream: (socket, { path: streamPath, headers }) => acceptSocket(socket, new URL(streamPath, 'http://x').pathname, headers),
     onUrl: (url) => {
       env.RELAY_URL = url ?? RELAY_URL;
+      if (url) setTimeout(() => directRelay?.republish().catch(() => {}), 2_000).unref();
       console.log(url ? `[node-relay] joining federation as ${url}` : `[node-relay] tunnel lost; out of federation until it is back`);
       heartbeat();
       if (url) setTimeout(() => relayLinks?.maintain().catch(() => {}), 5_000).unref();
@@ -371,6 +378,42 @@ if (tunneling) {
   });
 }
 if (federating) setInterval(heartbeat, 2 * 60_000).unref();
+
+// Direct connections (src/direct): browsers reach this relay with a WebRTC data
+// channel on a UDP port the router forwards, found through the DNS relay
+// directory, with no cloud relay in the way. Needs node-datachannel 0.33+.
+let directRelay = null;
+if (!isOff(process.env.FREERTC_DIRECT)) {
+  // Set up in the background: asking the router takes a few seconds and the
+  // relay serves its own address meanwhile.
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.once(signal, async () => {
+      await directRelay?.stop().catch(() => {});
+      process.exit(0);
+    });
+  }
+  (async () => {
+  const { startDirectRelay } = await import('../src/direct/node-relay-direct.js');
+  // The identity signs the directory entry. A relay that does not federate is
+  // not listed, so any identity will do there.
+  const { publicKey, privateKey } = env.RELAY_IDENTITY_SECRET
+    ? decodeRelayIdentitySecret(env.RELAY_IDENTITY_SECRET)
+    : await (async () => { const { generateRandomPair } = await import('unsea'); const pair = await generateRandomPair(); return { publicKey: pair.pub, privateKey: pair.priv }; })();
+  const home = process.env.FREERTC_DIRECTORY_URL || (tunnelHomes[0] || bootstrap[0] || '').replace(/^ws/, 'http').replace(/\/ws$/, '');
+  directRelay = await startDirectRelay({
+    identity: await createRelayIdentity(publicKey, privateKey),
+    dataDir: DATA_DIR,
+    port: Number(process.env.FREERTC_DIRECT_PORT || 9443),
+    // Listed in the directory only when this relay federates publicly.
+    directoryUrl: federating && PUBLIC ? (home || null) : null,
+    publicIp: process.env.FREERTC_DIRECT_PUBLIC_IP || null,
+    tunnelUrl: () => (tunnelNodeIdOf(env.RELAY_URL) ? env.RELAY_URL : null),
+    name: env.RELAY_NAME,
+    acceptSocket: (socket) => acceptSocket(socket),
+    log: (line) => console.log(`${new Date().toLocaleTimeString([], { hour12: false })} [node-relay:direct] ${line}`),
+  });
+  })().catch((error) => console.log(`[node-relay:direct] direct connections: off (${error?.message || error})`));
+}
 
 if (process.env.PUNCH_RENDEZVOUS_URL) {
   const { listenForPunches } = await import('../src/punch/transport.js');
