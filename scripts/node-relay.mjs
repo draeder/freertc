@@ -11,9 +11,10 @@
 //                              public relays and never federates a loopback or
 //                              private address, its own or another's; false is a
 //                              private/LAN mesh where local addresses are allowed
-//   PORT, HOST                 where to listen (default 127.0.0.1:8788)
+//   PORT, HOST                 where to listen (default 0.0.0.0:8788: this machine and its LAN;
+//                              HOST=127.0.0.1 keeps it to this machine)
 //   RELAY_URL                  this relay's ws(s):// URL as others reach it
-//                              (default wss://PROD_DOMAIN/ws, else ws://HOST:PORT/ws)
+//                              (default wss://PROD_DOMAIN/ws, else ws://HOST:PORT/ws, with 127.0.0.1 for 0.0.0.0)
 //   RELAY_NAME                 display name
 //   KADEMLIA_BOOTSTRAP_URLS    comma-separated relays to join through (public
 //                              default: the public relays; private default: none)
@@ -81,7 +82,11 @@ installWebSocketPair();
 const { default: worker } = await import('../src/index.js');
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const HOST = process.env.HOST || '127.0.0.1';
+const HOST = process.env.HOST || '0.0.0.0';
+// Listening on every interface lets other machines on the LAN use this relay.
+// It still names itself by loopback, so its relay URL and name stay what they
+// were, and a private address is never announced to public relays.
+const SELF_HOST = ['0.0.0.0', '::'].includes(HOST) ? '127.0.0.1' : HOST;
 const PORT = Number(process.env.PORT || 8788);
 const DATA_DIR = path.resolve(process.env.FREERTC_DATA_DIR || path.join(process.cwd(), '.freertc-relay'));
 const PUBLIC_DIR = path.join(ROOT, 'public');
@@ -119,7 +124,7 @@ const FEDERATION = !isOff(process.env.FREERTC_FEDERATION);
 const TUNNEL = !isOff(process.env.FREERTC_TUNNEL);
 const PUBLIC = isPublicRelay(process.env);
 const RELAY_URL = process.env.RELAY_URL
-  || (process.env.PROD_DOMAIN ? `${TLS ? 'wss' : 'ws'}://${process.env.PROD_DOMAIN}/ws` : `${TLS ? 'wss' : 'ws'}://${HOST}:${PORT}/ws`);
+  || (process.env.PROD_DOMAIN ? `${TLS ? 'wss' : 'ws'}://${process.env.PROD_DOMAIN}/ws` : `${TLS ? 'wss' : 'ws'}://${SELF_HOST}:${PORT}/ws`);
 const configuredBootstrap = String(process.env.KADEMLIA_BOOTSTRAP_URLS ?? '').split(',').map((url) => url.trim()).filter(Boolean);
 // A public relay never federates a loopback or private address, so it never
 // joins through one either.
@@ -158,7 +163,7 @@ const env = {
   ...(PUNCH ? { PUNCH_OFFER: 'on' } : {}),
   DB: meter.wrapD1(await openSqliteD1({ filename: path.resolve(process.env.DB_PATH || path.join(DATA_DIR, 'relay.sqlite')), migrationsDir: path.join(ROOT, 'migrations') })),
   RELAY_URL,
-  RELAY_NAME: process.env.RELAY_NAME || `freertc-node-${HOST}-${PORT}`,
+  RELAY_NAME: process.env.RELAY_NAME || `freertc-node-${SELF_HOST}-${PORT}`,
   FREERTC_PUBLIC: PUBLIC ? 'true' : 'false',
   KADEMLIA_BOOTSTRAP_URLS: federating ? bootstrap.join(',') : '',
   // Without an identity the worker code runs no overlay at all: that is what off means.

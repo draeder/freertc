@@ -299,7 +299,9 @@ Shortcut alias (same behavior):
 npm run dev:local
 ```
 
-You can also choose host/port:
+It listens on `0.0.0.0:8788` by default, so other machines on your network can
+use it at `ws://<this machine's LAN address>:8788/ws`. To keep it to this machine,
+or to pick another port:
 
 ```bash
 HOST=127.0.0.1 PORT=8788 npm run dev:node
