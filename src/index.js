@@ -43,7 +43,10 @@ const MAX_TTL_MS = 120_000;
 const MAX_MESSAGE_SIZE = 64 * 1024;
 const MAX_BATCH = 50;
 const RELAY_EXPIRY_MS = 5 * 60_000;       // relay entry expires after 5 min without heartbeat
-const FEDERATION_INTERVAL_MS = 2 * 60_000; // re-heartbeat every 2 min per isolate
+const FEDERATION_INTERVAL_MS = 2 * 60_000; // re-heartbeat every 2 min per relay (claimFederationHeartbeat)
+// An isolate checks once per interval; this much early still claims, so a
+// relay whose isolates all check a moment early still heartbeats each interval.
+const FEDERATION_CLAIM_SLACK_MS = 5_000;
 // Relays asked to deliver a message when none is known to hold its peer. They are the relays
 // that serve the room, and each one that does not hold the peer says so, so asking all of
 // them (up to the most a lookup returns) costs requests, not queued copies.
@@ -452,6 +455,23 @@ export default {
   }
 };
 
+// The relay's own clock for jobs that must run once per relay, not once per
+// isolate. Created on first use, so no migration is needed.
+let relayClockReady = false;
+
+/** True when this isolate claimed the federation heartbeat for this interval. */
+export async function claimFederationHeartbeat(db, now) {
+  if (!relayClockReady) {
+    await db.prepare("CREATE TABLE IF NOT EXISTS psp_relay_clock (key TEXT PRIMARY KEY, at_ms INTEGER NOT NULL)").run();
+    await db.prepare("INSERT OR IGNORE INTO psp_relay_clock (key, at_ms) VALUES ('federation', 0)").run();
+    relayClockReady = true;
+  }
+  const result = await db.prepare(
+    "UPDATE psp_relay_clock SET at_ms = ?1 WHERE key = 'federation' AND at_ms <= ?2",
+  ).bind(now, now - FEDERATION_INTERVAL_MS + FEDERATION_CLAIM_SLACK_MS).run();
+  return Number(result?.meta?.changes ?? 0) > 0;
+}
+
 async function handleFetch(request, env, ctx) {
   {
     const url = new URL(request.url);
@@ -466,6 +486,15 @@ async function handleFetch(request, env, ctx) {
       if (now - lastFederationMs > FEDERATION_INTERVAL_MS) {
         lastFederationMs = now;
         ctx.waitUntil((async () => {
+          // Every isolate keeps its own lastFederationMs, so each one the
+          // platform started heartbeat on its first request: a ping to up to
+          // 16 relays, which woke isolates there that pinged back. Each relay
+          // took ~1,300 pings an hour where a few dozen do. One heartbeat per
+          // relay per interval: the isolate that claims it in the relay's own
+          // database runs it.
+          // A database that cannot answer must not take the relay out of
+          // federation: then this isolate heartbeats, as every isolate used to.
+          if (!await claimFederationHeartbeat(env.DB, now).catch(() => true)) return;
           const relayName = env.RELAY_NAME || relayHostname(selfRelayUrl);
           if (isKademliaEnabled(env)) {
             // A failed join is retried on the next heartbeat. Left uncaught, the rejection
@@ -877,6 +906,27 @@ async function queryRelayForPeers(relayUrl, network, room, requesterPeerId, rela
   }
 }
 
+const FEDERATED_PEER_SHARE_MS = 5_000;
+const MAX_SHARED_FEDERATED_QUERIES = 2_000;
+const sharedFederatedQueries = new Map();
+
+export async function sharedFederatedPeerQuery(selfRelayUrl, network, room, remoteUrls, nodeIdByUrl) {
+  const key = JSON.stringify([selfRelayUrl, network, room, [...remoteUrls].sort()]);
+  const now = Date.now();
+  const shared = sharedFederatedQueries.get(key);
+  if (shared && now - shared.startedAt < FEDERATED_PEER_SHARE_MS) return shared.promise;
+  const promise = Promise.all(
+    remoteUrls.map((relayUrl) => queryRelayForPeers(relayUrl, network, room, null, nodeIdByUrl.get(relayUrl) ?? null)),
+  ).then((lists) => lists.flat());
+  sharedFederatedQueries.set(key, { promise, startedAt: now });
+  if (sharedFederatedQueries.size > MAX_SHARED_FEDERATED_QUERIES) {
+    const oldest = sharedFederatedQueries.keys().next().value;
+    if (oldest !== undefined) sharedFederatedQueries.delete(oldest);
+  }
+  promise.catch(() => { if (sharedFederatedQueries.get(key)?.promise === promise) sharedFederatedQueries.delete(key); });
+  return promise;
+}
+
 async function findFederatedPeers(
   env,
   selfRelayUrl,
@@ -916,10 +966,12 @@ async function findFederatedPeers(
     remoteUrls = allRelays.map((relay) => relay.url).filter((relayUrl) => relayUrl !== selfRelayUrl);
   }
 
+  // Every discover asked every relay serving the room for its list: a GET to
+  // each, a relay behind NAT through its tunnel. A room's discovers within
+  // FEDERATED_PEER_SHARE_MS now share one round (the lists are fetched
+  // without the requester excluded, and filtered for each caller below).
   const remotePeers = remoteUrls.length
-    ? (await Promise.all(
-      remoteUrls.map((relayUrl) => queryRelayForPeers(relayUrl, network, room, requesterPeerId, nodeIdByUrl.get(relayUrl) ?? null)),
-    )).flat()
+    ? await sharedFederatedPeerQuery(selfRelayUrl, network, room, remoteUrls, nodeIdByUrl)
     : [];
 
   const peers = mergeDiscoveredPeers(localPeers, remotePeers)
