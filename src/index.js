@@ -54,39 +54,6 @@ const PEER_RELAY_HINT_TTL_MS = 60_000;
 const livePeers = new Map(); // key: JSON [network, room, peerId]
 const networkSubscribers = new Map(); // key: JSON [network, room] -> Set of sockets
 const peerRelayHints = new Map(); // key: JSON [network, room, peerId] -> { url, expiresAt }
-// Peers that disconnected from this relay recently, by when they left. A peer
-// that left is not waiting for queued signaling: if nothing else in the
-// federation holds it, a message for it is dropped and the sender told it has
-// gone, rather than queued for nobody.
-const recentlyLeftPeers = new Map(); // key: JSON [network, room, peerId] -> leftAt
-const RECENTLY_LEFT_MS = 60_000;
-// ICE belongs to one live negotiation. It is never queued, and it crosses the
-// federation only along a route the offer already found (a relay hint), never
-// through a fresh Kademlia lookup.
-const ICE_TYPES = new Set(["ice_candidate", "ice_end"]);
-// Signaling that opens a negotiation: the sender is told when its target is gone.
-const OPENING_TYPES = new Set(["offer", "connect_request", "renegotiate"]);
-
-export function notePeerLeft(network, room, peerId, now = Date.now()) {
-  if (!network || !room || !peerId) return;
-  recentlyLeftPeers.set(peerScopeKey(network, room, peerId), now);
-  if (recentlyLeftPeers.size > 10_000) {
-    for (const [key, leftAt] of recentlyLeftPeers) {
-      if (now - leftAt > RECENTLY_LEFT_MS) recentlyLeftPeers.delete(key);
-    }
-  }
-}
-
-export function peerLeftRecently(network, room, peerId, now = Date.now()) {
-  const key = peerScopeKey(network, room, peerId);
-  const leftAt = recentlyLeftPeers.get(key);
-  if (leftAt == null) return false;
-  if (now - leftAt > RECENTLY_LEFT_MS || livePeers.has(key)) {
-    recentlyLeftPeers.delete(key);
-    return false;
-  }
-  return true;
-}
 // Diagnostic trail of federation work done on behalf of live sockets. Read
 // through GET /debug/state on the coordinator. Bounded; newest last.
 const debugTrail = [];
@@ -279,21 +246,6 @@ async function runDeferredTask(env, task) {
   await primeRelayNodeId(env, selfRelayUrl);
   const relayPeerId = resolveRelayPeerId(selfRelayUrl);
   const liveSocket = () => livePeers.get(peerScopeKey(network, room, peerId))?.socket ?? null;
-  // The target left this relay and no other relay holds it: drop the message,
-  // and end the sender's attempt with a bye so it stops dialing.
-  const tellSenderPeerGone = (type, message, senderId) => {
-    console.log(`[RELAY] Dropped ${type} for ${message.to}: it left this relay and no relay holds it`);
-    if (!OPENING_TYPES.has(type)) return;
-    try {
-      liveSocket()?.send(JSON.stringify({
-        psp_version: PSP_VERSION, type: "bye",
-        network, session_id: room,
-        from: message.to, to: senderId,
-        message_id: crypto.randomUUID(), timestamp: Date.now(),
-        ttl_ms: DEFAULT_TTL_MS, body: { reason: "peer_left" },
-      }));
-    } catch {}
-  };
 
   if (kind === "announce") {
     let federatedPeers = null;
@@ -389,24 +341,16 @@ async function runDeferredTask(env, task) {
         return;
       } catch {}
     }
-    const startedAt = Date.now();
-    const hint = getPeerRelayHint(network, room, message.to);
-    if (ICE_TYPES.has(type)) {
-      // Only along the route the offer found; otherwise it is dropped.
-      const delivered = Boolean(hint && selfRelayUrl && hint !== selfRelayUrl
-        && await forwardToRelayResult(hint, message, selfRelayUrl) === "delivered");
-      debugNote({ op: "forward", type, from: peerId.slice(0, 8), to: message.to.slice(0, 8), hint, delivered, ms: Date.now() - startedAt });
-      return;
-    }
     if (!db) {
       console.warn(`[RELAY] Could not deliver ${type} to ${message.to}; persistence unavailable`);
       return;
     }
     if (!selfRelayUrl) {
-      if (peerLeftRecently(network, room, message.to)) return tellSenderPeerGone(type, message, peerId);
       await insertRelayMessage(db, message);
       return;
     }
+    const startedAt = Date.now();
+    const hint = getPeerRelayHint(network, room, message.to);
     try {
       // Bounded: a forward that cannot finish inside the deadline is queued
       // like an unreachable peer instead of silently vanishing.
@@ -423,7 +367,6 @@ async function runDeferredTask(env, task) {
       debugNote({ op: "forward", type, from: peerId.slice(0, 8), to: message.to.slice(0, 8), hint, error: String(error?.stack || error?.message || error).slice(0, 400), ms: Date.now() - startedAt });
       console.error(`[FED] forwarding ${type} to ${message.to} failed: ${error?.message}`);
     }
-    if (peerLeftRecently(network, room, message.to)) return tellSenderPeerGone(type, message, peerId);
     await insertRelayMessage(db, message);
     console.log(`[RELAY] Peer ${message.to} unavailable across federation, queued ${type} in DB`);
     return;
@@ -812,11 +755,6 @@ export async function handleRelayForward(request, env) {
   // "queued" to the sender. A peer announced here but momentarily without a socket is still
   // held for, as before.
   if (!live && !(await peerIsKnownHere(env.DB, message.network, room, message.to))) {
-    return jsonResponse({ ok: true, delivered: false, queued: false }, 200);
-  }
-  // ICE is only good to a live negotiation, and a peer that just left is not
-  // coming back for its mail: neither is kept.
-  if (ICE_TYPES.has(message.type) || peerLeftRecently(message.network, room, message.to)) {
     return jsonResponse({ ok: true, delivered: false, queued: false }, 200);
   }
   await insertRelayMessage(env.DB, message);
@@ -1381,7 +1319,6 @@ function handleWebSocket(request, env, ctx, selfRelayUrl) {
     const subscriberScope = scopeKey(currentNetwork, currentRoom);
 
     const releasedLivePeer = deleteLivePeerIfOwned(livePeers, key, server);
-    if (releasedLivePeer) notePeerLeft(currentNetwork, currentRoom, currentPeerId);
     peerKey = null;
     peerId = null;
     network = null;
@@ -1591,7 +1528,6 @@ async function handleClientMessage(
 
     } else if (type === "bye") {
       const releasedLivePeer = deleteLivePeerIfOwned(livePeers, peerKey, socket);
-      if (releasedLivePeer) notePeerLeft(network, room, peerId);
       if (db && releasedLivePeer) {
         await deferWork(ctx, env, { kind: "peer-left", network, room, peerId, selfRelayUrl });
       }

@@ -8,8 +8,6 @@ import {
   forwardToRelay,
   getPeerRelayHint,
   handleRelayForward,
-  notePeerLeft,
-  peerLeftRecently,
   rememberPeerRelayHint,
 } from '../src/index.js';
 
@@ -237,26 +235,4 @@ test('a sender treats "not here" as a failed route, not a queued one', async () 
   } finally {
     globalThis.fetch = originalFetch;
   }
-});
-
-test('a relay never keeps ICE for a peer without a live socket', async () => {
-  const db = relayDb({ announced: true });
-  const response = await receiveForward(db, { ...forwardedOffer('peer-here'), type: 'ice_candidate', body: { candidate: 'a' } });
-  assert.deepEqual(await response.json(), { ok: true, delivered: false, queued: false });
-  assert.equal(db.queued.length, 0);
-});
-
-test('a peer that just left this relay gets no mail kept for it', async () => {
-  const db = relayDb({ announced: true });
-  notePeerLeft('network-host', 'room-host', 'peer-left');
-  assert.equal(peerLeftRecently('network-host', 'room-host', 'peer-left'), true);
-  const response = await receiveForward(db, forwardedOffer('peer-left'));
-  assert.deepEqual(await response.json(), { ok: true, delivered: false, queued: false });
-  assert.equal(db.queued.length, 0);
-});
-
-test('a left peer is forgotten after a minute', () => {
-  const leftAt = Date.now() - 61_000;
-  notePeerLeft('network-host', 'room-host', 'peer-old', leftAt);
-  assert.equal(peerLeftRecently('network-host', 'room-host', 'peer-old'), false);
 });
