@@ -342,6 +342,21 @@ export async function punchRelayChannel(offerUrl, { PeerConnection, iceServers, 
 //   webrtc-direct://<ip>:<port>/sha256/<fingerprint>[?tunnel=<its tunnel URL>]
 // A failed direct attempt falls back to the tunnel when the URL names one, and
 // that relay is not tried directly again for a while.
+/** A relay on this machine, this network, or a home relay at its bare public address or direct URL. */
+export function isLocalRelayUrl(url) {
+  const text = String(url || '')
+  if (isDirectRelayUrl(text.split('?')[0])) return true
+  try {
+    const host = new URL(text).hostname.replace(/^\[|\]$/g, '').toLowerCase()
+    return host === 'localhost' || host.endsWith('.local') || host === '::1'
+      || /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':')
+  } catch {
+    return false
+  }
+}
+
+// How long a relay connection may take to open before a recovery may cancel it.
+const SOCKET_OPEN_DEADLINE_MS = 45_000
 const directFailures = new Map()
 // How long a direct relay connection may stay 'disconnected' before it counts as gone.
 const DIRECT_DISCONNECTED_GRACE_MS = 5_000
@@ -556,6 +571,7 @@ export function createSignalingClient(options = {}) {
   // The relay this client signals through. switchRelay() moves it to another
   // relay while every open peer channel stays up.
   let signalUrl = initialSignalUrl
+  let socketOpenStartedAt = 0
   if (!initialPeerId || !networkId || !roomId || !signalUrl) {
     throw new Error('peerId, networkId, roomId, and signalUrl are required')
   }
@@ -1077,7 +1093,11 @@ export function createSignalingClient(options = {}) {
     const awake = relayWakeUntil > now
     let held = false
     try { held = relayHold?.() === true } catch { held = false }
-    return { neighbours, direct, anchors, isolated, isAnchor, awake, held, wantRelay: isolated || isAnchor || awake || held }
+    // A local relay (reached directly, or at a bare or private address) costs
+    // nothing per connection: stay on it. Letting go only made the room's
+    // relay list come and go, and gave newcomers fewer peers to find.
+    const local = isLocalRelayUrl(signalUrl)
+    return { neighbours, direct, anchors, isolated, isAnchor, awake, held, local, wantRelay: local || isolated || isAnchor || awake || held }
   }
 
   // Tell each live neighbour which ids this peer can vouch for. Sent when the answer changes and
@@ -2498,6 +2518,7 @@ export function createSignalingClient(options = {}) {
     }
 
     setStatus('connecting')
+    socketOpenStartedAt = Date.now()
     ws = openRelaySocket(wsUrl.toString(), { punch: relayPunch, iceServers: preferredIceServers, log })
 
     ws.onopen = () => {
@@ -2655,8 +2676,16 @@ export function createSignalingClient(options = {}) {
     try { onResume?.({ reason, gapMs }) } catch { /* consumer error must not break resume */ }
   }
 
-  function reconnectSignalingPreservingPeers(reason = 'signaling_refresh') {
+  function reconnectSignalingPreservingPeers(reason = 'signaling_refresh', { force = false } = {}) {
     if (stoppedByUser) return false
+    // A socket still opening is left to finish. On a busy relay, or a busy
+    // machine (a hundred peers on one laptop), opening can take longer than a
+    // recovery probe waits; cancelling it and starting over put each attempt
+    // at the back of the queue again, and the peer never got a relay.
+    if (!force && ws && ws.readyState === 0 && Date.now() - socketOpenStartedAt < SOCKET_OPEN_DEADLINE_MS) {
+      log(`[signal] ${reason}: relay connection still opening; waiting for it`)
+      return false
+    }
 
     log(`[signal] ${reason} — reconnecting signaling while preserving open peer channels`)
     resetReconnectBackoff()
@@ -2769,12 +2798,16 @@ export function createSignalingClient(options = {}) {
     get signalUrl() {
       return signalUrl
     },
+    /** True while the relay connection is still opening (and not past its deadline). */
+    get signalingOpening() {
+      return Boolean(ws && ws.readyState === 0 && Date.now() - socketOpenStartedAt < SOCKET_OPEN_DEADLINE_MS)
+    },
     /** Signal through another relay from now on; open peer channels stay up. */
     switchRelay(nextSignalUrl, reason = 'relay_switch') {
       if (!nextSignalUrl || nextSignalUrl === signalUrl) return false
       log(`[signal] ${reason}: moving signaling from ${signalUrl} to ${nextSignalUrl}`)
       signalUrl = nextSignalUrl
-      return reconnectSignalingPreservingPeers(reason)
+      return reconnectSignalingPreservingPeers(reason, { force: true })
     },
     reconnectSignaling(reason = 'signaling_refresh') {
       return reconnectSignalingPreservingPeers(reason)

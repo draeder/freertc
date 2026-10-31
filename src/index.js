@@ -369,11 +369,16 @@ async function runDeferredTask(env, task) {
       await insertRelayMessage(db, message);
       return;
     }
-    // A peer no relay has: drop what is sent to it, and tell the sender once
-    // so it stops. Without this every offer and ICE candidate for a peer that
-    // had left went to every relay serving the room, twice, and was then
-    // stored for a peer that would never collect it.
+    // A peer that said goodbye here: drop what is still sent to it, and tell
+    // the sender once so it stops. Without this every offer and ICE candidate
+    // for a peer that had left went to every relay serving the room, twice,
+    // and was then stored for a peer that would never collect it.
     const goneKey = peerScopeKey(network, room, message.to);
+    if ((relayIdlePeerUntilMs.get(goneKey) ?? 0) > Date.now()) {
+      await insertRelayMessage(db, message);
+      relayLog('messages held for peers resting off the relay', `[RELAY] ${message.to} is off the relay (mesh healthy): holding ${type}`);
+      return;
+    }
     const goneUntil = absentPeerUntilMs.get(goneKey) ?? 0;
     if (goneUntil > Date.now()) {
       relayLog('messages for peers no relay has, dropped', `[RELAY] ${message.type} for ${message.to} dropped: no relay has that peer`);
@@ -398,15 +403,8 @@ async function runDeferredTask(env, task) {
       debugNote({ op: "forward", type, from: peerId.slice(0, 8), to: message.to.slice(0, 8), hint, error: String(error?.stack || error?.message || error).slice(0, 400), ms: Date.now() - startedAt });
       console.error(`[FED] forwarding ${type} to ${message.to} failed: ${error?.message}`);
     }
-    if (!(await peerIsKnownHere(db, network, room, message.to))) {
-      forgetPeerRelayHint(network, room, message.to);
-      noteAbsentPeer(goneKey);
-      relayLog('messages for peers no relay has, dropped', `[RELAY] ${message.type} for ${message.to} dropped: no relay has that peer`);
-      tellSenderPeerGone(peerId, network, room, message, relayPeerId);
-      return;
-    }
-    // Registered here but without a socket at the moment (reconnecting):
-    // hold it for the peer, as before.
+    // Not reachable right now (reconnecting, or not yet registered): hold it
+    // for the peer, as before. Only a peer that said goodbye is gone.
     await insertRelayMessage(db, message);
     relayLog('messages queued for absent peers', `[RELAY] Peer ${message.to} unavailable across federation, queued ${type} in DB`);
     return;
@@ -424,6 +422,15 @@ async function runDeferredTask(env, task) {
 const ABSENT_PEER_MS = 60_000;
 const MAX_ABSENT_PEERS = 5_000;
 const absentPeerUntilMs = new Map();
+// Peers that let go of this relay on purpose (relay on demand) and are still
+// in their room's mesh, for as long as a membership lease lasts.
+const RELAY_IDLE_PEER_MS = 10 * 60_000;
+const relayIdlePeerUntilMs = new Map();
+function noteRelayIdlePeer(key) {
+  if (relayIdlePeerUntilMs.size >= MAX_ABSENT_PEERS) relayIdlePeerUntilMs.delete(relayIdlePeerUntilMs.keys().next().value);
+  relayIdlePeerUntilMs.set(key, Date.now() + RELAY_IDLE_PEER_MS);
+  absentPeerUntilMs.delete(key);
+}
 const absentPeerToldAtMs = new Map();
 function noteAbsentPeer(key) {
   if (absentPeerUntilMs.size >= MAX_ABSENT_PEERS) absentPeerUntilMs.delete(absentPeerUntilMs.keys().next().value);
@@ -868,7 +875,8 @@ export async function handleRelayForward(request, env) {
   // that serves the room, so a copy queued at each would be a write apiece and a false
   // "queued" to the sender. A peer announced here but momentarily without a socket is still
   // held for, as before.
-  if (!live && !(await peerIsKnownHere(env.DB, message.network, room, message.to))) {
+  const restingHere = (relayIdlePeerUntilMs.get(liveKey) ?? 0) > Date.now();
+  if (!live && !restingHere && !(await peerIsKnownHere(env.DB, message.network, room, message.to))) {
     return jsonResponse({ ok: true, delivered: false, queued: false }, 200);
   }
   await insertRelayMessage(env.DB, message);
@@ -1624,6 +1632,7 @@ async function handleClientMessage(
     if (type === "announce") {
       const isHeartbeat = prevPeerKey === peerKey;
       absentPeerUntilMs.delete(peerKey);
+      relayIdlePeerUntilMs.delete(peerKey);
 
       // Registration is complete only after the relay has accepted the
       // announcement. Clients use this ACK to begin discovery and signaling.
@@ -1638,6 +1647,12 @@ async function handleClientMessage(
       await deferWork(ctx, env, { kind: "announce", network, room, peerId, selfRelayUrl, message, isHeartbeat });
 
     } else if (type === "withdraw") {
+      // A peer that lets go of the relay because its mesh is healthy (relay on
+      // demand) is still in the room: messages for it are held, not dropped.
+      if (message.body?.reason === "relay_idle") noteRelayIdlePeer(peerKey);
+      // Any other withdraw is a goodbye (closed tab, Ctrl-C, reload): the peer
+      // has left, and what is still sent to it is dropped (see "forward").
+      else noteAbsentPeer(peerKey);
       const releasedLivePeer = deleteLivePeerIfOwned(livePeers, peerKey, socket);
       if (db && releasedLivePeer) {
         await deferWork(ctx, env, { kind: "peer-left", network, room, peerId, selfRelayUrl });
