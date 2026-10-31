@@ -188,6 +188,17 @@ const env = {
 };
 // Any Node relay can be a tunnel home for relays behind NAT, as a worker can.
 env.RELAY_TUNNEL = nodeDurableNamespace(RelayTunnel, env);
+// No peer is connected to a relay that has just started: forget the room
+// announcements the last run left in its database. Kept, they were listed
+// to other relays (and so to browsers) as present until they expired, and
+// browsers dialled dozens of peers that were gone before the live ones.
+try {
+  const cleared = await env.DB.prepare('DELETE FROM psp_announcements').run();
+  const n = Number(cleared?.meta?.changes ?? cleared?.changes ?? 0);
+  if (n) console.log(`[node-relay] forgot ${n} peer announcement${n === 1 ? '' : 's'} left from the last run`);
+} catch {
+  // a new database has no table yet
+}
 const ctx = { waitUntil: (work) => { Promise.resolve(work).catch((error) => console.error('[node-relay] background task failed:', error?.message || error)); } };
 
 // This relay calling itself at its own public address (a relay reached
