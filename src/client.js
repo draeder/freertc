@@ -503,7 +503,7 @@ export function createSignalingClient(options = {}) {
     networkId,
     roomId: configuredRoomId,
     sessionId: legacyRoomId,
-    signalUrl,
+    signalUrl: initialSignalUrl,
     iceServers: configuredIceServers,
     // Reach a relay behind NAT over a punched data channel instead of its
     // tunnel home (see openRelaySocket). On by default where WebRTC exists.
@@ -538,6 +538,9 @@ export function createSignalingClient(options = {}) {
 
   const roomId = configuredRoomId || legacyRoomId || networkId
 
+  // The relay this client signals through. switchRelay() moves it to another
+  // relay while every open peer channel stays up.
+  let signalUrl = initialSignalUrl
   if (!initialPeerId || !networkId || !roomId || !signalUrl) {
     throw new Error('peerId, networkId, roomId, and signalUrl are required')
   }
@@ -2739,6 +2742,16 @@ export function createSignalingClient(options = {}) {
       log('[signal] recovery backoffs cleared')
     },
 
+    get signalUrl() {
+      return signalUrl
+    },
+    /** Signal through another relay from now on; open peer channels stay up. */
+    switchRelay(nextSignalUrl, reason = 'relay_switch') {
+      if (!nextSignalUrl || nextSignalUrl === signalUrl) return false
+      log(`[signal] ${reason}: moving signaling from ${signalUrl} to ${nextSignalUrl}`)
+      signalUrl = nextSignalUrl
+      return reconnectSignalingPreservingPeers(reason)
+    },
     reconnectSignaling(reason = 'signaling_refresh') {
       return reconnectSignalingPreservingPeers(reason)
     },
