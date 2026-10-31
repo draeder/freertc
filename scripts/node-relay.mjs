@@ -382,6 +382,15 @@ if (PUNCH) {
 // Say whether federation actually holds: which relays answered this relay's
 // announcement, logged whenever that changes.
 let federationState = null;
+// Say plainly what this relay's public address costs.
+function howReached(url) {
+  if (!tunnelNodeIdOf(url)) return ' (open port, no tunnel)';
+  let host = url;
+  try { host = new URL(url).host; } catch {}
+  return String(url).startsWith('wss:')
+    ? ` (through a cloud tunnel on ${host}: works, but every message through it counts against Cloudflare's requests)`
+    : ` (through the home relay ${host}, no cloud)`;
+}
 async function heartbeat() {
   if (!federating) return;
   // Not federated yet: still getting a public address (open port or tunnel).
@@ -394,11 +403,23 @@ async function heartbeat() {
     : !result?.enabled
       ? 'not federated: federation is off for this address'
       : result.confirmed_by.length
-        ? `federated as ${env.RELAY_URL}: known to ${hosts(result.confirmed_by).join(', ')}`
+        ? `federated as ${env.RELAY_URL}${howReached(env.RELAY_URL)}: known to ${hosts(result.confirmed_by).join(', ')}`
         : `not federated: no relay answered (asked ${hosts(result.asked).join(', ') || 'none'})`;
   if (state !== federationState) {
     federationState = state;
     console.log(`[node-relay] ${state}`);
+  }
+}
+
+/** Open-port relays listed in the DNS directory (not this one), as tunnel homes. */
+async function directoryHomeUrls(selfNodeId) {
+  if (isOff(process.env.FREERTC_DIRECTORY_HOMES)) return [];
+  try {
+    const { lookupDirectRelays } = await import('../src/direct/lookup.js');
+    const records = await lookupDirectRelays({ useCache: false });
+    return records.filter((record) => record.ws && record.node_id !== selfNodeId).map((record) => record.ws).slice(0, 3);
+  } catch {
+    return [];
   }
 }
 
@@ -408,9 +429,36 @@ async function openTunnel() {
   tunnelStarted = true;
   const { startTunnel } = await import('../src/tunnel/client.js');
   const { publicKey, privateKey } = decodeRelayIdentitySecret(env.RELAY_IDENTITY_SECRET);
-  startTunnel({
-    homes: tunnelHomes,
-    identity: await createRelayIdentity(publicKey, privateKey),
+  const identity = await createRelayIdentity(publicKey, privateKey);
+  // A home relay from the DNS directory first: a home relay with an open port
+  // (see openPublicPort) carries this relay's federation and peers' signaling
+  // with no cloud relay in the way. The cloud homes come after, for when none
+  // answers; every frame through them counts against Cloudflare's limit.
+  const directoryHomes = await directoryHomeUrls(identity.nodeId);
+  if (directoryHomes.length) console.log(`[node-relay] home relays from the DNS directory: ${directoryHomes.join(', ')} (cloud only if none answers)`);
+  startHomeTunnel(startTunnel, identity, directoryHomes);
+  // On a cloud home while a directory home exists again (it was down, or it
+  // came up after this relay did): move back, checked every few minutes.
+  setInterval(async () => {
+    const url = tunnelHandle?.url;
+    if (!url || !url.startsWith('wss:')) return;
+    const homes = await directoryHomeUrls(identity.nodeId);
+    for (const home of homes) {
+      const up = await fetch(home.replace(/^ws/, 'http').replace(/\/ws$/, '/health'), { signal: AbortSignal.timeout(5_000) }).then((r) => r.ok).catch(() => false);
+      if (!up) continue;
+      console.log(`[node-relay] home relay ${home} is up: moving this relay's tunnel there from the cloud`);
+      tunnelHandle.close();
+      startHomeTunnel(startTunnel, identity, homes);
+      return;
+    }
+  }, 3 * 60_000).unref();
+}
+
+let tunnelHandle = null;
+function startHomeTunnel(startTunnel, identity, directoryHomes) {
+  tunnelHandle = startTunnel({
+    homes: [...directoryHomes, ...tunnelHomes],
+    identity,
     name: env.RELAY_NAME,
     handleRequest: (request) => (handlePunchOffer && new URL(request.url).pathname === PUNCH_OFFER_PATH
       ? handlePunchOffer(request)
@@ -466,6 +514,7 @@ async function openPublicPort() {
       openPortMapping = mapping;
       env.RELAY_URL = url;
       log(`router forwards tcp ${mapping.externalIp}:${mapping.externalPort} here (${mapping.method}) and ${new URL(home).host} reached it: no tunnel`);
+      setTimeout(() => directRelay?.republish().catch(() => {}), 2_000).unref();
       console.log(`[node-relay] joining federation as ${url}`);
       heartbeat();
       setTimeout(() => relayLinks?.maintain().catch(() => {}), 5_000).unref();
@@ -563,7 +612,9 @@ if (!isOff(process.env.FREERTC_DIRECT)) {
     // Listed in the directory only when this relay federates publicly.
     directoryUrl: federating && PUBLIC ? (home || null) : null,
     publicIp: process.env.FREERTC_DIRECT_PUBLIC_IP || null,
-    tunnelUrl: () => (tunnelNodeIdOf(env.RELAY_URL) ? env.RELAY_URL : null),
+    tunnelUrl: () => (tunnelNodeIdOf(env.RELAY_URL) && String(env.RELAY_URL).startsWith('wss:') ? env.RELAY_URL : null),
+    // Listed with its open TCP port, so relays behind NAT can make it their home.
+    wsUrl: () => (openPortMapping ? env.RELAY_URL : null),
     name: env.RELAY_NAME,
     acceptSocket: (socket) => acceptSocket(socket),
     log: (line) => console.log(`${new Date().toLocaleTimeString([], { hour12: false })} [node-relay:direct] ${line}`),
@@ -592,7 +643,7 @@ server.on('error', (error) => noteTrouble(`server errors (${error?.code || 'unkn
 server.listen(PORT, HOST, () => {
   console.log(`[node-relay] ${env.RELAY_NAME} on ${TLS ? 'https' : 'http'}://${HOST}:${PORT} (relay ${env.RELAY_URL})`);
   console.log(`[node-relay] federation: ${federationNote}; data in ${DATA_DIR}`);
-  console.log(`[node-relay] punched connections: ${PUNCH ? `on (POST ${PUNCH_OFFER_PATH})` : (isOff(process.env.FREERTC_PUNCH) ? 'off (FREERTC_PUNCH=off)' : 'off: no WebRTC here (npm install werift)')}`);
+  console.log(`[node-relay] punched connections: ${PUNCH ? `accepted when a peer asks for one, introduced through this relay's public address (POST ${PUNCH_OFFER_PATH})` : (isOff(process.env.FREERTC_PUNCH) ? 'off (FREERTC_PUNCH=off)' : 'off: no WebRTC here (npm install werift)')}`);
   heartbeat();
   if (tunneling) {
     (OPEN_PORT ? openPublicPort() : Promise.resolve(false))

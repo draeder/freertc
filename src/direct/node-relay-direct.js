@@ -37,6 +37,7 @@ export async function startDirectRelay({
   directoryUrl,
   publicIp = null,          // set when this machine has a public address and no router to ask
   tunnelUrl = () => null,   // this relay's tunnel URL, when it has one
+  wsUrl = () => null,       // ws://<public ip>:<port>/ws when the router forwards its TCP port
   name = null,
   acceptSocket,
   fetchImpl = globalThis.fetch,
@@ -87,6 +88,7 @@ export async function startDirectRelay({
       // The port the relay listens on (the router may forward a different
       // public one): machines on this network use these, not the public address.
       lan: lanEndpoints(port),
+      ws: wsUrl() || null,
     });
     try {
       const response = await fetchImpl(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(record) });

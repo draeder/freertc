@@ -9,6 +9,9 @@
 //     direct: 'webrtc-direct://<ip>:<port>/sha256/<fingerprint>',
 //     tunnel: 'wss://<home>/t/<node id>/ws' | null,   the way in when direct fails
 //     capacity, issued_at_ms, expires_at_ms, signature,
+//     ws: 'ws://<ip>:<port>/ws'        optional: the relay's open TCP port, at
+//                                       the same address as direct; relays
+//                                       behind NAT use it as their home
 //     lan: ['<private ip>:<port>', …]   optional: where machines on the
 //                                       relay's own network reach it (a
 //                                       router seldom loops its public
@@ -50,6 +53,16 @@ function lanOk(value) {
   return Array.isArray(value) && value.length >= 1 && value.length <= MAX_LAN_ADDRESSES && value.every(isLanEndpoint);
 }
 
+function wsUrlOk(value, direct) {
+  try {
+    const url = new URL(value);
+    const host = parseDirectRelayUrl(direct)?.host;
+    return url.protocol === 'ws:' && url.hostname === host && url.port !== '' && url.pathname === '/ws' && !url.search && !url.hash;
+  } catch {
+    return false;
+  }
+}
+
 function tunnelUrlOk(value, nodeId) {
   if (value === null) return true;
   try {
@@ -60,7 +73,7 @@ function tunnelUrlOk(value, nodeId) {
   }
 }
 
-export async function createSignedDirectoryRecord(identity, { direct, tunnel = null, name = null, capacity = 10_000, ttlMs = 24 * 60 * 60_000, now = Date.now(), lan = [] }) {
+export async function createSignedDirectoryRecord(identity, { direct, tunnel = null, name = null, capacity = 10_000, ttlMs = 24 * 60 * 60_000, now = Date.now(), lan = [], ws = null }) {
   if (!parseDirectRelayUrl(direct)) throw new TypeError('direct must be a webrtc-direct URL');
   if (!tunnelUrlOk(tunnel, identity.nodeId)) throw new TypeError('tunnel must be this relay\'s own tunnel URL');
   const payload = {
@@ -78,6 +91,7 @@ export async function createSignedDirectoryRecord(identity, { direct, tunnel = n
   // Left out when there is none, so such a record reads the same as before.
   const lanEndpoints = [...new Set((lan || []).filter(isLanEndpoint))].slice(0, MAX_LAN_ADDRESSES);
   if (lanEndpoints.length) payload.lan = lanEndpoints;
+  if (ws && wsUrlOk(ws, direct)) payload.ws = ws;
   return { ...payload, signature: await signMessage(canonicalJson(payload), identity.privateKey) };
 }
 
@@ -94,9 +108,10 @@ export async function verifyDirectoryRecord(record, { now = Date.now() } = {}) {
     const expires = Number(record.expires_at_ms);
     if (!Number.isFinite(issued) || !Number.isFinite(expires)) return false;
     if (issued > now + MAX_CLOCK_SKEW_MS || expires <= now || expires - issued > MAX_DIRECTORY_TTL_MS) return false;
-    const keys = Object.keys(record).filter((key) => key !== 'lan').sort().join(',');
+    const keys = Object.keys(record).filter((key) => key !== 'lan' && key !== 'ws').sort().join(',');
     if (keys !== 'capacity,direct,expires_at_ms,issued_at_ms,kind,name,node_id,public_key,signature,tunnel,version') return false;
     if ('lan' in record && !lanOk(record.lan)) return false;
+    if ('ws' in record && !wsUrlOk(record.ws, record.direct)) return false;
     return await verifyMessage(canonicalJson(unsigned(record)), record.signature, record.public_key);
   } catch {
     return false;

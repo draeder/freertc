@@ -80,6 +80,17 @@ test('a record can carry the relay\'s LAN addresses, and the client tries them t
   assert.match(sdp, /a=candidate:3 1 UDP 2130706430 10\.0\.0\.5 9443 typ host/);
 });
 
+test('a record can carry the relay\'s open TCP port, at its own address only', async () => {
+  const id = await identity();
+  const direct = directRelayUrl({ host: '203.0.113.7', port: 9443, fingerprint: FP });
+  const record = await createSignedDirectoryRecord(id, { direct, ws: 'ws://203.0.113.7:8788/ws' });
+  assert.equal(record.ws, 'ws://203.0.113.7:8788/ws');
+  assert.equal(await verifyDirectoryRecord(record), true);
+  const elsewhere = await createSignedDirectoryRecord(id, { direct, ws: 'ws://198.51.100.9:8788/ws' });
+  assert.equal('ws' in elsewhere, false, 'another address is not this relay\'s port');
+  assert.equal(await verifyDirectoryRecord({ ...record, ws: 'ws://198.51.100.9:8788/ws' }), false);
+});
+
 test('directory TXT encoding round-trips in 255-character strings', async () => {
   const id = await identity();
   const record = await createSignedDirectoryRecord(id, { direct: directRelayUrl({ host: '203.0.113.7', port: 9443, fingerprint: FP }) });
