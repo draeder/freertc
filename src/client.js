@@ -2459,6 +2459,9 @@ export function createSignalingClient(options = {}) {
           networkId:    p.network ?? networkId,
           capabilities: p.hints ?? {},
           advertisedAt: p.last_seen ?? p.timestamp ?? Date.now(),
+          // When the relay sent this list, on the relay's clock: the age of an
+          // advertisement is judged on one clock, not across two machines.
+          listedAt:     Number(msg.timestamp) || null,
           advisory:     true,
           localSeenAt:  Date.now(),
         }))
