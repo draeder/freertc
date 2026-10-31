@@ -1071,7 +1071,11 @@ async function findFederatedPeers(
     // relays closest to the room in the overlay, often cloud relays; when
     // those are out of requests, linked local relays still find each other's
     // peers.
-    const linked = typeof env.LINKED_RELAY_URLS === 'function' ? env.LINKED_RELAY_URLS() : [];
+    const linked = [
+      ...(typeof env.LINKED_RELAY_URLS === 'function' ? env.LINKED_RELAY_URLS() : []),
+      // and the relays behind NAT reached through this one (node-relay)
+      ...(typeof env.HOSTED_RELAY_URLS === 'function' ? env.HOSTED_RELAY_URLS() : []),
+    ];
     // And every relay in the DNS relay directory (by its open port), read
     // through public DNS-over-HTTPS and cached: no cloud relay is involved.
     const listed = await directoryRelayUrls();

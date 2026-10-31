@@ -48,6 +48,8 @@ export function nodeDurableNamespace(ObjectClass, env) {
     return object;
   };
   return {
+    /** The live objects by name (Node only; a Worker namespace has no such list). */
+    instances,
     idFromName: (name) => String(name),
     get: (id) => ({
       fetch: (input, init) => instance(String(id)).fetch(input instanceof Request && !init ? input : new Request(input, init)),

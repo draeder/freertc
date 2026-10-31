@@ -207,6 +207,18 @@ const env = {
 };
 // Any Node relay can be a tunnel home for relays behind NAT, as a worker can.
 env.RELAY_TUNNEL = nodeDurableNamespace(RelayTunnel, env);
+// Relays behind NAT reached through this one, as their federation URLs:
+// always asked for a room's peers, like linked relays (src/index.js).
+env.HOSTED_RELAY_URLS = () => {
+  const urls = [];
+  let base = null;
+  try { base = new URL(String(env.RELAY_URL)); } catch { return urls; }
+  for (const [nodeId, object] of env.RELAY_TUNNEL.instances) {
+    if (!/^[0-9a-f]{64}$/.test(nodeId) || !object?.tunnelSocket?.()) continue;
+    urls.push(`${base.protocol}//${base.host}/t/${nodeId}/ws`);
+  }
+  return urls;
+};
 // No peer is connected to a relay that has just started: forget the room
 // announcements the last run left in its database. Kept, they were listed
 // to other relays (and so to browsers) as present until they expired, and
