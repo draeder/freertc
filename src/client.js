@@ -343,6 +343,8 @@ export async function punchRelayChannel(offerUrl, { PeerConnection, iceServers, 
 // A failed direct attempt falls back to the tunnel when the URL names one, and
 // that relay is not tried directly again for a while.
 const directFailures = new Map()
+// How long a direct relay connection may stay 'disconnected' before it counts as gone.
+const DIRECT_DISCONNECTED_GRACE_MS = 5_000
 
 function openDirectRelaySocket(relayUrl, { WebSocketImpl, PeerConnection, log }) {
   const [directUrl, query = ''] = String(relayUrl).split('?')
@@ -408,7 +410,18 @@ function openDirectRelaySocket(relayUrl, { WebSocketImpl, PeerConnection, log })
       channel.onmessage = (event) => socket.onmessage?.({ data: typeof event.data === 'string' ? event.data : String(event.data) })
       channel.onclose = () => finish(1006, 'direct channel closed')
       channel.onerror = (event) => socket.onerror?.(event)
-      pc.onconnectionstatechange = () => { if (['failed', 'closed'].includes(pc.connectionState)) finish(1006, `connection ${pc.connectionState}`) }
+      // 'disconnected' that lasts is a relay that is gone (stopped, asleep,
+      // off the network). A background tab sends no keepalive, so this is
+      // the only sign it gets; waiting for 'failed' could take minutes.
+      let disconnectedTimer = null
+      pc.onconnectionstatechange = () => {
+        const state = pc.connectionState
+        if (state === 'failed' || state === 'closed') finish(1006, `connection ${state}`)
+        else if (state === 'disconnected') {
+          clearTimeout(disconnectedTimer)
+          disconnectedTimer = setTimeout(() => { if (pc.connectionState === 'disconnected') finish(1006, 'connection disconnected') }, DIRECT_DISCONNECTED_GRACE_MS)
+        } else clearTimeout(disconnectedTimer)
+      }
       socket.readyState = SOCKET_OPEN
       socket.onopen?.({})
     })
