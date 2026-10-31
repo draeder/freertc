@@ -100,7 +100,9 @@ export async function handleDirectoryRequest(request, env, { fetchImpl = globalT
     const all = await listDirectory(env, fetchImpl);
     const mine = all.filter((entry) => entry.comment === commentFor(body.node_id));
     const current = mine[0] ? decodeDirectoryTxt(mine[0].content) : null;
-    const changed = !current || current.direct !== body.direct || current.tunnel !== body.tunnel || current.name !== body.name;
+    const sameList = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+    const changed = !current || current.direct !== body.direct || current.tunnel !== body.tunnel || current.name !== body.name
+      || !sameList(current.lan, body.lan) || (current.ws ?? null) !== (body.ws ?? null);
     // An unchanged entry is rewritten only as it nears expiry, so a relay that
     // republishes on a timer costs no DNS writes.
     if (!changed && Number(current.expires_at_ms) - now > REFRESH_BEFORE_EXPIRY_MS) {

@@ -179,6 +179,15 @@ test('the directory lists a relay only at the address it publishes from, and onl
   const again = await (await handleDirectoryRequest(post(await createSignedDirectoryRecord(id, { direct: record.direct }), '203.0.113.7'), ENV, { fetchImpl: cf.fetchImpl })).json();
   assert.equal(again.published, false, 'unchanged: no DNS write');
   assert.equal(cf.calls.filter((c) => !c.startsWith('GET')).length, writes);
+
+  // A new open port or LAN address is a change, written once the minute is up.
+  const later = Date.now() + 2 * 60_000;
+  const withPort = await createSignedDirectoryRecord(id, { direct: record.direct, ws: 'ws://203.0.113.7:8788/ws', lan: ['192.168.50.20:9443'], now: Date.now() + 30_000 });
+  const soon = await handleDirectoryRequest(post(withPort, '203.0.113.7'), ENV, { fetchImpl: cf.fetchImpl, now: Date.now() + 30_000 });
+  assert.equal(soon.status, 429, 'too soon after the last write');
+  const written = await (await handleDirectoryRequest(post(withPort, '203.0.113.7'), ENV, { fetchImpl: cf.fetchImpl, now: later })).json();
+  assert.equal(written.published, true, 'the open port and LAN address are written');
+  assert.equal(decodeDirectoryTxt([...cf.records.values()][0].content).ws, 'ws://203.0.113.7:8788/ws');
 });
 
 test('a relay withdraws only its own entry, and dead entries are cleaned up', async () => {

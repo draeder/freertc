@@ -76,6 +76,7 @@ export async function startDirectRelay({
   }
 
   let published = null;
+  let retryTimer = null;
   let stopped = false;
   const endpoint = directoryUrl ? new URL(DIRECTORY_PATH, directoryUrl).toString() : null;
 
@@ -97,6 +98,11 @@ export async function startDirectRelay({
         const why = body?.error || `status ${response.status}`;
         log(`directory: not listed (${why}${body?.seen ? `; it sees ${body.seen}, the router says ${externalIp}` : ''})`);
         if (body?.seen && body.seen !== externalIp) externalIp = null; // a second NAT: stop trying
+        // Changed too soon after the last write: try again once that has passed.
+        if (response.status === 429 && !retryTimer) {
+          retryTimer = setTimeout(() => { retryTimer = null; publish().catch(() => {}); }, 75_000);
+          retryTimer.unref?.();
+        }
         return;
       }
       if (body.published) log(`directory: listed as ${record.direct}${record.lan ? ` (on this network: ${record.lan.join(', ')})` : ''}`);
