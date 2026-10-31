@@ -575,6 +575,9 @@ export function createSignalingClient(options = {}) {
   // relay while every open peer channel stays up.
   let signalUrl = initialSignalUrl
   let socketOpenStartedAt = 0
+  // Relay connections in a row that closed before they ever opened.
+  let failedOpens = 0
+  let openedThisSocket = false
   if (!initialPeerId || !networkId || !roomId || !signalUrl) {
     throw new Error('peerId, networkId, roomId, and signalUrl are required')
   }
@@ -2525,6 +2528,7 @@ export function createSignalingClient(options = {}) {
 
     setStatus('connecting')
     socketOpenStartedAt = Date.now()
+    openedThisSocket = false
     ws = openRelaySocket(wsUrl.toString(), { punch: relayPunch, iceServers: preferredIceServers, log })
 
     ws.onopen = () => {
@@ -2535,6 +2539,8 @@ export function createSignalingClient(options = {}) {
         return
       }
       intentionalClose = false
+      openedThisSocket = true
+      failedOpens = 0
       setStatus('connected')
       backoffMs = BACKOFF_BASE_MS
       reconnectAttempts = 0
@@ -2570,6 +2576,7 @@ export function createSignalingClient(options = {}) {
     }
 
     ws.onclose = (event) => {
+      if (!openedThisSocket) failedOpens += 1
       registered = false
       stopAdvertiseHeartbeat()
       stopKeepalive()
@@ -2713,7 +2720,7 @@ export function createSignalingClient(options = {}) {
     // machine (a hundred peers on one laptop), opening can take longer than a
     // recovery probe waits; cancelling it and starting over put each attempt
     // at the back of the queue again, and the peer never got a relay.
-    if (!force && ws && ws.readyState === 0 && Date.now() - socketOpenStartedAt < SOCKET_OPEN_DEADLINE_MS) {
+    if (!force && ws && ws.readyState === 0 && failedOpens < 2 && Date.now() - socketOpenStartedAt < SOCKET_OPEN_DEADLINE_MS) {
       log(`[signal] ${reason}: relay connection still opening; waiting for it`)
       return false
     }
@@ -2831,13 +2838,18 @@ export function createSignalingClient(options = {}) {
     },
     /** True while the relay connection is still opening (and not past its deadline). */
     get signalingOpening() {
-      return Boolean(ws && ws.readyState === 0 && Date.now() - socketOpenStartedAt < SOCKET_OPEN_DEADLINE_MS)
+      // Not after two attempts in a row closed without ever opening (a relay
+      // that is gone, such as one whose machine moved to another network):
+      // the caller may then move to another relay instead of waiting on this
+      // one's next attempt, forever.
+      return Boolean(ws && ws.readyState === 0 && failedOpens < 2 && Date.now() - socketOpenStartedAt < SOCKET_OPEN_DEADLINE_MS)
     },
     /** Signal through another relay from now on; open peer channels stay up. */
     switchRelay(nextSignalUrl, reason = 'relay_switch') {
       if (!nextSignalUrl || nextSignalUrl === signalUrl) return false
       log(`[signal] ${reason}: moving signaling from ${signalUrl} to ${nextSignalUrl}`)
       signalUrl = nextSignalUrl
+      failedOpens = 0
       return reconnectSignalingPreservingPeers(reason, { force: true })
     },
     reconnectSignaling(reason = 'signaling_refresh') {
