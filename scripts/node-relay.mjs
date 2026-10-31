@@ -85,7 +85,7 @@ try {
 }
 
 installWebSocketPair();
-const { default: worker } = await import('../src/index.js');
+const { default: worker, relayLogCounts } = await import('../src/index.js');
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const HOST = process.env.HOST || '0.0.0.0';
@@ -177,6 +177,7 @@ const env = {
   DB: meter.wrapD1(await openSqliteD1({ filename: path.resolve(process.env.DB_PATH || path.join(DATA_DIR, 'relay.sqlite')), migrationsDir: path.join(ROOT, 'migrations') })),
   RELAY_URL,
   RELAY_NAME: process.env.RELAY_NAME || `freertc-node-${SELF_HOST}-${PORT}`,
+  ...(process.env.FREERTC_VERBOSE ? { FREERTC_VERBOSE: process.env.FREERTC_VERBOSE } : {}),
   FREERTC_PUBLIC: PUBLIC ? 'true' : 'false',
   KADEMLIA_BOOTSTRAP_URLS: federating ? bootstrap.join(',') : '',
   // Without an identity the worker code runs no overlay at all: that is what off means.
@@ -442,6 +443,16 @@ async function openPublicPort() {
 }
 
 if (federating) setInterval(heartbeat, 2 * 60_000).unref();
+
+// One line a minute instead of one per message passed on (FREERTC_VERBOSE=1
+// for every message).
+setInterval(async () => {
+  if (!relayLogCounts?.size) return;
+  const parts = [...relayLogCounts].map(([what, count]) => `${count} ${what}`);
+  relayLogCounts.clear();
+  const health = await worker.fetch(new Request(`http://${SELF_HOST}:${PORT}/health`), env, ctx).then((r) => r.json()).catch(() => null);
+  console.log(`${new Date().toLocaleTimeString([], { hour12: false })} [node-relay] last minute: ${parts.join(', ')}${health ? `; ${health.peers} peers connected` : ''}`);
+}, 60_000).unref();
 
 // Direct connections (src/direct): browsers reach this relay with a WebRTC data
 // channel on a UDP port the router forwards, found through the DNS relay

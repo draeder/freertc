@@ -17,6 +17,20 @@ import { relayPeerIdFor } from "./relay-id.js";
 import { tunnelRoute } from "./tunnel/frames.js";
 import { DIRECTORY_PATH, directoryEnabled, handleDirectoryRequest } from "./direct/directory.js";
 import { REACHABLE_PATH, handleReachableRequest } from "./direct/reachable.js";
+
+// Per-message log lines (one for every offer, answer and ICE candidate a relay
+// passes on) only with FREERTC_VERBOSE; otherwise they are counted, and a
+// Node relay prints the counts once a minute (relayLogCounts).
+export const relayLogCounts = new Map();
+let relayVerbose = false;
+function relayLog(what, line) {
+  if (relayVerbose) {
+    console.log(line);
+    return;
+  }
+  relayLogCounts.set(what, (relayLogCounts.get(what) ?? 0) + 1);
+}
+
 export { RelayTunnel } from "./tunnel/home.js";
 
 const PSP_VERSION = "1.0";
@@ -281,7 +295,7 @@ async function runDeferredTask(env, task) {
     // Only broadcast peer_list when the peer is newly joining, not on a
     // heartbeat re-announce: no topology change occurred.
     if (!task.isHeartbeat && db) {
-      console.log(`[NET] Broadcasting peer_list for network=${network} room=${room} after new announce from ${peerId}`);
+      relayLog('peer lists sent', `[NET] Broadcasting peer_list for network=${network} room=${room} after new announce from ${peerId}`);
       await broadcastPeerList(env, selfRelayUrl, network, room, relayPeerId, { federatedPeers })
         .catch((err) => console.error(`[Broadcast error]`, err?.message));
     }
@@ -366,7 +380,7 @@ async function runDeferredTask(env, task) {
       ]);
       debugNote({ op: "forward", type, from: peerId.slice(0, 8), to: message.to.slice(0, 8), hint, delivered: deliveredRemote, ms: Date.now() - startedAt });
       if (deliveredRemote) {
-        console.log(`[FED] Routed ${type} to peer relay for ${message.to}`);
+        relayLog('messages routed to other relays', `[FED] Routed ${type} to peer relay for ${message.to}`);
         return;
       }
     } catch (error) {
@@ -374,7 +388,7 @@ async function runDeferredTask(env, task) {
       console.error(`[FED] forwarding ${type} to ${message.to} failed: ${error?.message}`);
     }
     await insertRelayMessage(db, message);
-    console.log(`[RELAY] Peer ${message.to} unavailable across federation, queued ${type} in DB`);
+    relayLog('messages queued for absent peers', `[RELAY] Peer ${message.to} unavailable across federation, queued ${type} in DB`);
     return;
   }
 
@@ -447,6 +461,7 @@ let lastFederationMs = 0; // tracks last heartbeat time within this isolate
 
 export default {
   async fetch(request, env, ctx) {
+    relayVerbose = env?.FREERTC_VERBOSE === "1" || env?.FREERTC_VERBOSE === "true";
     try {
       return await handleFetch(request, env, ctx);
     } catch (error) {
@@ -784,13 +799,13 @@ export async function handleRelayForward(request, env) {
   if (live) {
     try {
       live.socket.send(JSON.stringify(message));
-      console.log(`[FED-IN] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} from ${viaRelayUrl}: delivered to live socket`);
+      relayLog('messages from other relays delivered', `[FED-IN] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} from ${viaRelayUrl}: delivered to live socket`);
       return jsonResponse({ ok: true, delivered: true }, 200);
     } catch (error) {
       console.log(`[FED-IN] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} from ${viaRelayUrl}: live socket send failed (${error?.message})`);
     }
   } else {
-    console.log(`[FED-IN] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} from ${viaRelayUrl}: not live here (${livePeers.size} live)`);
+    relayLog('messages from other relays for absent peers', `[FED-IN] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} from ${viaRelayUrl}: not live here (${livePeers.size} live)`);
   }
   // A relay that has never heard of the peer keeps nothing for it. The sender asks every relay
   // that serves the room, so a copy queued at each would be a write apiece and a false
@@ -1040,7 +1055,7 @@ async function forwardToRelayResult(relayUrl, message, selfRelayId) {
         // Legacy relay versions returned an empty success response.
       }
     }
-    console.log(`[FED] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} via ${relayUrl}: ${outcome} (${response.status})`);
+    relayLog(outcome === 'delivered' ? 'messages forwarded to other relays' : `forwards ${outcome}`, `[FED] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} via ${relayUrl}: ${outcome} (${response.status})`);
     return outcome;
   } catch (error) {
     console.log(`[FED] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} via ${relayUrl}: fetch failed (${error?.message})`);
@@ -1531,7 +1546,7 @@ async function handleClientMessage(
         networkSubscribers.set(subscriberScope, new Set());
       }
       networkSubscribers.get(subscriberScope).add(socket);
-      console.log(`[NET] Peer ${peerId} subscribed to network=${network} room=${room}`);
+      relayLog('peers subscribed', `[NET] Peer ${peerId} subscribed to network=${network} room=${room}`);
     }
 
     // Reconnects reuse a peer ID. A late ping/close from the replaced socket
@@ -1610,7 +1625,7 @@ async function handleClientMessage(
         try {
           live.socket.send(rawData);
           deliveredLive = true;
-          console.log(`[RELAY] Delivered ${type} from ${peerId} to ${message.to} immediately`);
+          relayLog('messages delivered', `[RELAY] Delivered ${type} from ${peerId} to ${message.to} immediately`);
         } catch (err) {
           console.error(`[RELAY] Failed to deliver to ${message.to}:`, err?.message);
         }
