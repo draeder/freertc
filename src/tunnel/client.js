@@ -10,9 +10,18 @@ const DEAD_AFTER_MS = 70_000;
 const CONNECT_TIMEOUT_MS = 15_000;
 const MAX_BACKOFF_MS = 30_000;
 // A home that refuses with 429 or 5xx (a cloud relay out of its daily
-// requests answers 503) is left alone this long; retrying it every second
-// only spends more of what it has run out of.
-const REFUSED_BACKOFF_MS = 10 * 60_000;
+// requests answers 503) is left alone, longer each time (1, 2, 4 ... 60
+// min), but tried again just after midnight UTC, when Cloudflare's daily
+// limits reset. Retrying it every second only spends what it has run out of.
+const REFUSED_BACKOFF_MIN_MS = 60_000;
+const REFUSED_BACKOFF_MAX_MS = 60 * 60_000;
+
+/** Just after the next midnight UTC. */
+function nextUtcReset(now) {
+  const next = new Date(now);
+  next.setUTCHours(24, 0, 5, 0);
+  return next.getTime();
+}
 
 function connectUrl(homeUrl, nodeId) {
   return tunnelUrlFor(homeUrl, nodeId).replace(/\/ws$/, '/connect');
@@ -92,6 +101,7 @@ export function startTunnel({ homes, identity, name, handleRequest, handleStream
   let homeIndex = 0;
   let failures = 0;
   const refusedUntil = new Map(); // home URL -> ms
+  const refusedBackoff = new Map(); // home URL -> its next backoff, ms
   let saidAllRefused = false;
   let readyResolve;
   const ready = new Promise((resolve) => { readyResolve = resolve; });
@@ -112,7 +122,7 @@ export function startTunnel({ homes, identity, name, handleRequest, handleStream
     while (tries < homes.length && (refusedUntil.get(homes[homeIndex % homes.length]) ?? 0) > now) { homeIndex += 1; tries += 1; }
     if (tries >= homes.length) {
       const wait = Math.max(1_000, Math.min(...homes.map((h) => refusedUntil.get(h) ?? now)) - now);
-      if (!saidAllRefused) log(`every home relay refused (429/5xx: out of requests?); trying again in ${Math.round(wait / 60_000)} min`);
+      if (!saidAllRefused) log(`every home relay refused (429/5xx: out of requests?); waiting ${wait < 120_000 ? `${Math.round(wait / 1000)} s` : `${Math.round(wait / 60_000)} min`}`);
       saidAllRefused = true;
       setTimeout(connect, wait).unref?.();
       return;
@@ -153,6 +163,8 @@ export function startTunnel({ homes, identity, name, handleRequest, handleStream
       }
       if (frame.t === 'ready') {
         isReady = true;
+        refusedBackoff.delete(homeUrl);
+        refusedUntil.delete(homeUrl);
         openedAt = Date.now();
         failures = 0;
         clearTimeout(connectTimer);
@@ -214,7 +226,7 @@ export function startTunnel({ homes, identity, name, handleRequest, handleStream
     socket.on('error', (error) => {
       const status = Number(/Unexpected server response: (\d{3})/.exec(String(error?.message || ''))?.[1] || 0);
       if (status === 429 || status >= 500) refusedStatus = status;
-      log(`tunnel to ${homeUrl}: ${error?.message || error}${refusedStatus ? `; not trying it again for ${REFUSED_BACKOFF_MS / 60_000} min` : ''}`);
+      log(`tunnel to ${homeUrl}: ${error?.message || error}`);
     });
     socket.on('close', (code, reason) => {
       clearTimeout(connectTimer);
@@ -228,7 +240,12 @@ export function startTunnel({ homes, identity, name, handleRequest, handleStream
         log(`tunnel to ${homeUrl} closed (${code}${why ? ` ${why}` : ''}) after ${formatUptime(Date.now() - openedAt)}; reconnecting`);
         failures = 1;
       } else if (refusedStatus) {
-        refusedUntil.set(homeUrl, Date.now() + REFUSED_BACKOFF_MS);
+        const now = Date.now();
+        const backoff = refusedBackoff.get(homeUrl) ?? REFUSED_BACKOFF_MIN_MS;
+        refusedBackoff.set(homeUrl, Math.min(REFUSED_BACKOFF_MAX_MS, backoff * 2));
+        const until = Math.min(now + backoff, nextUtcReset(now));
+        refusedUntil.set(homeUrl, until);
+        log(`${homeUrl} refused (${refusedStatus}); trying it again ${until - now < 120_000 ? `in ${Math.round((until - now) / 1000)} s` : `in ${Math.round((until - now) / 60_000)} min`}${until === nextUtcReset(now) ? ' (midnight UTC, when daily limits reset)' : ''}`);
         homeIndex += 1;
         failures = 0;
         setUrl(null);
