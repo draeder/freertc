@@ -1108,22 +1108,24 @@ async function forwardToRelayResult(relayUrl, message, selfRelayId) {
     // the WebSocket request that is forwarding the negotiation.
     const bytes = await response.arrayBuffer();
     let outcome = "delivered";
+    let why = null;
     if (!response.ok) {
       outcome = "failed";
+      why = `answered ${response.status}`;
     } else {
       try {
         const result = JSON.parse(new TextDecoder().decode(bytes));
         if (result?.delivered === true) outcome = "delivered";
         else if (result?.queued === true) outcome = "queued";
-        else if (result?.delivered === false) outcome = "failed";
+        else if (result?.delivered === false) { outcome = "failed"; why = "the peer was no longer on that relay"; }
       } catch {
         // Legacy relay versions returned an empty success response.
       }
     }
-    relayLog(outcome === 'delivered' ? 'messages forwarded to other relays' : `forwards ${outcome}`, `[FED] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} via ${relayUrl}: ${outcome} (${response.status})`);
+    relayLog(outcome === 'delivered' ? 'messages forwarded to other relays' : `forwards ${outcome}${why ? ` (${why})` : ''}`, `[FED] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} via ${relayUrl}: ${outcome} (${response.status})`);
     return outcome;
   } catch (error) {
-    console.log(`[FED] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} via ${relayUrl}: fetch failed (${error?.message})`);
+    relayLog('forwards failed (the other relay did not answer)', `[FED] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} via ${relayUrl}: fetch failed (${error?.message})`);
     return "failed";
   }
 }
@@ -1743,7 +1745,7 @@ async function handleClientMessage(
           deliveredLive = true;
           relayLog('messages delivered', `[RELAY] Delivered ${type} from ${peerId} to ${message.to} immediately`);
         } catch (err) {
-          console.error(`[RELAY] Failed to deliver to ${message.to}:`, err?.message);
+          relayLog("deliveries to peers whose connection had just closed", `[RELAY] Failed to deliver to ${message.to}: ${err?.message}`);
         }
       }
 
@@ -1761,7 +1763,11 @@ async function handleClientMessage(
     }
     return { peerKey, network, room, peerId };
   } catch (err) {
-    console.error("[Handler] Error:", err?.message || String(err));
+    const text = err?.message || String(err);
+    // A message for a peer whose connection closed a moment ago (a peer
+    // leaving, a test ending): counted, not printed once per message.
+    if (/not open/i.test(text)) relayLog('messages to peers whose connection had just closed', `[Handler] ${text}`);
+    else console.error("[Handler] Error:", text);
     return null;
   }
 }
