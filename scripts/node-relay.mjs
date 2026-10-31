@@ -445,7 +445,9 @@ async function heartbeat() {
  */
 async function directoryHomeUrls(selfNodeId) {
   if (isOff(process.env.FREERTC_DIRECTORY_HOMES)) return [];
-  const urls = [];
+  // Relays this one was last reached through, remembered across restarts:
+  // they do not depend on DNS or on the cloud relays being up.
+  const urls = [...rememberedHomes()];
   try {
     const { lookupDirectRelays } = await import('../src/direct/lookup.js');
     const records = await lookupDirectRelays({ useCache: false });
@@ -459,6 +461,23 @@ async function directoryHomeUrls(selfNodeId) {
     }
   } catch {}
   return [...new Set(urls)].slice(0, 3);
+}
+
+const HOMES_FILE = path.join(DATA_DIR, 'homes.json');
+function rememberedHomes() {
+  try {
+    const list = JSON.parse(readFileSync(HOMES_FILE, 'utf8'));
+    return Array.isArray(list) ? list.filter((url) => typeof url === 'string' && url.startsWith('ws://')).slice(0, 3) : [];
+  } catch {
+    return [];
+  }
+}
+function rememberHome(url) {
+  try {
+    const home = String(url).replace(/\/t\/[0-9a-f]{64}\/ws$/, '/ws');
+    if (!home.startsWith('ws://')) return;
+    writeFileSync(HOMES_FILE, JSON.stringify([home, ...rememberedHomes().filter((h) => h !== home)].slice(0, 3)));
+  } catch {}
 }
 
 let tunnelStarted = false;
@@ -487,7 +506,9 @@ async function openTunnel() {
   }, 30_000).unref();
   async function moveOffCloud() {
     const url = tunnelHandle?.url;
-    if (!url || !url.startsWith('wss:')) return;
+    // On a relay with an open port already: nothing to do. Through the cloud,
+    // or not reached at all (every home refusing): look for one.
+    if (url && !url.startsWith('wss:')) return;
     const homes = await directoryHomeUrls(identity.nodeId);
     for (const home of homes) {
       const up = await fetch(home.replace(/^ws/, 'http').replace(/\/ws$/, '/health'), { signal: AbortSignal.timeout(5_000) }).then((r) => r.ok).catch(() => false);
@@ -512,6 +533,7 @@ function startHomeTunnel(startTunnel, identity, directoryHomes) {
     handleStream: (socket, { path: streamPath, headers }) => acceptSocket(socket, new URL(streamPath, 'http://x').pathname, headers),
     onUrl: (url) => {
       env.RELAY_URL = url ?? RELAY_URL;
+      if (url) rememberHome(url);
       if (url) setTimeout(() => directRelay?.republish().catch(() => {}), 2_000).unref();
       console.log(url ? `[node-relay] joining federation as ${url}` : `[node-relay] tunnel lost; out of federation until it is back`);
       heartbeat();

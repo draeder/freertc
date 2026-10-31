@@ -9,6 +9,10 @@ const PING_EVERY_MS = 25_000;
 const DEAD_AFTER_MS = 70_000;
 const CONNECT_TIMEOUT_MS = 15_000;
 const MAX_BACKOFF_MS = 30_000;
+// A home that refuses with 429 or 5xx (a cloud relay out of its daily
+// requests answers 503) is left alone this long; retrying it every second
+// only spends more of what it has run out of.
+const REFUSED_BACKOFF_MS = 10 * 60_000;
 
 function connectUrl(homeUrl, nodeId) {
   return tunnelUrlFor(homeUrl, nodeId).replace(/\/ws$/, '/connect');
@@ -87,6 +91,8 @@ export function startTunnel({ homes, identity, name, handleRequest, handleStream
   let currentUrl = null;
   let homeIndex = 0;
   let failures = 0;
+  const refusedUntil = new Map(); // home URL -> ms
+  let saidAllRefused = false;
   let readyResolve;
   const ready = new Promise((resolve) => { readyResolve = resolve; });
 
@@ -99,6 +105,19 @@ export function startTunnel({ homes, identity, name, handleRequest, handleStream
   async function connect() {
     if (stopped) return;
     const WS = WebSocketImpl ?? (await import('ws')).default;
+    // Skip homes that refused us recently; if all did, wait for the first
+    // to come off its backoff.
+    const now = Date.now();
+    let tries = 0;
+    while (tries < homes.length && (refusedUntil.get(homes[homeIndex % homes.length]) ?? 0) > now) { homeIndex += 1; tries += 1; }
+    if (tries >= homes.length) {
+      const wait = Math.max(1_000, Math.min(...homes.map((h) => refusedUntil.get(h) ?? now)) - now);
+      if (!saidAllRefused) log(`every home relay refused (429/5xx: out of requests?); trying again in ${Math.round(wait / 60_000)} min`);
+      saidAllRefused = true;
+      setTimeout(connect, wait).unref?.();
+      return;
+    }
+    saidAllRefused = false;
     const homeUrl = homes[homeIndex % homes.length];
     const tunnelUrl = tunnelUrlFor(homeUrl, identity.nodeId);
     const socket = new WS(connectUrl(homeUrl, identity.nodeId));
@@ -191,7 +210,12 @@ export function startTunnel({ homes, identity, name, handleRequest, handleStream
       }
     });
 
-    socket.on('error', (error) => log(`tunnel to ${homeUrl}: ${error?.message || error}`));
+    let refusedStatus = 0;
+    socket.on('error', (error) => {
+      const status = Number(/Unexpected server response: (\d{3})/.exec(String(error?.message || ''))?.[1] || 0);
+      if (status === 429 || status >= 500) refusedStatus = status;
+      log(`tunnel to ${homeUrl}: ${error?.message || error}${refusedStatus ? `; not trying it again for ${REFUSED_BACKOFF_MS / 60_000} min` : ''}`);
+    });
     socket.on('close', (code, reason) => {
       clearTimeout(connectTimer);
       clearInterval(pinger);
@@ -203,6 +227,11 @@ export function startTunnel({ homes, identity, name, handleRequest, handleStream
         const why = String(reason || '').trim();
         log(`tunnel to ${homeUrl} closed (${code}${why ? ` ${why}` : ''}) after ${formatUptime(Date.now() - openedAt)}; reconnecting`);
         failures = 1;
+      } else if (refusedStatus) {
+        refusedUntil.set(homeUrl, Date.now() + REFUSED_BACKOFF_MS);
+        homeIndex += 1;
+        failures = 0;
+        setUrl(null);
       } else {
         failures += 1;
         // Two failed tries at one home: move to the next.
