@@ -508,6 +508,32 @@ setInterval(async () => {
   console.log(`${new Date().toLocaleTimeString([], { hour12: false })} [node-relay] last minute: ${parts.join(', ')}${health ? `; ${health.peers} peers connected` : ''}`);
 }, 60_000).unref();
 
+// On a terminal, one status line that redraws in place every few seconds
+// while the relay is healthy (it never adds lines); anything else the relay
+// prints goes above it. Piped or redirected output gets no status line.
+if (process.stdout.isTTY) {
+  let status = '';
+  const clear = () => { if (status) process.stdout.write('\r\x1b[2K'); };
+  const draw = () => { if (status) process.stdout.write(status.slice(0, Math.max(20, (process.stdout.columns || 120) - 1))); };
+  for (const method of ['log', 'info', 'warn', 'error']) {
+    const original = console[method].bind(console);
+    console[method] = (...args) => { clear(); original(...args); draw(); };
+  }
+  let stallMs = 0;
+  setInterval(() => { stallMs = Math.max(stallMs, maxLoopLagMs); }, 100).unref();
+  setInterval(async () => {
+    const health = await worker.fetch(new Request(`http://${SELF_HOST}:${PORT}/health`), env, ctx).then((r) => r.json()).catch(() => null);
+    const time = new Date().toLocaleTimeString([], { hour12: false });
+    const stall = stallMs > 1_000 ? `, stalled ${stallMs} ms` : '';
+    stallMs = 0;
+    clear();
+    status = health
+      ? `${time} [node-relay] ${health.peers ?? 0} peers connected${stall ? stall : ', healthy'}`
+      : `${time} [node-relay] not answering its own health check`;
+    draw();
+  }, 5_000).unref();
+}
+
 // Direct connections (src/direct): browsers reach this relay with a WebRTC data
 // channel on a UDP port the router forwards, found through the DNS relay
 // directory, with no cloud relay in the way. Needs node-datachannel 0.33+.
