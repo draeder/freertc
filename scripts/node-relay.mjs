@@ -190,6 +190,30 @@ const env = {
 env.RELAY_TUNNEL = nodeDurableNamespace(RelayTunnel, env);
 const ctx = { waitUntil: (work) => { Promise.resolve(work).catch((error) => console.error('[node-relay] background task failed:', error?.message || error)); } };
 
+// This relay calling itself at its own public address (a relay reached
+// through it, ws://<public ip>:<port>/t/<id>/..., or its own federation
+// URL) goes to localhost instead. Few routers loop a public address back
+// inside, so those calls failed, and the failed forwards went round through
+// the cloud relays instead: thousands of Worker and Durable Object requests.
+{
+  const outsideFetch = globalThis.fetch;
+  globalThis.fetch = (input, init) => {
+    try {
+      const own = String(env.RELAY_URL || '');
+      if (!TLS && own.startsWith('ws://') && !tunnelNodeIdOf(own)) {
+        const self = new URL(own.replace(/^ws/, 'http'));
+        const target = new URL(typeof input === 'string' || input instanceof URL ? String(input) : input.url);
+        if (target.host === self.host && (target.protocol === 'http:' || target.protocol === 'ws:')) {
+          target.protocol = 'http:';
+          target.host = `127.0.0.1:${PORT}`;
+          return outsideFetch(typeof input === 'string' || input instanceof URL ? target.toString() : new Request(target.toString(), input), init);
+        }
+      }
+    } catch {}
+    return outsideFetch(input, init);
+  };
+}
+
 function toRequest(req, body) {
   const headers = new Headers();
   for (const [name, value] of Object.entries(req.headers)) {
