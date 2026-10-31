@@ -1,3 +1,4 @@
+import { lookupDirectRelays } from "./direct/lookup.js";
 import { relayFetch } from "./relay-fetch.js";
 import {
   configuredBootstrapUrls,
@@ -1020,6 +1021,19 @@ export async function sharedFederatedPeerQuery(selfRelayUrl, network, room, remo
   return promise;
 }
 
+/** The open-port (ws) URLs of the relays in the DNS relay directory; [] when DNS does not answer. */
+let directoryUrlsCache = { at: 0, urls: [], pending: null };
+async function directoryRelayUrls() {
+  // Cached for a minute either way, and never waited on for more than 1.5 s:
+  // a slow or unreachable resolver must not hold up a peer's discover.
+  if (Date.now() - directoryUrlsCache.at < 60_000) return directoryUrlsCache.urls;
+  directoryUrlsCache.pending ??= lookupDirectRelays()
+    .then((records) => records.map((record) => record.ws).filter((url) => typeof url === 'string' && url.startsWith('ws://')))
+    .catch(() => [])
+    .then((urls) => { directoryUrlsCache = { at: Date.now(), urls, pending: null }; return urls; });
+  return Promise.race([directoryUrlsCache.pending, new Promise((resolve) => setTimeout(() => resolve(directoryUrlsCache.urls), 1_500))]);
+}
+
 async function findFederatedPeers(
   env,
   selfRelayUrl,
@@ -1058,7 +1072,10 @@ async function findFederatedPeers(
     // those are out of requests, linked local relays still find each other's
     // peers.
     const linked = typeof env.LINKED_RELAY_URLS === 'function' ? env.LINKED_RELAY_URLS() : [];
-    remoteUrls = [...new Set([...providers.map((provider) => provider.url), ...linked])]
+    // And every relay in the DNS relay directory (by its open port), read
+    // through public DNS-over-HTTPS and cached: no cloud relay is involved.
+    const listed = await directoryRelayUrls();
+    remoteUrls = [...new Set([...providers.map((provider) => provider.url), ...linked, ...listed])]
       .filter((relayUrl) => relayUrl && relayUrl !== selfRelayUrl);
   } else {
     const allRelays = await listRelays(env.DB);
