@@ -411,16 +411,28 @@ async function heartbeat() {
   }
 }
 
-/** Open-port relays listed in the DNS directory (not this one), as tunnel homes. */
+/**
+ * Relays with an open port that this relay can be reached through (not this
+ * one): those in the DNS directory, and those it already knows from
+ * federation at a bare public address (found sooner than DNS, which caches
+ * for minutes).
+ */
 async function directoryHomeUrls(selfNodeId) {
   if (isOff(process.env.FREERTC_DIRECTORY_HOMES)) return [];
+  const urls = [];
   try {
     const { lookupDirectRelays } = await import('../src/direct/lookup.js');
     const records = await lookupDirectRelays({ useCache: false });
-    return records.filter((record) => record.ws && record.node_id !== selfNodeId).map((record) => record.ws).slice(0, 3);
-  } catch {
-    return [];
-  }
+    for (const record of records) if (record.ws && record.node_id !== selfNodeId) urls.push(record.ws);
+  } catch {}
+  try {
+    for (const relay of await listKnownRelays(env, env.RELAY_URL)) {
+      const url = String(relay.url || '');
+      if (relay.node_id === selfNodeId || !/^ws:\/\/\d{1,3}(\.\d{1,3}){3}:\d{1,5}\/ws$/.test(url) || isPrivateRelayUrl(url)) continue;
+      urls.push(url);
+    }
+  } catch {}
+  return [...new Set(urls)].slice(0, 3);
 }
 
 let tunnelStarted = false;
@@ -435,23 +447,31 @@ async function openTunnel() {
   // cloud relay in the way. The cloud homes come after, for when none
   // answers; every frame through them counts against Cloudflare's limit.
   const directoryHomes = await directoryHomeUrls(identity.nodeId);
-  if (directoryHomes.length) console.log(`[node-relay] can be reached through these relays from the DNS directory: ${directoryHomes.join(", ")} (cloud only if none answers)`);
+  if (directoryHomes.length) console.log(`[node-relay] can be reached through these relays with an open port: ${directoryHomes.join(", ")} (cloud only if none answers)`);
   startHomeTunnel(startTunnel, identity, directoryHomes);
-  // On a cloud home while a directory home exists again (it was down, or it
-  // came up after this relay did): move back, checked every few minutes.
+  // Reached through the cloud (no open-port relay answered, or one came up
+  // after this relay did): look again every 30 s and move as soon as one is
+  // up, so it does not matter which relay starts first. The lookups cost no
+  // Worker requests (DNS-over-HTTPS, and this relay's own federation table).
+  let checking = false;
   setInterval(async () => {
+    if (checking) return;
+    checking = true;
+    try { await moveOffCloud(); } finally { checking = false; }
+  }, 30_000).unref();
+  async function moveOffCloud() {
     const url = tunnelHandle?.url;
     if (!url || !url.startsWith('wss:')) return;
     const homes = await directoryHomeUrls(identity.nodeId);
     for (const home of homes) {
       const up = await fetch(home.replace(/^ws/, 'http').replace(/\/ws$/, '/health'), { signal: AbortSignal.timeout(5_000) }).then((r) => r.ok).catch(() => false);
       if (!up) continue;
-      console.log(`[node-relay] ${home} from the DNS directory is up: reaching this relay through it instead of the cloud`);
+      console.log(`[node-relay] ${home} is up (a relay with an open port): reaching this relay through it instead of the cloud`);
       tunnelHandle.close();
       startHomeTunnel(startTunnel, identity, homes);
       return;
     }
-  }, 3 * 60_000).unref();
+  }
 }
 
 let tunnelHandle = null;
