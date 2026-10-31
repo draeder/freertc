@@ -389,7 +389,7 @@ function howReached(url) {
   try { host = new URL(url).host; } catch {}
   return String(url).startsWith('wss:')
     ? ` (through a cloud tunnel on ${host}: works, but every message through it counts against Cloudflare's requests)`
-    : ` (through the home relay ${host}, no cloud)`;
+    : ` (reached through the relay at ${host}, no cloud)`;
 }
 async function heartbeat() {
   if (!federating) return;
@@ -430,12 +430,12 @@ async function openTunnel() {
   const { startTunnel } = await import('../src/tunnel/client.js');
   const { publicKey, privateKey } = decodeRelayIdentitySecret(env.RELAY_IDENTITY_SECRET);
   const identity = await createRelayIdentity(publicKey, privateKey);
-  // A home relay from the DNS directory first: a home relay with an open port
-  // (see openPublicPort) carries this relay's federation and peers' signaling
-  // with no cloud relay in the way. The cloud homes come after, for when none
+  // Relays with an open port from the DNS directory first: reached through
+  // one of them, this relay's federation and peers' signaling go with no
+  // cloud relay in the way. The cloud homes come after, for when none
   // answers; every frame through them counts against Cloudflare's limit.
   const directoryHomes = await directoryHomeUrls(identity.nodeId);
-  if (directoryHomes.length) console.log(`[node-relay] home relays from the DNS directory: ${directoryHomes.join(', ')} (cloud only if none answers)`);
+  if (directoryHomes.length) console.log(`[node-relay] can be reached through these relays from the DNS directory: ${directoryHomes.join(", ")} (cloud only if none answers)`);
   startHomeTunnel(startTunnel, identity, directoryHomes);
   // On a cloud home while a directory home exists again (it was down, or it
   // came up after this relay did): move back, checked every few minutes.
@@ -446,7 +446,7 @@ async function openTunnel() {
     for (const home of homes) {
       const up = await fetch(home.replace(/^ws/, 'http').replace(/\/ws$/, '/health'), { signal: AbortSignal.timeout(5_000) }).then((r) => r.ok).catch(() => false);
       if (!up) continue;
-      console.log(`[node-relay] home relay ${home} is up: moving this relay's tunnel there from the cloud`);
+      console.log(`[node-relay] ${home} from the DNS directory is up: reaching this relay through it instead of the cloud`);
       tunnelHandle.close();
       startHomeTunnel(startTunnel, identity, homes);
       return;
