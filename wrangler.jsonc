@@ -2,6 +2,8 @@
   "name": "freertc-worker-dev",
   "main": "src/index.js",
   "compatibility_date": "2024-09-23",
+  // Keep variables set in the dashboard: a deploy must never remove them.
+  "keep_vars": true,
   "workers_dev": true,
   "assets": {
     "directory": "public"

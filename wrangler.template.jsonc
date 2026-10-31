@@ -4,6 +4,8 @@
   // Default JS worker runtime (no Rust toolchain required).
   "main": "src/index.js",
   "compatibility_date": "2024-09-23",
+  // Keep variables set in the dashboard: a deploy must never remove them.
+  "keep_vars": true,
 
   // Serve static files from the public directory.
   "assets": {
