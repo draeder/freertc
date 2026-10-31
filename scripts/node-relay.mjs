@@ -76,7 +76,9 @@ try {
     // parent's output.
     const { spawn } = await import('node:child_process');
     const child = spawn(process.execPath, ['--experimental-sqlite', '--no-warnings', ...process.execArgv, fileURLToPath(import.meta.url), ...process.argv.slice(2)], { stdio: 'inherit' });
-    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal));
+    // A second Ctrl-C ends the child at once, whatever it is doing.
+    let signalled = 0;
+    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => { signalled += 1; child.kill(signalled > 1 ? 'SIGKILL' : signal); });
     child.on('exit', (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
     await new Promise(() => {});
   }
@@ -608,10 +610,18 @@ if (process.stdout.isTTY) {
 // directory, with no cloud relay in the way. Needs node-datachannel 0.33+.
 let directRelay = null;
 // On exit, withdraw from the directory and remove the router's port forwards.
+// Ctrl-C always ends the relay: the cleanup gets 3 s (a router or the
+// directory that does not answer must not keep it running), and a second
+// Ctrl-C ends it at once.
+let stopping = false;
 for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.once(signal, async () => {
-    await Promise.all([directRelay?.stop().catch(() => {}), openPortMapping?.close().catch(() => {})]);
-    process.exit(0);
+  process.on(signal, () => {
+    if (stopping) process.kill(process.pid, 'SIGKILL');
+    stopping = true;
+    console.log('[node-relay] stopping (Ctrl-C again to stop at once)');
+    setTimeout(() => process.exit(0), 3_000);
+    Promise.all([directRelay?.stop().catch(() => {}), openPortMapping?.close().catch(() => {})])
+      .finally(() => process.exit(0));
   });
 }
 if (!isOff(process.env.FREERTC_DIRECT)) {
