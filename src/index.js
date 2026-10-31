@@ -369,6 +369,17 @@ async function runDeferredTask(env, task) {
       await insertRelayMessage(db, message);
       return;
     }
+    // A peer no relay has: drop what is sent to it, and tell the sender once
+    // so it stops. Without this every offer and ICE candidate for a peer that
+    // had left went to every relay serving the room, twice, and was then
+    // stored for a peer that would never collect it.
+    const goneKey = peerScopeKey(network, room, message.to);
+    const goneUntil = absentPeerUntilMs.get(goneKey) ?? 0;
+    if (goneUntil > Date.now()) {
+      relayLog('messages for peers no relay has, dropped', `[RELAY] ${message.type} for ${message.to} dropped: no relay has that peer`);
+      tellSenderPeerGone(peerId, network, room, message, relayPeerId);
+      return;
+    }
     const startedAt = Date.now();
     const hint = getPeerRelayHint(network, room, message.to);
     try {
@@ -387,6 +398,15 @@ async function runDeferredTask(env, task) {
       debugNote({ op: "forward", type, from: peerId.slice(0, 8), to: message.to.slice(0, 8), hint, error: String(error?.stack || error?.message || error).slice(0, 400), ms: Date.now() - startedAt });
       console.error(`[FED] forwarding ${type} to ${message.to} failed: ${error?.message}`);
     }
+    if (!(await peerIsKnownHere(db, network, room, message.to))) {
+      forgetPeerRelayHint(network, room, message.to);
+      noteAbsentPeer(goneKey);
+      relayLog('messages for peers no relay has, dropped', `[RELAY] ${message.type} for ${message.to} dropped: no relay has that peer`);
+      tellSenderPeerGone(peerId, network, room, message, relayPeerId);
+      return;
+    }
+    // Registered here but without a socket at the moment (reconnecting):
+    // hold it for the peer, as before.
     await insertRelayMessage(db, message);
     relayLog('messages queued for absent peers', `[RELAY] Peer ${message.to} unavailable across federation, queued ${type} in DB`);
     return;
@@ -396,6 +416,37 @@ async function runDeferredTask(env, task) {
     if (db) await cleanupExpired(db);
     return;
   }
+}
+
+// Peers no relay had when last asked, so messages to them are dropped without
+// asking again for a minute; and when each sender was last told, so it is
+// told once a minute, not once per ICE candidate.
+const ABSENT_PEER_MS = 60_000;
+const MAX_ABSENT_PEERS = 5_000;
+const absentPeerUntilMs = new Map();
+const absentPeerToldAtMs = new Map();
+function noteAbsentPeer(key) {
+  if (absentPeerUntilMs.size >= MAX_ABSENT_PEERS) absentPeerUntilMs.delete(absentPeerUntilMs.keys().next().value);
+  absentPeerUntilMs.set(key, Date.now() + ABSENT_PEER_MS);
+}
+export function clearAbsentPeer(network, room, peerId) {
+  absentPeerUntilMs.delete(peerScopeKey(network, room, peerId));
+}
+function tellSenderPeerGone(senderPeerId, network, room, message, relayPeerId) {
+  const socket = livePeers.get(peerScopeKey(network, room, senderPeerId))?.socket;
+  if (!socket) return;
+  const toldKey = `${peerScopeKey(network, room, senderPeerId)}>${message.to}`;
+  if (Date.now() - (absentPeerToldAtMs.get(toldKey) ?? 0) < ABSENT_PEER_MS) return;
+  if (absentPeerToldAtMs.size >= MAX_ABSENT_PEERS) absentPeerToldAtMs.delete(absentPeerToldAtMs.keys().next().value);
+  absentPeerToldAtMs.set(toldKey, Date.now());
+  try {
+    socket.send(JSON.stringify({
+      psp_version: PSP_VERSION, type: "error", network, session_id: room,
+      from: relayPeerId, to: senderPeerId,
+      message_id: crypto.randomUUID(), timestamp: Date.now(), ttl_ms: DEFAULT_TTL_MS,
+      body: { code: "target_not_connected", reason: "no relay has this peer", peer_id: message.to },
+    }));
+  } catch { /* the sender left too */ }
 }
 let nextSocketGeneration = 0;
 
@@ -443,7 +494,13 @@ export function rememberPeerRelayHint(network, room, peerId, relayUrl, now = Dat
     url: normalizedUrl,
     expiresAt: now + PEER_RELAY_HINT_TTL_MS,
   });
+  // A relay lists the peer again: it is back.
+  absentPeerUntilMs.delete(peerScopeKey(network, room, peerId));
   return true;
+}
+
+export function forgetPeerRelayHint(network, room, peerId) {
+  peerRelayHints.delete(peerScopeKey(network, room, peerId));
 }
 
 export function getPeerRelayHint(network, room, peerId, now = Date.now()) {
@@ -1566,6 +1623,7 @@ async function handleClientMessage(
 
     if (type === "announce") {
       const isHeartbeat = prevPeerKey === peerKey;
+      absentPeerUntilMs.delete(peerKey);
 
       // Registration is complete only after the relay has accepted the
       // announcement. Clients use this ACK to begin discovery and signaling.

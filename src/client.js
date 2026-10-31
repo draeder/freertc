@@ -518,6 +518,8 @@ export function createSignalingClient(options = {}) {
     onBootstrap,
     onIncomingRelay,
     onNegotiationFailure,
+    // A relay said no relay has this peer: ({ peerId }). The peer has left.
+    onPeerGone,
     onConnectionStateChange,
     onStatusChange,
     onDataMessage,
@@ -2447,6 +2449,15 @@ export function createSignalingClient(options = {}) {
         log(`[signal] error: ${msg.body?.code} — ${msg.body?.reason}`)
         if (msg.body?.code === 'target_not_connected') {
           log('[signal] target unavailable for relay (offline/disconnected/or other isolate)')
+          // Named peer: no relay has it. Forget it and stop negotiating with it.
+          const gonePeerId = typeof msg.body?.peer_id === 'string' ? msg.body.peer_id : null
+          if (gonePeerId && gonePeerId !== peerId) {
+            mesh.bootstrapCandidates = mesh.bootstrapCandidates.filter((c) => c.peerId !== gonePeerId)
+            const conn = mesh.connections.get(gonePeerId)
+            const channelOpen = conn?.dc?.readyState === 'open' || conn?.channel?.readyState === 'open'
+            if (conn && !channelOpen) closePeerConnection(gonePeerId, 'peer_gone', false)
+            try { onPeerGone?.({ peerId: gonePeerId }) } catch { /* consumer error */ }
+          }
         }
         break
 
