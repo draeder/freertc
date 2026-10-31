@@ -1241,7 +1241,42 @@ function mergeDiscoveredPeers(...peerGroups) {
   return Array.from(merged.values()).sort((left, right) => left.peer_id.localeCompare(right.peer_id));
 }
 
+// Peers per list. A room can be bigger: each peer is sent the PEER_LIST_SIZE
+// nearest its own id (XOR, as the mesh measures), so every peer sees a
+// different slice and together they cover the whole room. The same lowest-id
+// slice for everyone left the rest of a 100-peer room undiscoverable.
+const PEER_LIST_SIZE = MAX_BATCH;
+// How many registrations are read to choose from.
+const PEER_SCAN_LIMIT = 1000;
+
+function xorCompare(a, b, target) {
+  const hex = /^[0-9a-f]+$/i;
+  if (!hex.test(a) || !hex.test(b) || !hex.test(target)) return a < b ? -1 : a > b ? 1 : 0;
+  const n = Math.max(a.length, b.length);
+  for (let i = 0; i < n; i += 1) {
+    const t = parseInt(target[i] ?? '0', 16);
+    const da = parseInt(a[i] ?? '0', 16) ^ t;
+    const db = parseInt(b[i] ?? '0', 16) ^ t;
+    if (da !== db) return da - db;
+  }
+  return 0;
+}
+
+export function peersNearest(peers, forPeerId, limit = PEER_LIST_SIZE) {
+  if (!Array.isArray(peers) || peers.length <= limit || !forPeerId) return Array.isArray(peers) ? peers.slice(0, limit) : [];
+  const target = String(forPeerId).toLowerCase();
+  return peers
+    .filter((peer) => peer?.peer_id !== forPeerId)
+    .sort((a, b) => xorCompare(String(a.peer_id).toLowerCase(), String(b.peer_id).toLowerCase(), target))
+    .slice(0, limit);
+}
+
+// Which peer each subscribed socket belongs to, so a room-wide list can be
+// cut for each.
+const socketPeerIds = new WeakMap();
+
 function sendPeerList(socket, network, room, peers, to = null, from = relayPeerIdFor(null)) {
+  peers = peersNearest(peers, to ?? socketPeerIds.get(socket) ?? null);
   socket.send(JSON.stringify({
     psp_version: PSP_VERSION,
     type: "peer_list",
@@ -1294,7 +1329,7 @@ async function broadcastPeerList(env, selfRelayUrl, network, room, relayPeerId, 
     WHERE network = ?1 AND expires_at_ms > ?2
     ORDER BY peer_id ASC
     LIMIT ?3
-  `).bind(storageScope, now, MAX_BATCH).all();
+  `).bind(storageScope, now, PEER_SCAN_LIMIT).all();
 
   const localPeers = (result.results || []).map(row => ({
     peer_id: row.peer_id,
@@ -1356,7 +1391,7 @@ async function findPeers(db, network, room, requesterPeerId) {
     WHERE network = ?1 AND peer_id != ?2 AND expires_at_ms > ?3
     ORDER BY peer_id ASC
     LIMIT ?4
-  `).bind(storageScope, requesterPeerId, now, MAX_BATCH).all();
+  `).bind(storageScope, requesterPeerId, now, PEER_SCAN_LIMIT).all();
 
   return (result.results || []).map(row => ({
     peer_id: row.peer_id,
@@ -1611,6 +1646,7 @@ async function handleClientMessage(
         networkSubscribers.set(subscriberScope, new Set());
       }
       networkSubscribers.get(subscriberScope).add(socket);
+      socketPeerIds.set(socket, peerId);
       relayLog('peers subscribed', `[NET] Peer ${peerId} subscribed to network=${network} room=${room}`);
     }
 
