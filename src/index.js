@@ -1341,7 +1341,7 @@ async function deliverQueuedRelayMessages(db, socket, network, room, peerId) {
   const queued = await fetchRelayMessages(db, network, room, peerId);
   if (queued.length === 0) return 0;
 
-  console.log(`[OUT] Delivering ${queued.length} queued messages to ${peerId}`);
+  relayLog('held messages handed to reconnecting peers', `[OUT] Delivering ${queued.length} queued messages to ${peerId}`);
   const deliveredIds = [];
   for (const { id, message: queuedMsg } of queued) {
     try {
