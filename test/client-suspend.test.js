@@ -66,3 +66,44 @@ test("a clock jump is a suspend: the client resumes like a thawed browser", asyn
     globalThis.WebSocket = originalWebSocket;
   }
 });
+
+test("a short clock jump (a busy machine) keeps live links and the relay socket", async () => {
+  const originalWebSocket = globalThis.WebSocket;
+  const originalNow = Date.now;
+  const sockets = [];
+  class FakeWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSED = 3;
+    constructor() { this.readyState = FakeWebSocket.CONNECTING; this.sent = []; sockets.push(this); }
+    send(value) { this.sent.push(JSON.parse(value)); }
+    open() { this.readyState = FakeWebSocket.OPEN; this.onopen?.(); }
+    close(code = 1000) { this.readyState = FakeWebSocket.CLOSED; this.closeCode = code; this.onclose?.({ code }); }
+  }
+  globalThis.WebSocket = FakeWebSocket;
+  let client;
+  try {
+    client = createSignalingClient({ peerId: "local-peer", networkId: "test-network", roomId: "test-room", signalUrl: "wss://signal.example/ws", autoConnect: false });
+    client.connect();
+    sockets[0].open();
+    sockets[0].onmessage?.({ data: JSON.stringify({ psp_version: "1.0", type: "ack", from: "relay", to: "local-peer", body: { status: "ok" } }) });
+    let liveClosed = false;
+    let deadClosed = false;
+    client.mesh.connections.set("live-peer", { state: "connected", connection: { connectionState: "connected", close() { liveClosed = true; } }, channel: { readyState: "open" } });
+    client.mesh.connections.set("dead-peer", { state: "connected", connection: { connectionState: "failed", close() { deadClosed = true; } }, channel: { readyState: "closed" } });
+
+    // Thirty seconds between two ticks: a busy process, or a short sleep.
+    const realNow = originalNow();
+    Date.now = () => realNow + 30_000;
+    await new Promise((resolve) => setTimeout(resolve, 1_400));
+
+    assert.equal(liveClosed, false, "a live link is kept");
+    assert.equal(deadClosed, true, "a dead link is closed");
+    assert.equal(sockets.length, 1, "the relay socket is kept");
+    assert.ok(sockets[0].sent.some((frame) => frame.type === "ping"), "the relay is pinged instead");
+  } finally {
+    Date.now = originalNow;
+    client?.disconnect?.();
+    globalThis.WebSocket = originalWebSocket;
+  }
+});

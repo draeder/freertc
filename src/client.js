@@ -119,6 +119,9 @@ const SIGNAL_PONG_TIMEOUT_MS = 60000
 // seconds — that must never read as a suspend, which tears every link down.
 const SUSPEND_TICK_MS = 1000
 const SUSPEND_GAP_MS = 20000
+// A gap this long is a real sleep: everything is reset. A shorter one may be a
+// busy machine, and is checked instead (see handleSuspendRestore).
+const SLEEP_GAP_MS = 60000
 // A relay-backed offer normally reaches the destination on its next one-second
 // signaling heartbeat. Five total sends over 2.85s cover that delivery window
 // without pinning an isolated peer to one unreachable candidate for 31.85s.
@@ -2642,6 +2645,31 @@ export function createSignalingClient(options = {}) {
 
   function handleSuspendRestore(reason = 'browser_resume', gapMs = 0) {
     if (stoppedByUser) return
+
+    // A timer that fired late is not proof the machine slept: a busy process
+    // (a hundred peers on one laptop) sees the same gap. Tearing everything
+    // down then threw away working links and every peer reconnected at once,
+    // which made the machine busier still. Check first: keep what is alive,
+    // close what is dead, and ping the relay instead of replacing it. After
+    // a real sleep the links are dead and are replaced just the same.
+    if (reason === 'clock_jump' && gapMs < SLEEP_GAP_MS) {
+      log(`[signal] timers ran ${Math.round(gapMs / 1000)}s late — checking links and relay instead of resetting them`)
+      for (const [remotePeerId, entry] of [...mesh.connections.entries()]) {
+        const state = entry?.connection?.connectionState
+        if (state === 'failed' || state === 'closed' || entry?.channel?.readyState === 'closed') {
+          closePeerConnection(remotePeerId, 'resume_dead', false)
+        }
+      }
+      if (ws && ws.readyState === 1 && registered) {
+        lastSignalPingSentAt = Date.now()
+        send(pspEnvelope('ping', { body: { nonce: generateMessageId() } }))
+      } else if (!ws || ws.readyState > 1) {
+        resetReconnectBackoff()
+        openSocket()
+      }
+      try { onResume?.({ reason, gapMs }) } catch { /* consumer error must not break resume */ }
+      return
+    }
 
     log(reason === 'clock_jump'
       ? '[signal] resumed after suspend — reconnecting immediately'
