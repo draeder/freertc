@@ -1,3 +1,4 @@
+import { relayFetch } from "./relay-fetch.js";
 import {
   configuredBootstrapUrls,
   handleKademliaRequest,
@@ -15,6 +16,7 @@ import {
 import { relayPeerIdFor } from "./relay-id.js";
 import { tunnelRoute } from "./tunnel/frames.js";
 import { DIRECTORY_PATH, directoryEnabled, handleDirectoryRequest } from "./direct/directory.js";
+import { REACHABLE_PATH, handleReachableRequest } from "./direct/reachable.js";
 export { RelayTunnel } from "./tunnel/home.js";
 
 const PSP_VERSION = "1.0";
@@ -533,6 +535,9 @@ async function handleFetch(request, env, ctx) {
       if (!directoryEnabled(env)) return jsonResponse({ ok: false, error: "No relay directory here" }, 404);
       return handleDirectoryRequest(request, env);
     }
+    // A local relay checks that relays can call it on its public address
+    // before it federates there without a tunnel (src/direct/reachable.js).
+    if (url.pathname === REACHABLE_PATH) return handleReachableRequest(request);
 
     if (request.method === "OPTIONS" && url.pathname.startsWith("/api/")) {
       // Browsers preflight cross-origin API calls; a 405 here made Safari
@@ -809,7 +814,7 @@ async function peerIsKnownHere(db, network, room, peerId) {
 
 // POST to the global hub; cache returned relay list into own D1 so both sides know each other
 async function registerWithHub(env, selfUrl) {
-  const resp = await fetch(`${relayHttpBase(normalizeRelayUrl(env.GLOBAL_RELAY_URL))}/api/v1/relays`, {
+  const resp = await relayFetch(`${relayHttpBase(normalizeRelayUrl(env.GLOBAL_RELAY_URL))}/api/v1/relays`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ url: selfUrl, name: env.RELAY_NAME || null })
@@ -902,7 +907,7 @@ async function queryRelayForPeers(relayUrl, network, room, requesterPeerId, rela
     // A relay that hangs must not hang every discover that consults it: one
     // slow provider stalled the whole federated list past the clients' probe
     // window and they switched relays instead of getting an answer.
-    const resp = await fetch(`${base}/api/v1/peers?${params.toString()}`, {
+    const resp = await relayFetch(`${base}/api/v1/peers?${params.toString()}`, {
       signal: AbortSignal.timeout(FEDERATED_PEER_QUERY_TIMEOUT_MS),
     });
     if (!resp.ok) return [];
@@ -1013,7 +1018,7 @@ async function discoverJoiningPeer({ discover, publish, send }) {
 async function forwardToRelayResult(relayUrl, message, selfRelayId) {
   try {
     const base = relayHttpBase(relayUrl);
-    const response = await fetch(`${base}/api/v1/relay`, {
+    const response = await relayFetch(`${base}/api/v1/relay`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message, via: selfRelayId || "relay-bridge" })

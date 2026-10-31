@@ -1,5 +1,5 @@
-// Ask the home router to forward a UDP port to this machine, so browsers can
-// reach the relay's direct listener from the internet. No configuration: UPnP
+// Ask the home router to forward a port to this machine: UDP for browsers'
+// direct connections, TCP for other relays' calls. No configuration: UPnP
 // IGD first (most home routers), then NAT-PMP (Apple and some others). No
 // dependencies.
 //
@@ -90,7 +90,7 @@ function soapCall({ controlUrl, serviceType }, action, args = {}) {
   });
 }
 
-async function mapWithUpnp({ internalPort, externalPort, description, log }) {
+async function mapWithUpnp({ internalPort, externalPort, description, protocol, log }) {
   for (const location of await ssdpSearch()) {
     let service;
     try { service = await wanService(location); } catch { continue; }
@@ -104,7 +104,7 @@ async function mapWithUpnp({ internalPort, externalPort, description, log }) {
       const add = () => soapCall(service, 'AddPortMapping', {
         NewRemoteHost: '',
         NewExternalPort: externalPort,
-        NewProtocol: 'UDP',
+        NewProtocol: protocol,
         NewInternalPort: internalPort,
         NewInternalClient: internalClient,
         NewEnabled: 1,
@@ -119,10 +119,10 @@ async function mapWithUpnp({ internalPort, externalPort, description, log }) {
         externalIp,
         externalPort,
         internalClient,
-        protocol: 'UDP',
+        protocol,
         async close() {
           clearInterval(renew);
-          await soapCall(service, 'DeletePortMapping', { NewRemoteHost: '', NewExternalPort: externalPort, NewProtocol: 'UDP' }).catch(() => {});
+          await soapCall(service, 'DeletePortMapping', { NewRemoteHost: '', NewExternalPort: externalPort, NewProtocol: protocol }).catch(() => {});
         },
       };
     } catch (error) {
@@ -162,7 +162,7 @@ function pmpRequest(gateway, request, timeoutMs = 2_000) {
   });
 }
 
-async function mapWithPmp({ internalPort, externalPort, log }) {
+async function mapWithPmp({ internalPort, externalPort, protocol, log }) {
   const gateway = await defaultGateway();
   if (!gateway) return null;
   try {
@@ -171,7 +171,7 @@ async function mapWithPmp({ internalPort, externalPort, log }) {
     const externalIp = [...ipAnswer.subarray(8, 12)].join('.');
     const map = async (lifetime) => {
       const request = Buffer.alloc(12);
-      request[0] = 0; request[1] = 1; // version 0, map UDP
+      request[0] = 0; request[1] = protocol === 'TCP' ? 2 : 1; // version 0, map UDP (1) or TCP (2)
       request.writeUInt16BE(internalPort, 4);
       request.writeUInt16BE(externalPort, 6);
       request.writeUInt32BE(lifetime, 8);
@@ -186,7 +186,7 @@ async function mapWithPmp({ internalPort, externalPort, log }) {
       method: 'nat-pmp',
       externalIp,
       externalPort: mappedPort,
-      protocol: 'UDP',
+      protocol,
       async close() { clearInterval(renew); await map(0).catch(() => {}); },
     };
   } catch (error) {
@@ -195,11 +195,14 @@ async function mapWithPmp({ internalPort, externalPort, log }) {
   }
 }
 
-/** Forward UDP externalPort on the router to internalPort here. */
-export async function mapUdpPort({ internalPort, externalPort = internalPort, description = 'freertc relay', log = () => {} }) {
-  return (await mapWithUpnp({ internalPort, externalPort, description, log }))
-    ?? (await mapWithPmp({ internalPort, externalPort, log }));
+/** Forward externalPort (protocol 'UDP' or 'TCP') on the router to internalPort here. */
+export async function mapPort({ internalPort, externalPort = internalPort, protocol = 'UDP', description = 'freertc relay', log = () => {} }) {
+  return (await mapWithUpnp({ internalPort, externalPort, description, protocol, log }))
+    ?? (await mapWithPmp({ internalPort, externalPort, protocol, log }));
 }
+
+export const mapUdpPort = (options) => mapPort({ ...options, protocol: 'UDP' });
+export const mapTcpPort = (options) => mapPort({ ...options, protocol: 'TCP' });
 
 /** True for an address that is not reachable from the internet (private, CGNAT, loopback, link-local). */
 export function isNonPublicIPv4(ip) {

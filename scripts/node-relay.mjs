@@ -129,6 +129,9 @@ const isOff = (value, fallback = 'on') => ['off', 'false', '0', 'no'].includes(S
 const FEDERATION = !isOff(process.env.FREERTC_FEDERATION);
 const TUNNEL = !isOff(process.env.FREERTC_TUNNEL);
 const PUBLIC = isPublicRelay(process.env);
+// Federate on this machine's public address, through a port the router
+// forwards, instead of a tunnel (FREERTC_OPEN_PORT=off for the tunnel only).
+const OPEN_PORT = !isOff(process.env.FREERTC_OPEN_PORT) && !process.env.RELAY_URL && !process.env.PROD_DOMAIN;
 const RELAY_URL = process.env.RELAY_URL
   || (process.env.PROD_DOMAIN ? `${TLS ? 'wss' : 'ws'}://${process.env.PROD_DOMAIN}/ws` : `${TLS ? 'wss' : 'ws'}://${SELF_HOST}:${PORT}/ws`);
 const configuredBootstrap = String(process.env.KADEMLIA_BOOTSTRAP_URLS ?? '').split(',').map((url) => url.trim()).filter(Boolean);
@@ -147,10 +150,14 @@ let tunneling = false;
 if (!FEDERATION) {
   federationNote = 'off (FREERTC_FEDERATION=off)';
 } else if (PUBLIC && isPrivateRelayUrl(RELAY_URL) && TUNNEL && tunnelHomes.length) {
-  // Behind NAT: public relays can't reach ws://127.0.0.1 or a LAN address, so
-  // take a public address through a tunnel. Federation starts once it is open.
+  // Behind NAT: public relays can't reach ws://127.0.0.1 or a LAN address.
+  // First ask the router to forward this port (OPEN_PORT below); if it won't,
+  // or relays still can't reach it, take a public address through a tunnel.
+  // Federation starts once there is a public address.
   tunneling = true;
-  federationNote = `public, through a tunnel (${RELAY_URL} is loopback/private; homes: ${tunnelHomes.join(', ')}), joining through ${bootstrap.join(', ')}`;
+  federationNote = OPEN_PORT
+    ? `public: asking the router to forward tcp ${PORT} so relays reach this one with no tunnel (a tunnel through ${tunnelHomes.join(', ')} if not), joining through ${bootstrap.join(', ')}`
+    : `public, through a tunnel (${RELAY_URL} is loopback/private; homes: ${tunnelHomes.join(', ')}), joining through ${bootstrap.join(', ')}`;
 } else if (PUBLIC && isPrivateRelayUrl(RELAY_URL)) {
   // Announcing ws://127.0.0.1 or a LAN address to public relays would send them
   // to an address that reaches nobody. Stay out until there is a public one.
@@ -340,6 +347,8 @@ if (PUNCH) {
 let federationState = null;
 async function heartbeat() {
   if (!federating) return;
+  // Not federated yet: still getting a public address (open port or tunnel).
+  if (PUBLIC && isPrivateRelayUrl(env.RELAY_URL)) return;
   const result = await heartbeatKademlia(env, env.RELAY_URL)
     .catch((error) => ({ error: error?.message || String(error) }));
   const hosts = (urls) => urls.map((url) => { try { return new URL(url).host; } catch { return url; } }).sort();
@@ -356,7 +365,10 @@ async function heartbeat() {
   }
 }
 
-if (tunneling) {
+let tunnelStarted = false;
+async function openTunnel() {
+  if (tunnelStarted) return;
+  tunnelStarted = true;
   const { startTunnel } = await import('../src/tunnel/client.js');
   const { publicKey, privateKey } = decodeRelayIdentitySecret(env.RELAY_IDENTITY_SECRET);
   startTunnel({
@@ -377,21 +389,74 @@ if (tunneling) {
     log: (line) => console.log(`${new Date().toLocaleTimeString([], { hour12: false })} [node-relay:tunnel] ${line}`),
   });
 }
+
+// The open port: forward tcp PORT on the router, check that a public relay can
+// call this relay there, and federate as ws://<public ip>:<port>/ws. Relays
+// call it straight (from a Worker, over a TCP socket); no tunnel is opened.
+let openPortMapping = null;
+async function openPublicPort() {
+  const log = (line) => console.log(`${new Date().toLocaleTimeString([], { hour12: false })} [node-relay:open-port] ${line}`);
+  const { mapTcpPort, isNonPublicIPv4 } = await import('../src/direct/portmap.js');
+  const { REACHABLE_PATH } = await import('../src/direct/reachable.js');
+  const mapping = await mapTcpPort({ internalPort: PORT, externalPort: PORT, description: `freertc relay ${PORT}`, log });
+  if (!mapping) { log('no router answered UPnP or NAT-PMP; using a tunnel'); return false; }
+  if (isNonPublicIPv4(mapping.externalIp)) {
+    log(`the router's own address ${mapping.externalIp} is not public (carrier-grade NAT or a second router); using a tunnel`);
+    await mapping.close().catch(() => {});
+    return false;
+  }
+  const url = `ws://${mapping.externalIp}:${mapping.externalPort}/ws`;
+  const { publicKey, privateKey } = decodeRelayIdentitySecret(env.RELAY_IDENTITY_SECRET);
+  const { nodeId } = await createRelayIdentity(publicKey, privateKey);
+  for (const home of tunnelHomes) {
+    try {
+      const response = await fetch(new URL(REACHABLE_PATH, home.replace(/^ws/, 'http')), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ port: mapping.externalPort, node_id: nodeId }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      const result = await response.json().catch(() => null);
+      if (!response.ok || !result) continue; // that relay can't check yet; ask the next
+      if (result.ip && result.ip !== mapping.externalIp) {
+        log(`relays see this machine at ${result.ip}, the router says ${mapping.externalIp}; using a tunnel`);
+        break;
+      }
+      if (!result.reachable) {
+        log(`router forwards tcp ${mapping.externalIp}:${mapping.externalPort}, but ${new URL(home).host} could not reach it (${result.why || 'no answer'}); a firewall on this machine may be blocking port ${PORT}. Using a tunnel`);
+        break;
+      }
+      openPortMapping = mapping;
+      env.RELAY_URL = url;
+      log(`router forwards tcp ${mapping.externalIp}:${mapping.externalPort} here (${mapping.method}) and ${new URL(home).host} reached it: no tunnel`);
+      console.log(`[node-relay] joining federation as ${url}`);
+      heartbeat();
+      setTimeout(() => relayLinks?.maintain().catch(() => {}), 5_000).unref();
+      return true;
+    } catch (error) {
+      log(`${new URL(home).host}: ${error?.message || error}`);
+    }
+  }
+  await mapping.close().catch(() => {});
+  return false;
+}
+
 if (federating) setInterval(heartbeat, 2 * 60_000).unref();
 
 // Direct connections (src/direct): browsers reach this relay with a WebRTC data
 // channel on a UDP port the router forwards, found through the DNS relay
 // directory, with no cloud relay in the way. Needs node-datachannel 0.33+.
 let directRelay = null;
+// On exit, withdraw from the directory and remove the router's port forwards.
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.once(signal, async () => {
+    await Promise.all([directRelay?.stop().catch(() => {}), openPortMapping?.close().catch(() => {})]);
+    process.exit(0);
+  });
+}
 if (!isOff(process.env.FREERTC_DIRECT)) {
   // Set up in the background: asking the router takes a few seconds and the
   // relay serves its own address meanwhile.
-  for (const signal of ['SIGINT', 'SIGTERM']) {
-    process.once(signal, async () => {
-      await directRelay?.stop().catch(() => {});
-      process.exit(0);
-    });
-  }
   (async () => {
   const { startDirectRelay } = await import('../src/direct/node-relay-direct.js');
   // The identity signs the directory entry. A relay that does not federate is
@@ -433,4 +498,9 @@ server.listen(PORT, HOST, () => {
   console.log(`[node-relay] federation: ${federationNote}; data in ${DATA_DIR}`);
   console.log(`[node-relay] punched connections: ${PUNCH ? `on (POST ${PUNCH_OFFER_PATH})` : (isOff(process.env.FREERTC_PUNCH) ? 'off (FREERTC_PUNCH=off)' : 'off: no WebRTC here (npm install werift)')}`);
   heartbeat();
+  if (tunneling) {
+    (OPEN_PORT ? openPublicPort() : Promise.resolve(false))
+      .catch((error) => { console.log(`[node-relay:open-port] ${error?.message || error}; using a tunnel`); return false; })
+      .then((open) => (open ? null : openTunnel()));
+  }
 });

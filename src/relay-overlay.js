@@ -1,3 +1,4 @@
+import { relayFetch } from './relay-fetch.js';
 import {
   DEFAULT_K_BUCKET_SIZE,
   DEFAULT_LOOKUP_ALPHA,
@@ -365,7 +366,7 @@ async function postRpc(relayUrl, path, body) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), RPC_TIMEOUT_MS);
   try {
-    const response = await fetch(`${relayHttpBase(relayUrl)}${path}`, {
+    const response = await relayFetch(`${relayHttpBase(relayUrl)}${path}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
