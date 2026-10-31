@@ -1052,8 +1052,14 @@ async function findFederatedPeers(
     for (const provider of providers) {
       if (provider?.url && provider?.node_id) nodeIdByUrl.set(provider.url, provider.node_id);
     }
-    remoteUrls = [...new Set(providers.map((provider) => provider.url))]
-      .filter((relayUrl) => relayUrl !== selfRelayUrl);
+    // Relays this one is linked to directly (node-relay: punched channels or
+    // the LAN) are always asked too. The room's provider records live on the
+    // relays closest to the room in the overlay, often cloud relays; when
+    // those are out of requests, linked local relays still find each other's
+    // peers.
+    const linked = typeof env.LINKED_RELAY_URLS === 'function' ? env.LINKED_RELAY_URLS() : [];
+    remoteUrls = [...new Set([...providers.map((provider) => provider.url), ...linked])]
+      .filter((relayUrl) => relayUrl && relayUrl !== selfRelayUrl);
   } else {
     const allRelays = await listRelays(env.DB);
     remoteUrls = allRelays.map((relay) => relay.url).filter((relayUrl) => relayUrl !== selfRelayUrl);

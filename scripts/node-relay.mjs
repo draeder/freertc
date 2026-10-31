@@ -381,6 +381,7 @@ if (LINKS) {
     log: (line) => console.log(`[node-relay:links] ${line}`),
   });
   globalThis.fetch = relayLinks.wrapFetch(directFetch);
+  env.LINKED_RELAY_URLS = () => relayLinks.linkedRelayUrls();
   setTimeout(() => relayLinks.maintain().catch(() => {}), 5_000).unref();
   const lanHost = !['127.0.0.1', 'localhost', '::1'].includes(HOST);
   if (!isOff(process.env.FREERTC_LAN) && lanHost && hasLanAddress()) {

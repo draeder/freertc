@@ -134,6 +134,7 @@ export function createRelayLinks({
         const existing = links.get(record.node_id);
         if (existing?.open) { log(`already linked to ${record.node_id.slice(0, 8)}; closing the second link`); link.close(); return; }
         peerNodeId = record.node_id;
+        link.url = typeof record.url === 'string' ? record.url : null;
         links.set(peerNodeId, link);
         log(`linked to ${peerNodeId.slice(0, 8)} over ${via}`);
         return;
@@ -200,6 +201,8 @@ export function createRelayLinks({
 
   return {
     links,
+    /** The federation URLs of the relays this one is linked to right now. */
+    linkedRelayUrls: () => [...links.values()].filter((link) => link.open && link.url).map((link) => link.url),
     accept: (socket, options) => attach(socket, options),
     maintain,
     /** A relay on the LAN announced itself: link to it there (lower node ID dials). */
