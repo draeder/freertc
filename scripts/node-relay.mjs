@@ -65,23 +65,42 @@ import { createRelayIdentity, createSignedNodeRecord, decodeRelayIdentitySecret,
 import { heartbeatKademlia, isPublicRelay, listKnownRelays, relayReachOf } from '../src/relay-overlay.js';
 import { RelayTunnel } from '../src/tunnel/home.js';
 
-// node:sqlite needs --experimental-sqlite before Node 22.13. Turn it on rather than fail.
+// The relay runs as a child of this process, which restarts it when the
+// machine moves to another network (exit code NETWORK_CHANGED_EXIT): a new
+// LAN address, router and public address mean new port forwards, a new
+// directory entry and new federation, which a running relay cannot redo in
+// place. Signals are passed on, so Ctrl-C still stops it; node:sqlite gets
+// --experimental-sqlite where this Node needs it (before 22.13).
+const NETWORK_CHANGED_EXIT = 75;
+if (!process.env.FREERTC_RELAY_CHILD) {
+  const { spawn } = await import('node:child_process');
+  let needsFlag = false;
+  try { await import('node:sqlite'); } catch { needsFlag = !process.execArgv.includes('--experimental-sqlite'); }
+  const args = [...(needsFlag ? ['--experimental-sqlite', '--no-warnings'] : []), ...process.execArgv, fileURLToPath(import.meta.url), ...process.argv.slice(2)];
+  let child = null;
+  let stopping = false;
+  let signalled = 0;
+  const start = () => {
+    child = spawn(process.execPath, args, { stdio: 'inherit', env: { ...process.env, FREERTC_RELAY_CHILD: '1' } });
+    child.on('exit', (code, signal) => {
+      if (!stopping && code === NETWORK_CHANGED_EXIT) {
+        console.log('[node-relay] restarting on the new network');
+        start();
+        return;
+      }
+      process.exit(code ?? (signal ? 1 : 0));
+    });
+  };
+  // A second Ctrl-C ends the child at once, whatever it is doing.
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(signal, () => { stopping = true; signalled += 1; child?.kill(signalled > 1 ? 'SIGKILL' : signal); });
+  }
+  start();
+  await new Promise(() => {});
+}
 try {
   await import('node:sqlite');
 } catch {
-  if (!process.execArgv.includes('--experimental-sqlite')) {
-    // Run this relay again with the flag, as a child that lives and dies with
-    // this process: a signal sent here (Ctrl-C, a test stopping the relay) is
-    // passed on, so the child never outlives it holding the port and the
-    // parent's output.
-    const { spawn } = await import('node:child_process');
-    const child = spawn(process.execPath, ['--experimental-sqlite', '--no-warnings', ...process.execArgv, fileURLToPath(import.meta.url), ...process.argv.slice(2)], { stdio: 'inherit' });
-    // A second Ctrl-C ends the child at once, whatever it is doing.
-    let signalled = 0;
-    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => { signalled += 1; child.kill(signalled > 1 ? 'SIGKILL' : signal); });
-    child.on('exit', (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
-    await new Promise(() => {});
-  }
   console.error('[node-relay] this Node has no node:sqlite; use Node 22.5 or later');
   process.exit(1);
 }
@@ -672,15 +691,41 @@ let directRelay = null;
 // directory that does not answer must not keep it running), and a second
 // Ctrl-C ends it at once.
 let stopping = false;
+let stoppingAt = 0;
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
-    if (stopping) process.kill(process.pid, 'SIGKILL');
+    // Ctrl-C reaches this process twice (from the terminal and passed on by
+    // the parent): only a second press, not the echo, stops it at once.
+    if (stopping && Date.now() - stoppingAt > 500) process.kill(process.pid, 'SIGKILL');
+    if (stopping) return;
     stopping = true;
+    stoppingAt = Date.now();
     console.log('[node-relay] stopping (Ctrl-C again to stop at once)');
     setTimeout(() => process.exit(0), 3_000);
     Promise.all([directRelay?.stop().catch(() => {}), openPortMapping?.close().catch(() => {})])
       .finally(() => process.exit(0));
   });
+}
+// Moved to another network (the machine's IPv4 addresses changed: new
+// Wi-Fi, a hotspot, a VPN): clean up as on Ctrl-C and exit with
+// NETWORK_CHANGED_EXIT, and the parent starts the relay again, which redoes
+// the port forwards, the directory entry and federation for the new network.
+if (process.env.FREERTC_RELAY_CHILD) {
+  const { networkInterfaces } = await import('node:os');
+  const addresses = () => Object.values(networkInterfaces()).flat()
+    .filter((entry) => entry && !entry.internal && entry.family === 'IPv4' && !entry.address.startsWith('169.254.'))
+    .map((entry) => entry.address).sort().join(',');
+  const startedOn = addresses();
+  setInterval(() => {
+    const now = addresses();
+    if (now === startedOn || stopping) return;
+    stopping = true;
+    stoppingAt = Date.now();
+    console.log(`[node-relay] the network changed (${startedOn || 'none'} -> ${now || 'none'}); restarting`);
+    setTimeout(() => process.exit(NETWORK_CHANGED_EXIT), 3_000);
+    Promise.all([directRelay?.stop().catch(() => {}), openPortMapping?.close().catch(() => {})])
+      .finally(() => process.exit(NETWORK_CHANGED_EXIT));
+  }, 10_000).unref();
 }
 if (!isOff(process.env.FREERTC_DIRECT)) {
   // Set up in the background: asking the router takes a few seconds and the
