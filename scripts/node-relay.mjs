@@ -242,6 +242,34 @@ const server = TLS
   : createServer(handler);
 
 const wss = new WebSocketServer({ noServer: true });
+
+// A peer that vanishes without closing (a killed process, a sleeping laptop,
+// a router that drops the connection) leaves a socket the system may not
+// report closed for minutes, and the relay kept counting and routing to it.
+// Ping every socket; one that has not answered within LIVENESS_TIMEOUT_MS is
+// closed, which removes the peer from its room at once.
+const LIVENESS_PING_MS = 15_000;
+const LIVENESS_TIMEOUT_MS = 30_000;
+const watchedSockets = new Set();
+function watchLiveness(ws) {
+  ws.lastHeardAt = Date.now();
+  const heard = () => { ws.lastHeardAt = Date.now(); };
+  ws.on('pong', heard);
+  ws.on('message', heard);
+  ws.on('close', () => watchedSockets.delete(ws));
+  watchedSockets.add(ws);
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const ws of watchedSockets) {
+    if (now - ws.lastHeardAt > LIVENESS_TIMEOUT_MS) {
+      watchedSockets.delete(ws);
+      try { ws.terminate(); } catch {}
+      continue;
+    }
+    try { ws.ping(); } catch {}
+  }
+}, LIVENESS_PING_MS).unref();
 server.on('upgrade', async (req, socket, head) => {
   try {
     if (new URL(req.url, 'http://x').pathname === LINK_PATH) {
@@ -258,6 +286,7 @@ server.on('upgrade', async (req, socket, head) => {
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
       ws.on('message', (data) => meter.wsMessage(data));
+      watchLiveness(ws);
       serverSocket.attach(ws);
     });
   } catch (error) {

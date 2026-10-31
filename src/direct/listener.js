@@ -146,10 +146,14 @@ export async function startDirectListener({
       try { pc.close(); } catch {}
     }, OPEN_TIMEOUT_MS);
 
+    let socket = null;
     pc.onStateChange((state) => {
-      if (state === 'failed' || state === 'closed') {
+      // 'disconnected' too: a browser that vanished (tab killed, laptop asleep)
+      // closes nothing, and its socket would otherwise stay counted.
+      if (state === 'failed' || state === 'closed' || state === 'disconnected') {
         clearTimeout(timer);
         forget();
+        socket?.finish();
       }
     });
     pc.onDataChannel((channel) => {
@@ -160,7 +164,7 @@ export async function startDirectListener({
         try { pc.close(); } catch {}
         return;
       }
-      const socket = new DirectChannelSocket(channel, pc);
+      socket = new DirectChannelSocket(channel, pc);
       open += 1;
       accepted += 1;
       socket.on('close', () => { open -= 1; });
