@@ -232,6 +232,11 @@ const handler = async (req, res) => {
     const response = await worker.fetch(toRequest(req, chunks.length ? Buffer.concat(chunks) : undefined), env, ctx);
     await writeResponse(res, response);
   } catch (error) {
+    // A client that hung up mid-request is not a relay error: count it.
+    if (error?.message === 'aborted' || error?.code === 'ECONNRESET') {
+      noteTrouble('requests the client abandoned');
+      return;
+    }
     console.error('[node-relay] request failed:', error?.stack || error);
     if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: false, error: 'Relay error' }));
