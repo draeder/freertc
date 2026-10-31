@@ -1,7 +1,7 @@
-import { isDirectRelayUrl } from './direct/common.js'
+import { directRelayLan, isDirectRelayUrl } from './direct/common.js'
 import { directRelayChannel } from './direct/dial.js'
 export { directRelayChannel }
-export { isDirectRelayUrl, parseDirectRelayUrl } from './direct/common.js'
+export { isDirectRelayUrl, parseDirectRelayUrl, directoryRecordUrl, directRelayLan } from './direct/common.js'
 export { lookupDirectRelays, DEFAULT_DIRECTORY_NAME } from './direct/lookup.js'
 // Backoff config for reconnect
 const BACKOFF_BASE_MS = 1000
@@ -419,7 +419,7 @@ function openDirectRelaySocket(relayUrl, { WebSocketImpl, PeerConnection, log })
     inner.onclose = (event) => { socket.readyState = SOCKET_CLOSED; socket.onclose?.(event) }
   }
 
-  directRelayChannel(directUrl, { PeerConnection })
+  directRelayChannel(directUrl, { PeerConnection, lan: directRelayLan(relayUrl) })
     .then((opened) => {
       if (closedByUser) { try { opened.channel.close() } catch {} try { opened.pc.close() } catch {} return }
       ;({ pc, channel } = opened)

@@ -3,7 +3,7 @@
 // The browser's own offer is used exactly as created; only the relay's answer
 // is written here.
 
-import { DIRECT_CHANNEL_LABEL, directAnswerSdp, parseDirectRelayUrl, relayIceCredentialFor } from './common.js';
+import { DIRECT_CHANNEL_LABEL, directAnswerSdp, directRelayLan, parseDirectRelayUrl, relayIceCredentialFor } from './common.js';
 
 export const DIRECT_OPEN_TIMEOUT_MS = 5_000;
 
@@ -12,8 +12,9 @@ export async function directRelayChannel(url, {
   PeerConnection = globalThis.RTCPeerConnection,
   timeoutMs = DIRECT_OPEN_TIMEOUT_MS,
   label = DIRECT_CHANNEL_LABEL,
+  lan = directRelayLan(url),
 } = {}) {
-  const target = parseDirectRelayUrl(url);
+  const target = parseDirectRelayUrl(String(url).split('?')[0]);
   if (!target) throw new TypeError(`not a direct relay URL: ${url}`);
   if (typeof PeerConnection !== 'function') throw new Error('WebRTC is not available here');
 
@@ -34,7 +35,7 @@ export async function directRelayChannel(url, {
     const ufrag = /a=ice-ufrag:(\S+)/.exec(sdp)?.[1];
     const pwd = /a=ice-pwd:(\S+)/.exec(sdp)?.[1];
     if (!ufrag || !pwd) throw new Error('offer has no ICE credentials');
-    await pc.setRemoteDescription({ type: 'answer', sdp: directAnswerSdp(target, relayIceCredentialFor(ufrag, pwd)) });
+    await pc.setRemoteDescription({ type: 'answer', sdp: directAnswerSdp(target, relayIceCredentialFor(ufrag, pwd), lan) });
     await opened;
     return { pc, channel };
   } catch (error) {

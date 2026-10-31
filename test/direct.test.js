@@ -7,7 +7,7 @@ import path from 'node:path';
 import { generateRandomPair } from 'unsea';
 import { createRelayIdentity } from '../src/relay-identity.js';
 import {
-  directAnswerSdp, directRelayUrl, isDirectRelayUrl, parseDirectRelayUrl, parseRelayIceCredential, relayIceCredentialFor,
+  directAnswerSdp, directRelayUrl, directRelayLan, directoryRecordUrl, isDirectRelayUrl, parseDirectRelayUrl, parseRelayIceCredential, relayIceCredentialFor,
 } from '../src/direct/common.js';
 import {
   createSignedDirectoryRecord, createSignedWithdrawal, decodeDirectoryTxt, encodeDirectoryTxt, verifyDirectoryRecord,
@@ -59,6 +59,25 @@ test('directory records are signed, bound to their relay, and expire', async () 
   await assert.rejects(createSignedDirectoryRecord(id, { direct, tunnel: `wss://peer.ooo/t/${other.nodeId}/ws` }), /own tunnel/);
   const stolenKey = { ...record, public_key: other.publicKey };
   assert.equal(await verifyDirectoryRecord(stolenKey), false, 'node id must be the hash of the key');
+});
+
+test('a record can carry the relay\'s LAN addresses, and the client tries them too', async () => {
+  const id = await identity();
+  const direct = directRelayUrl({ host: '203.0.113.7', port: 9443, fingerprint: FP });
+  const tunnel = `wss://peer.ooo/t/${id.nodeId}/ws`;
+  const record = await createSignedDirectoryRecord(id, { direct, tunnel, lan: ['192.168.50.20:9443', '8.8.8.8:9443', '10.0.0.5:9443'] });
+  assert.deepEqual(record.lan, ['192.168.50.20:9443', '10.0.0.5:9443'], 'public addresses are not LAN addresses');
+  assert.equal(await verifyDirectoryRecord(record), true);
+  assert.equal(await verifyDirectoryRecord({ ...record, lan: ['192.168.50.21:9443', '10.0.0.5:9443'] }), false, 'lan is signed');
+  const none = await createSignedDirectoryRecord(id, { direct, tunnel });
+  assert.equal('lan' in none, false, 'no lan field when there is none');
+  const url = directoryRecordUrl(record);
+  assert.deepEqual(directRelayLan(url), ['192.168.50.20:9443', '10.0.0.5:9443']);
+  assert.equal(new URLSearchParams(url.split('?')[1]).get('tunnel'), tunnel);
+  const sdp = directAnswerSdp(parseDirectRelayUrl(direct), relayIceCredentialFor('aB3d', 'x'.repeat(22)), directRelayLan(url));
+  assert.match(sdp, /a=candidate:1 1 UDP 2130706431 203\.0\.113\.7 9443 typ host/);
+  assert.match(sdp, /a=candidate:2 1 UDP 2130706430 192\.168\.50\.20 9443 typ host/);
+  assert.match(sdp, /a=candidate:3 1 UDP 2130706430 10\.0\.0\.5 9443 typ host/);
 });
 
 test('directory TXT encoding round-trips in 255-character strings', async () => {
@@ -207,5 +226,6 @@ test('a WebRTC client connects to the direct listener with no signaling', async 
   const result = JSON.parse(output.trim().split('\n').pop());
   assert.equal(result.error, undefined, result.error);
   assert.equal(result.reply, 'echo:hello');
+  assert.equal(result.viaLan, 'echo:lan', 'reached through its LAN address when the public one does not answer');
   assert.match(result.wrongFingerprint, /^refused/, 'a wrong fingerprint is refused');
 });

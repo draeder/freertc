@@ -14,6 +14,19 @@ import { mapUdpPort, isNonPublicIPv4 } from './portmap.js';
 import { directRelayUrl } from './common.js';
 import { createSignedDirectoryRecord, createSignedWithdrawal } from './record.js';
 import { DIRECTORY_PATH } from './directory.js';
+import { networkInterfaces } from 'node:os';
+import { isLanEndpoint } from './record.js';
+
+/** This machine's private IPv4 addresses with the relay's own UDP port, "ip:port". */
+function lanEndpoints(port) {
+  const out = [];
+  for (const entry of Object.values(networkInterfaces()).flat()) {
+    if (!entry || entry.internal || entry.family !== 'IPv4') continue;
+    const endpoint = `${entry.address}:${port}`;
+    if (isLanEndpoint(endpoint) && !out.includes(endpoint)) out.push(endpoint);
+  }
+  return out.slice(0, 4);
+}
 
 const REPUBLISH_MS = 30 * 60_000;
 
@@ -71,6 +84,9 @@ export async function startDirectRelay({
       direct: directRelayUrl({ host: externalIp, port: externalPort, fingerprint: cert.fingerprint }),
       tunnel: tunnelUrl() || null,
       name,
+      // The port the relay listens on (the router may forward a different
+      // public one): machines on this network use these, not the public address.
+      lan: lanEndpoints(port),
     });
     try {
       const response = await fetchImpl(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(record) });
@@ -81,7 +97,7 @@ export async function startDirectRelay({
         if (body?.seen && body.seen !== externalIp) externalIp = null; // a second NAT: stop trying
         return;
       }
-      if (body.published) log(`directory: listed as ${record.direct}`);
+      if (body.published) log(`directory: listed as ${record.direct}${record.lan ? ` (on this network: ${record.lan.join(', ')})` : ''}`);
       published = record;
     } catch (error) {
       log(`directory: ${error?.message || error}`);

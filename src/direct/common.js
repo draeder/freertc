@@ -66,6 +66,25 @@ export function parseDirectRelayUrl(value) {
   return { host, port, fingerprint: m[4].toLowerCase(), family: m[1] ? 6 : 4 };
 }
 
+/** The relay's LAN addresses ("ip:port") in a direct relay URL's ?lan= (comma-separated). */
+export function directRelayLan(url) {
+  const query = String(url || '').split('?')[1] || '';
+  const value = new URLSearchParams(query).get('lan') || '';
+  return value.split(',').map((part) => part.trim()).filter((part) => /^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$/.test(part)).slice(0, 4);
+}
+
+/**
+ * The URL a client uses for a directory record:
+ * webrtc-direct://…[?lan=<ip:port,…>][&tunnel=<tunnel URL>].
+ */
+export function directoryRecordUrl(record) {
+  const params = new URLSearchParams();
+  if (Array.isArray(record?.lan) && record.lan.length) params.set('lan', record.lan.join(','));
+  if (record?.tunnel) params.set('tunnel', record.tunnel);
+  const query = params.toString();
+  return query ? `${record.direct}?${query}` : record.direct;
+}
+
 export function isDirectRelayUrl(value) {
   return parseDirectRelayUrl(value) !== null;
 }
@@ -93,8 +112,15 @@ export function parseRelayIceCredential(value) {
   return { ufrag, pwd };
 }
 
-/** The relay's answer, written by the browser. */
-export function directAnswerSdp({ host, port, fingerprint, family }, credential) {
+/** The relay's answer, written by the browser. lan: more "ip:port" addresses of the relay to try. */
+export function directAnswerSdp({ host, port, fingerprint, family }, credential, lan = []) {
+  // A machine on the relay's own network seldom reaches the relay at its
+  // public address (few routers loop it back), so its LAN addresses are
+  // candidates too; ICE uses whichever answers.
+  const extra = (lan || []).map((endpoint, index) => {
+    const m = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/.exec(String(endpoint));
+    return m && family !== 6 ? `a=candidate:${index + 2} 1 UDP 2130706430 ${m[1]} ${m[2]} typ host` : null;
+  }).filter(Boolean);
   const ipVersion = family === 6 ? 'IP6' : 'IP4';
   return [
     'v=0',
@@ -113,6 +139,7 @@ export function directAnswerSdp({ host, port, fingerprint, family }, credential)
     'a=sctp-port:5000',
     'a=max-message-size:262144',
     `a=candidate:1 1 UDP 2130706431 ${host} ${port} typ host`,
+    ...extra,
     'a=end-of-candidates',
     '',
   ].join('\r\n');

@@ -21,6 +21,11 @@ try {
   const { pc, channel } = await directRelayChannel(directRelayUrl({ host: '127.0.0.1', port, fingerprint: cert.fingerprint }), { PeerConnection: RTCPeerConnection });
   out.reply = await new Promise((resolve) => { channel.onmessage = (e) => resolve(String(e.data)); channel.send('hello'); });
   pc.close();
+  // The public address does not answer (as from inside the relay's own
+  // network): the LAN address in ?lan= does.
+  const viaLan = await directRelayChannel(`${directRelayUrl({ host: '192.0.2.200', port, fingerprint: cert.fingerprint })}?lan=127.0.0.1:${port}`, { PeerConnection: RTCPeerConnection, timeoutMs: 8000 });
+  out.viaLan = await new Promise((resolve) => { viaLan.channel.onmessage = (e) => resolve(String(e.data)); viaLan.channel.send('lan'); });
+  viaLan.pc.close();
   try {
     await directRelayChannel(directRelayUrl({ host: '127.0.0.1', port, fingerprint: 'b'.repeat(64) }), { PeerConnection: RTCPeerConnection, timeoutMs: 3000 });
     out.wrongFingerprint = 'connected';
