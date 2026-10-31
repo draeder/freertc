@@ -1249,26 +1249,33 @@ const PEER_LIST_SIZE = MAX_BATCH;
 // How many registrations are read to choose from.
 const PEER_SCAN_LIMIT = 1000;
 
-function xorCompare(a, b, target) {
-  const hex = /^[0-9a-f]+$/i;
-  if (!hex.test(a) || !hex.test(b) || !hex.test(target)) return a < b ? -1 : a > b ? 1 : 0;
-  const n = Math.max(a.length, b.length);
-  for (let i = 0; i < n; i += 1) {
-    const t = parseInt(target[i] ?? '0', 16);
-    const da = parseInt(a[i] ?? '0', 16) ^ t;
-    const db = parseInt(b[i] ?? '0', 16) ^ t;
-    if (da !== db) return da - db;
+// Each id's first 64 bits as a number, cached: comparing by XOR on these is
+// enough to order peers and costs a fraction of comparing hex digit by digit.
+const idKeys = new Map();
+function idKey(id) {
+  let key = idKeys.get(id);
+  if (key === undefined) {
+    const hex = String(id).toLowerCase().slice(0, 16);
+    key = /^[0-9a-f]{16}$/.test(hex) ? BigInt(`0x${hex}`) : null;
+    if (idKeys.size > 20_000) idKeys.clear();
+    idKeys.set(id, key);
   }
-  return 0;
+  return key;
 }
 
 export function peersNearest(peers, forPeerId, limit = PEER_LIST_SIZE) {
-  if (!Array.isArray(peers) || peers.length <= limit || !forPeerId) return Array.isArray(peers) ? peers.slice(0, limit) : [];
-  const target = String(forPeerId).toLowerCase();
-  return peers
-    .filter((peer) => peer?.peer_id !== forPeerId)
-    .sort((a, b) => xorCompare(String(a.peer_id).toLowerCase(), String(b.peer_id).toLowerCase(), target))
-    .slice(0, limit);
+  if (!Array.isArray(peers)) return [];
+  if (peers.length <= limit || !forPeerId) return peers.length <= limit ? peers : peers.slice(0, limit);
+  const target = idKey(forPeerId);
+  if (target === null) return peers.slice(0, limit);
+  const scored = [];
+  for (const peer of peers) {
+    if (peer?.peer_id === forPeerId) continue;
+    const key = idKey(peer?.peer_id);
+    scored.push({ peer, distance: key === null ? (1n << 64n) : key ^ target });
+  }
+  scored.sort((a, b) => (a.distance < b.distance ? -1 : a.distance > b.distance ? 1 : 0));
+  return scored.slice(0, limit).map((entry) => entry.peer);
 }
 
 // Which peer each subscribed socket belongs to, so a room-wide list can be
