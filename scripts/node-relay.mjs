@@ -281,6 +281,7 @@ server.on('upgrade', async (req, socket, head) => {
     const response = await worker.fetch(toRequest(req), env, ctx);
     const serverSocket = serverSocketOf(response);
     if (!serverSocket) {
+      noteTrouble(`upgrades refused (${response.status})`);
       socket.end(`HTTP/1.1 ${response.status} ${response.statusText || 'Error'}\r\nConnection: close\r\n\r\n`);
       return;
     }
@@ -290,6 +291,7 @@ server.on('upgrade', async (req, socket, head) => {
       serverSocket.attach(ws);
     });
   } catch (error) {
+    noteTrouble('upgrades failed');
     console.error('[node-relay] upgrade failed:', error?.stack || error);
     socket.destroy();
   }
@@ -475,7 +477,25 @@ if (federating) setInterval(heartbeat, 2 * 60_000).unref();
 
 // One line a minute instead of one per message passed on (FREERTC_VERBOSE=1
 // for every message).
+// How busy the relay is: the longest it took to get back to its event loop
+// this minute (a relay that stalls cannot accept connections), and
+// connections that failed before or during the upgrade.
+let maxLoopLagMs = 0;
+let lastLoopTick = Date.now();
+setInterval(() => {
+  const now = Date.now();
+  maxLoopLagMs = Math.max(maxLoopLagMs, now - lastLoopTick - 100);
+  lastLoopTick = now;
+}, 100).unref();
+const connectionTrouble = new Map();
+const noteTrouble = (what) => connectionTrouble.set(what, (connectionTrouble.get(what) ?? 0) + 1);
+
 setInterval(async () => {
+  const lag = maxLoopLagMs;
+  maxLoopLagMs = 0;
+  for (const [what, count] of connectionTrouble) relayLogCounts.set(what, count);
+  connectionTrouble.clear();
+  if (lag > 1_000) relayLogCounts.set(`ms longest stall`, lag);
   if (!relayLogCounts?.size) return;
   const parts = [...relayLogCounts].map(([what, count]) => `${count} ${what}`);
   relayLogCounts.clear();
@@ -533,6 +553,11 @@ if (process.env.PUNCH_RENDEZVOUS_URL) {
   console.log(`[node-relay] accepting punched connections as ${listenerId}`);
 }
 
+server.on('clientError', (error, socket) => {
+  noteTrouble(`connection errors (${error?.code || 'client'})`);
+  try { socket.destroy(); } catch {}
+});
+server.on('error', (error) => noteTrouble(`server errors (${error?.code || 'unknown'})`));
 server.listen(PORT, HOST, () => {
   console.log(`[node-relay] ${env.RELAY_NAME} on ${TLS ? 'https' : 'http'}://${HOST}:${PORT} (relay ${env.RELAY_URL})`);
   console.log(`[node-relay] federation: ${federationNote}; data in ${DATA_DIR}`);
