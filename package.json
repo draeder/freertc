@@ -83,7 +83,7 @@
   "optionalDependencies": {
     "node-datachannel": "^0.33.4",
     "werift": "^0.24.4",
-    "pigeonidp": "https://codeload.github.com/PeerPigeon/PigeonIdP/tar.gz/e2cb00da70af87b15e660a80d2dae474f294b76e"
+    "pigeonidp": "https://codeload.github.com/PeerPigeon/PigeonIdP/tar.gz/4c18a43d150167c5a15b1bbe2cc9d7a8dcd3b5b1"
   },
   "devDependencies": {
     "wrangler": "^4.123.0"

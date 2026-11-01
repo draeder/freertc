@@ -18,9 +18,9 @@ try { records = await import('pigeonidp/records'); } catch { /* not installed: s
 const SERVER = fileURLToPath(new URL('../scripts/node-relay.mjs', import.meta.url));
 const PORT = 18_900 + Math.floor(Math.random() * 90);
 
-async function startRelay(dataDir, extraEnv = {}) {
+async function startRelay(dataDir, extraEnv = {}, port = PORT) {
   const child = spawn(process.execPath, [SERVER], {
-    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', FREERTC_FEDERATION: 'off', FREERTC_DIRECT: 'off', FREERTC_PUNCH: 'off', FREERTC_DATA_DIR: dataDir, ...extraEnv },
+    env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', FREERTC_FEDERATION: 'off', FREERTC_DIRECT: 'off', FREERTC_PUNCH: 'off', FREERTC_DATA_DIR: dataDir, ...extraEnv },
     stdio: ['ignore', 'pipe', 'inherit'],
   });
   let output = '';
@@ -42,14 +42,14 @@ async function stopRelay(relay) {
   await exited;
 }
 
-async function registeredClient() {
+async function registeredClient(port = PORT) {
   const original = globalThis.WebSocket;
   globalThis.WebSocket = WebSocket;
   const client = createSignalingClient({
     peerId: Array.from({ length: 64 }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join(''),
     networkId: 'pigeonchess',
     roomId: 'global',
-    signalUrl: `ws://127.0.0.1:${PORT}/ws`,
+    signalUrl: `ws://127.0.0.1:${port}/ws`,
     autoConnect: false,
   });
   client.connect()
@@ -97,5 +97,43 @@ test('with FREERTC_IDP=off the relay answers account requests as unsupported', a
   } finally {
     client.disconnect();
     await stopRelay(relay);
+  }
+});
+
+test('local relays share accounts with each other', { skip: !records && 'pigeonidp not installed' }, async () => {
+  const portA = PORT + 100;
+  const portB = PORT + 101;
+  const mesh = { FREERTC_FEDERATION: 'on', FREERTC_PUBLIC: 'false', FREERTC_TUNNEL: 'off', FREERTC_LINKS: 'off', FREERTC_LAN: 'off' };
+  const a = await startRelay(mkdtempSync(path.join(tmpdir(), 'freertc-accounts-a-')), { ...mesh, RELAY_URL: `ws://127.0.0.1:${portA}/ws` }, portA);
+  const b = await startRelay(mkdtempSync(path.join(tmpdir(), 'freertc-accounts-b-')), { ...mesh, RELAY_URL: `ws://127.0.0.1:${portB}/ws`, KADEMLIA_BOOTSTRAP_URLS: `ws://127.0.0.1:${portA}/ws` }, portB);
+  const knows = async (port, other) => {
+    const list = await fetch(`http://127.0.0.1:${port}/api/v1/relays`).then((r) => r.json()).catch(() => null);
+    return JSON.stringify(list ?? '').includes(`127.0.0.1:${other}`);
+  };
+  for (let i = 0; i < 60 && !(await knows(portA, portB) && await knows(portB, portA)); i++) await new Promise((r) => setTimeout(r, 500));
+  const clientA = await registeredClient(portA);
+  const clientB = await registeredClient(portB);
+  try {
+    const keys = await generateRandomPair();
+    const record = await records.createAccountRecord({ alias: 'Pat', namespace: 'pigeon-chess', keys, password: 'Correct-Horse-9' });
+    assert.deepEqual(await clientA.relayRequest({ action: 'idp-put', record }), { ok: true, stored: true });
+    let found = null;
+    for (let i = 0; i < 20 && !found; i++) {
+      found = (await clientB.relayRequest({ action: 'idp-get', namespace: 'pigeon-chess', alias: 'pat' })).record;
+      if (!found) await new Promise((r) => setTimeout(r, 250));
+    }
+    assert.equal(found?.pub, keys.pub, 'the other local relay has it');
+
+    const thief = await generateRandomPair();
+    const stolen = await records.createAccountRecord({ alias: 'Pat', namespace: 'pigeon-chess', keys: thief, password: 'x' });
+    assert.deepEqual(await clientB.relayRequest({ action: 'idp-put', record: stolen }), { ok: false, error: 'taken' });
+
+    const viaHttp = await fetch(`http://127.0.0.1:${portB}/api/v1/idp`, { method: 'POST', body: JSON.stringify({ action: 'idp-get', namespace: 'pigeon-chess', alias: 'PAT' }) }).then((r) => r.json());
+    assert.equal(viaHttp.record?.pub, keys.pub);
+  } finally {
+    clientA.disconnect();
+    clientB.disconnect();
+    await stopRelay(a);
+    await stopRelay(b);
   }
 });

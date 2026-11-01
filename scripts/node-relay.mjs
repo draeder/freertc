@@ -40,7 +40,8 @@
 //                              needs WebRTC (the optional werift dependency)
 //   RELAY_KIND                 local (default) | cloud — what this relay tells clients it is
 //   FREERTC_IDP                on (default) | off — keep PigeonIdP accounts for the browsers on this
-//                              relay, in <data dir>/identities.json (needs the pigeonidp package)
+//                              relay, in <data dir>/identities.json (needs the pigeonidp package),
+//                              shared with the other local relays it federates with
 //   FREERTC_LINKS              on (default) | off — link to other local relays (punched data
 //                              channels, or the LAN) and send federation calls to them over the
 //                              link instead of out through a cloud tunnel home
@@ -241,6 +242,15 @@ if (!isOff(process.env.FREERTC_IDP)) {
     const store = await createRelayIdentityStore({
       dataDir: DATA_DIR,
       log: (line) => console.log(`[node-relay:accounts] ${line}`),
+      // Shared with the other local relays this one federates with (never
+      // the cloud relays): their POST /api/v1/idp. Looked up on each use, as
+      // federation comes up after this; fetch is the relay's own, so linked
+      // relays are reached over their link.
+      otherRelays: federating
+        ? async () => (await listKnownRelays(env, env.RELAY_URL).catch(() => []))
+          .filter((relay) => relay.relay_kind === 'local' && relay.url && relay.url !== env.RELAY_URL)
+          .map((relay) => relay.url.replace(/^ws(s?):\/\//, 'http$1://').replace(/\/ws$/, ''))
+        : null,
     });
     env.RELAY_REQUEST_HANDLER = (body) => store.handle(body);
     console.log(`[node-relay] accounts: kept for browsers on this relay in ${path.relative(process.cwd(), store.file) || store.file} (${store.size()} so far)`);

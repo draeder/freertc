@@ -681,6 +681,25 @@ async function handleFetch(request, env, ctx) {
       return jsonResponse({ ok: false, error: "Method not allowed" }, 405);
     }
 
+    // Accounts shared between local relays (pigeonidp/relay): another relay
+    // asking this one's account store. Records are signed by their owners, so
+    // the store checks them itself; a relay without one says unsupported.
+    if (url.pathname === "/api/v1/idp") {
+      if (request.method !== "POST") return jsonResponse({ ok: false, error: "Method not allowed" }, 405);
+      if (typeof env.RELAY_REQUEST_HANDLER !== "function") return jsonResponse({ ok: false, error: "unsupported" }, 200);
+      const text = await request.text().catch(() => "");
+      if (text.length > 64 * 1024) return jsonResponse({ ok: false, error: "too large" }, 413);
+      let body = null;
+      try { body = JSON.parse(text); } catch { /* answered below */ }
+      if (!body || (body.action !== "idp-get" && body.action !== "idp-put")) return jsonResponse({ ok: false, error: "unsupported" }, 200);
+      try {
+        const result = await env.RELAY_REQUEST_HANDLER({ ...body, from_relay: true }, { fromRelay: true });
+        return jsonResponse(result ?? { ok: false, error: "unsupported" }, 200);
+      } catch (error) {
+        return jsonResponse({ ok: false, error: String(error?.message || error).slice(0, 200) }, 200);
+      }
+    }
+
     if (url.pathname === "/api/v1/peers") {
       if (request.method === "GET") {
         return handleListPeers(request, env);
@@ -1744,7 +1763,7 @@ async function handleClientMessage(
       let result = null;
       if (typeof env.RELAY_REQUEST_HANDLER === "function") {
         try {
-          result = await env.RELAY_REQUEST_HANDLER(message.body, { peerId, network, room });
+          result = await env.RELAY_REQUEST_HANDLER({ ...message.body, from_relay: false }, { peerId, network, room });
         } catch (error) {
           result = { ok: false, error: String(error?.message || error).slice(0, 200) };
         }
