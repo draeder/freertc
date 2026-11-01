@@ -8,6 +8,20 @@ const BACKOFF_BASE_MS = 1000
 const BACKOFF_MAX_MS = 30000
 const BACKOFF_FACTOR = 1.5
 const DATA_PING_MS = 1000
+// Relayed links (see createSignalingClient): WebRTC failures before a pair
+// links through the relay, how often its keepalive crosses the relay, and
+// how its link request is repeated.
+const RELAYED_LINK_AFTER_FAILURES = 2
+const RELAYED_LINK_PING_MS = 5000
+const RELAYED_LINK_ASK_MS = 3000
+const RELAYED_LINK_ASKS = 4
+const RELAYED_LINK_TTL_MS = 10000
+// A WebRTC attempt closed after this long without opening counts as failed.
+const RELAYED_LINK_STALL_MS = 8000
+const RELAYED_LINK_OPEN = 'link-open'
+const RELAYED_LINK_ACCEPT = 'link-accept'
+const RELAYED_LINK_DATA = 'link-data'
+const RELAYED_LINK_CLOSE = 'link-close'
 // Twenty seconds, not four. A pong can sit behind the peer's own outbound
 // burst — the GitPigeon index sync moves megabytes in both directions the
 // moment two peers meet, and werift's SCTP is slow — and four seconds
@@ -567,6 +581,12 @@ export function createSignalingClient(options = {}) {
     relay: relayOptions = {},
     // Called with { state: 'up' | 'idle' | 'waking', ts } as the relay socket is released and woken.
     onRelayStateChange,
+    // Two peers that cannot reach each other over WebRTC (a router that does
+    // not loop UDP back, Safari offering only its public address, carrier
+    // NAT) can carry their link through the relay instead: 'local' (the
+    // default) does so only while this peer is on a local relay, which costs
+    // nothing per message; 'always' also on a cloud relay; false never.
+    relayedLinks: relayedLinksOption = 'local',
   } = options
 
   const roomId = configuredRoomId || legacyRoomId || networkId
@@ -715,6 +735,223 @@ export function createSignalingClient(options = {}) {
     try {
       onNegotiationFailure?.({ ...details, ts: Date.now() })
     } catch {}
+  }
+
+  // ── Relayed links ─────────────────────────────────────────────────────────
+  // Some pairs never connect over WebRTC without a TURN server: two Safari
+  // tabs behind a router that does not loop UDP back to itself (Safari offers
+  // only its public address), or a phone behind carrier NAT. After a pair has
+  // failed twice, the dialer asks for a relayed link instead: an object that
+  // looks like an open data channel to everything above it, whose frames
+  // travel as `ext` messages through the relay both peers are on. The relay
+  // already forwards these between its peers and to the relays it federates
+  // with, exactly as it forwards offers.
+  const linkFailures = new Map()   // peer id -> failed WebRTC attempts in a row
+  const dialAttempts = new Map()   // peer id -> when the open-pending WebRTC dial started
+  const relayedLinks = new Map()   // peer id -> link
+
+  function relayedLinksAllowed() {
+    if (relayedLinksOption === false || relayedLinksOption === 'never') return false
+    if (relayedLinksOption === 'always') return true
+    return isLocalRelayUrl(signalUrl)
+  }
+
+  function noteLinkFailure(remotePeerId, why) {
+    const count = (linkFailures.get(remotePeerId) ?? 0) + 1
+    linkFailures.set(remotePeerId, count)
+    if (count === RELAYED_LINK_AFTER_FAILURES) {
+      log(`[webrtc] ${remotePeerId} failed to connect ${count} times (${why}); the next try goes through the relay`)
+    }
+  }
+
+  function wantsRelayedLink(remotePeerId) {
+    return (linkFailures.get(remotePeerId) ?? 0) >= RELAYED_LINK_AFTER_FAILURES && relayedLinksAllowed()
+  }
+
+  function sendLinkFrame(remotePeerId, body) {
+    if (!registered || !ws) return false
+    send(pspEnvelope('ext', { to: remotePeerId, ttl_ms: RELAYED_LINK_TTL_MS, body }))
+    return true
+  }
+
+  function createRelayedLink(remotePeerId) {
+    const listeners = { open: new Set(), close: new Set(), message: new Set(), error: new Set() }
+    let lastPingAt = 0
+    const emit = (type, extra = {}) => {
+      const event = { type, target: channel, ...extra }
+      try { channel[`on${type}`]?.(event) } catch (err) { log(`[relayed] ${type} handler failed: ${err}`) }
+      for (const listener of [...listeners[type]]) {
+        try { listener(event) } catch { /* a host listener must not break the link */ }
+      }
+    }
+    const channel = {
+      label: 'freertc-relayed',
+      relayed: true,
+      readyState: 'connecting',
+      bufferedAmount: 0,
+      onopen: null,
+      onclose: null,
+      onmessage: null,
+      onerror: null,
+      addEventListener(type, listener) { listeners[type]?.add(listener) },
+      removeEventListener(type, listener) { listeners[type]?.delete(listener) },
+      send(data) {
+        if (channel.readyState !== 'open') throw new Error('relayed link is not open')
+        if (typeof data !== 'string') throw new Error('relayed links carry text only')
+        // Keepalive pings cross the relay like everything else: one every few
+        // seconds proves the path as well as one a second does.
+        if (data.startsWith('{"type":"ping"')) {
+          const now = Date.now()
+          if (now - lastPingAt < RELAYED_LINK_PING_MS) return
+          lastPingAt = now
+        }
+        // Not registered (the relay socket is reconnecting): the frame is
+        // lost, as on a lossy channel; the keepalive judges the link.
+        sendLinkFrame(remotePeerId, { action: RELAYED_LINK_DATA, d: data })
+      },
+      close() {
+        if (channel.readyState === 'closed') return
+        const wasUp = channel.readyState === 'open' || channel.readyState === 'connecting'
+        channel.readyState = 'closed'
+        connection.connectionState = 'closed'
+        connection.iceConnectionState = 'closed'
+        clearTimeout(link.openTimer)
+        if (relayedLinks.get(remotePeerId) === link) relayedLinks.delete(remotePeerId)
+        if (wasUp && !link.closedByRemote) sendLinkFrame(remotePeerId, { action: RELAYED_LINK_CLOSE })
+        emit('close')
+      },
+    }
+    const connection = {
+      relayed: true,
+      connectionState: 'connected',
+      iceConnectionState: 'connected',
+      iceGatheringState: 'complete',
+      signalingState: 'stable',
+      localDescription: null,
+      remoteDescription: { type: 'answer', sdp: '' },
+      onconnectionstatechange: null,
+      oniceconnectionstatechange: null,
+      ondatachannel: null,
+      onicecandidate: null,
+      addEventListener() {},
+      removeEventListener() {},
+      addIceCandidate: async () => {},
+      getConfiguration: () => ({ iceServers: [] }),
+      getStats: async () => new Map(),
+      close() { channel.close() },
+    }
+    const link = {
+      channel,
+      connection,
+      openTimer: null,
+      closedByRemote: false,
+      open() {
+        if (channel.readyState !== 'connecting') return
+        clearTimeout(link.openTimer)
+        channel.readyState = 'open'
+        const entry = mesh.connections.get(remotePeerId)
+        if (entry?.connection === connection) {
+          entry.state = 'connected'
+          entry.lastSeen = Date.now()
+        }
+        log(`[relayed] link to ${remotePeerId} open through the relay`)
+        emit('open')
+      },
+      deliver(text) {
+        if (channel.readyState !== 'open') return
+        emit('message', { data: text })
+      },
+    }
+    return link
+  }
+
+  // Put a relayed link where a WebRTC connection would be, so everything that
+  // looks a peer up in mesh.connections finds it.
+  function installRelayedLink(remotePeerId) {
+    const prior = mesh.connections.get(remotePeerId)
+    if (prior && !prior.relayed) {
+      clearOfferRetryTimer(prior.connection)
+      try { prior.channel?.close?.() } catch {}
+      try { prior.connection?.close?.() } catch {}
+    }
+    relayedLinks.get(remotePeerId)?.channel.close()
+    const link = createRelayedLink(remotePeerId)
+    relayedLinks.set(remotePeerId, link)
+    mesh.connections.set(remotePeerId, {
+      connection: link.connection,
+      channel: null,
+      relayed: true,
+      state: 'connecting',
+      lastSeen: Date.now(),
+      createdAt: Date.now(),
+      iceServers: null,
+    })
+    onConnectionStateChangeCb?.({ peerId: remotePeerId, state: 'connecting', ts: Date.now() })
+    attachDataChannelHandlers(link.channel, remotePeerId, link.connection)
+    return link
+  }
+
+  function openRelayedLink(remotePeerId) {
+    const link = installRelayedLink(remotePeerId)
+    log(`[relayed] asking ${remotePeerId} for a link through the relay`)
+    let asks = 0
+    const ask = () => {
+      if (link.channel.readyState !== 'connecting') return
+      if (asks >= RELAYED_LINK_ASKS) {
+        log(`[relayed] ${remotePeerId} did not answer the link request`)
+        link.channel.close()
+        if (mesh.connections.get(remotePeerId)?.connection === link.connection) {
+          mesh.markDead(remotePeerId)
+          onConnectionStateChangeCb?.({ peerId: remotePeerId, state: 'failed', ts: Date.now() })
+        }
+        return
+      }
+      asks += 1
+      sendLinkFrame(remotePeerId, { action: RELAYED_LINK_OPEN })
+      link.openTimer = setTimeout(ask, RELAYED_LINK_ASK_MS)
+    }
+    ask()
+    return link.connection
+  }
+
+  function handleLinkFrame(msg) {
+    const from = msg.from
+    const action = msg.body?.action
+    if (!from || from === peerId) return
+    if (msg.session_id && msg.session_id !== roomId) return
+    const link = relayedLinks.get(from)
+    const entry = mesh.connections.get(from)
+    switch (action) {
+      case RELAYED_LINK_DATA:
+        if (link && entry?.connection === link.connection && typeof msg.body.d === 'string') {
+          // Data before the acceptance: the acceptance was lost or overtaken.
+          if (link.channel.readyState === 'connecting') link.open()
+          link.deliver(msg.body.d)
+        }
+        break
+      case RELAYED_LINK_OPEN: {
+        // A working WebRTC link wins; the asker learns so when the link
+        // request goes unanswered and keeps what it has.
+        if (entry && !entry.relayed && entry.channel?.readyState === 'open') break
+        if (link && entry?.connection === link.connection && link.channel.readyState === 'open') {
+          sendLinkFrame(from, { action: RELAYED_LINK_ACCEPT })
+          break
+        }
+        const accepted = installRelayedLink(from)
+        sendLinkFrame(from, { action: RELAYED_LINK_ACCEPT })
+        accepted.open()
+        break
+      }
+      case RELAYED_LINK_ACCEPT:
+        if (link && entry?.connection === link.connection) link.open()
+        break
+      case RELAYED_LINK_CLOSE:
+        if (link) {
+          link.closedByRemote = true
+          link.channel.close()
+        }
+        break
+    }
   }
 
   function enqueuePeerNegotiation(remotePeerId, operation) {
@@ -1103,7 +1340,7 @@ export function createSignalingClient(options = {}) {
     // nothing per connection: stay on it. Letting go only made the room's
     // relay list come and go, and gave newcomers fewer peers to find.
     const local = isLocalRelayUrl(signalUrl)
-    return { neighbours, direct, anchors, isolated, isAnchor, awake, held, local, wantRelay: local || isolated || isAnchor || awake || held }
+    return { neighbours, direct, anchors, isolated, isAnchor, awake, held, local, wantRelay: local || isolated || isAnchor || awake || held || relayedLinks.size > 0 }
   }
 
   // Tell each live neighbour which ids this peer can vouch for. Sent when the answer changes and
@@ -1350,6 +1587,10 @@ export function createSignalingClient(options = {}) {
       if (openEntry?.connection === pc) {
         openEntry.channel = channel
         openEntry.lastSeen = Date.now()
+        if (!openEntry.relayed) {
+          linkFailures.delete(remotePeerId)
+          dialAttempts.delete(remotePeerId)
+        }
         // Round-trip bookkeeping, mirrored onto the entry so sendData can
         // refuse a channel whose outbound direction is unproven. SCTP can
         // die one-way: messages keep ARRIVING while every send fails as
@@ -1861,6 +2102,22 @@ export function createSignalingClient(options = {}) {
   async function initiateWebRTCConnectionLocked(toPeerId, iceServers = null) {
     const priorEntry = mesh.connections.get(toPeerId)
     const prior = priorEntry?.connection
+
+    if (priorEntry?.relayed && priorEntry.channel?.readyState === 'open') return prior
+    // Dialing again after an attempt that never opened: that one failed,
+    // however it ended (ICE, an unanswered offer, the host giving up on it).
+    const priorStillTrying = Boolean(prior && prior.signalingState !== 'closed' && priorEntry?.state !== 'dead'
+      && priorEntry?.channel?.readyState !== 'open')
+    const lastDial = dialAttempts.get(toPeerId)
+    if (lastDial && !priorStillTrying && Date.now() - lastDial >= RELAYED_LINK_STALL_MS) {
+      noteLinkFailure(toPeerId, 'never opened')
+      dialAttempts.delete(toPeerId)
+    }
+    if (wantsRelayedLink(toPeerId) && !priorStillTrying) {
+      dialAttempts.delete(toPeerId)
+      return openRelayedLink(toPeerId)
+    }
+    if (priorEntry?.channel?.readyState !== 'open' && !dialAttempts.has(toPeerId)) dialAttempts.set(toPeerId, Date.now())
 
     // Don't dial over a connection that is already open OR still being
     // made. Closing a prior that was mid-negotiation — the remote's offer
@@ -2480,6 +2737,10 @@ export function createSignalingClient(options = {}) {
       case 'bye':
       case 'renegotiate':
         handleSignalingMessage(msg).catch((err) => log(`[signal] handleSignalingMessage error: ${err}`))
+        break
+
+      case 'ext':
+        if (String(msg.body?.action ?? '').startsWith('link-')) handleLinkFrame(msg)
         break
 
       case 'pong':
