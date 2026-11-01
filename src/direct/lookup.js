@@ -24,8 +24,8 @@ async function queryTxt(dohUrl, name, fetchImpl) {
 
 /**
  * The verified, unexpired directory records published under `name`, closest
- * to the room first (when network and room are given). Tries each resolver in
- * turn; an empty list when none answers.
+ * to the room first (when network and room are given). Asks every resolver at
+ * once and merges what they return; an empty list when none answers.
  */
 export async function lookupDirectRelays({
   name = DEFAULT_DIRECTORY_NAME,
@@ -41,20 +41,26 @@ export async function lookupDirectRelays({
   if (cached && now - cached.at < CACHE_MS) {
     records = cached.records;
   } else {
-    for (const dohUrl of dohUrls) {
-      try {
-        const values = await queryTxt(dohUrl, name, fetchImpl);
-        const decoded = values.map(decodeDirectoryTxt).filter(Boolean);
-        const verified = [];
-        for (const record of decoded) {
-          if (await verifyDirectoryRecord(record, { now })) verified.push(record);
-        }
-        records = verified;
-        cache.set(name, { at: now, records });
-        break;
-      } catch {
-        // try the next resolver
+    // Every resolver at once, and their answers merged: one resolver can hold
+    // an old answer (an empty one cached while no relay was listed, for as
+    // long as the zone's negative-cache time) and would hide a relay that
+    // another already returns.
+    const answers = await Promise.allSettled(dohUrls.map((dohUrl) => queryTxt(dohUrl, name, fetchImpl)));
+    const byNode = new Map();
+    let answered = false;
+    for (const answer of answers) {
+      if (answer.status !== 'fulfilled') continue;
+      answered = true;
+      for (const value of answer.value) {
+        const record = decodeDirectoryTxt(value);
+        if (!record || !await verifyDirectoryRecord(record, { now })) continue;
+        const known = byNode.get(record.node_id);
+        if (!known || Number(record.issued_at_ms) > Number(known.issued_at_ms)) byNode.set(record.node_id, record);
       }
+    }
+    if (answered) {
+      records = [...byNode.values()];
+      cache.set(name, { at: now, records });
     }
   }
   if (!records) return [];

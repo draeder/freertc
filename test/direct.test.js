@@ -295,3 +295,12 @@ test('a WebRTC client connects to the direct listener with no signaling', async 
   assert.equal(result.viaLan, 'echo:lan', 'reached through its LAN address when the public one does not answer');
   assert.match(result.wrongFingerprint, /^refused/, 'a wrong fingerprint is refused');
 });
+
+test('a resolver still holding an empty answer does not hide a relay another resolver returns', async () => {
+  const record = await createSignedDirectoryRecord(await identity(), { direct: directRelayUrl({ host: '203.0.113.30', port: 9443, fingerprint: FP }) });
+  const fetchImpl = async (url) => new Response(JSON.stringify(url.startsWith('https://stale/')
+    ? { Status: 0 } // a cached "nothing here"
+    : { Answer: [{ type: 16, data: encodeDirectoryTxt(record) }] }));
+  const found = await lookupDirectRelays({ name: '_stale.test', dohUrls: ['https://stale/dns-query', 'https://fresh/dns-query'], fetchImpl, useCache: false });
+  assert.deepEqual(found.map((r) => r.node_id), [record.node_id]);
+});
