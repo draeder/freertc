@@ -258,19 +258,22 @@ export async function verifyLinkChallenge(publicKey, nonce, signature) {
 //
 // pqIdentity: { pub, priv, qpub, qpriv } with pub/priv the relay's P-256 keys.
 
-function pqLinkChallengeMessage(nonce, nodeId) {
-  return canonicalJson(['freertc-link-pq', 1, String(nonce), String(nodeId)]);
+// It covers the other side's nonce, this relay's node id, and a digest of the
+// fresh keys this relay made for the link (src/node/link-crypto.js), so the
+// link's encryption is bound to the relay that signed.
+function pqLinkChallengeMessage(nonce, nodeId, ephemeralDigest) {
+  return canonicalJson(['freertc-link-pq', 2, String(nonce), String(nodeId), String(ephemeralDigest)]);
 }
 
-/** A hybrid signature over a link challenge, bound to this relay's node id. */
-export async function signLinkChallengePq(pqIdentity, nodeId, nonce) {
-  return signMessage(pqLinkChallengeMessage(nonce, nodeId), pqIdentity);
+/** A hybrid signature over a link challenge and the link's fresh keys, bound to this relay's node id. */
+export async function signLinkChallengePq(pqIdentity, nodeId, nonce, ephemeralDigest) {
+  return signMessage(pqLinkChallengeMessage(nonce, nodeId, ephemeralDigest), pqIdentity);
 }
 
-export async function verifyLinkChallengePq(publicKey, pqPublicKey, nodeId, nonce, signature) {
+export async function verifyLinkChallengePq(publicKey, pqPublicKey, nodeId, nonce, signature, ephemeralDigest) {
   try {
-    if (typeof pqPublicKey !== 'string' || typeof signature !== 'string') return false;
-    return await verifyMessage(pqLinkChallengeMessage(nonce, nodeId), signature, { pub: publicKey, qpub: pqPublicKey });
+    if (typeof pqPublicKey !== 'string' || typeof signature !== 'string' || typeof ephemeralDigest !== 'string') return false;
+    return await verifyMessage(pqLinkChallengeMessage(nonce, nodeId, ephemeralDigest), signature, { pub: publicKey, qpub: pqPublicKey });
   } catch {
     return false;
   }

@@ -102,11 +102,13 @@ async function cleanup(env, fetchImpl, entries, now) {
 // withdrawal) in two headers. The first key a node id shows is pinned in D1;
 // from then on that node id is listed or withdrawn only with that same key, so
 // forging the relay's P-256 signature alone (a quantum computer) is no longer
-// enough. The TXT record itself is unchanged, so every client reads it as
+// enough. Pinned on first sight: a relay is protected from the first time it
+// lists itself with a key, not before. The TXT record itself is unchanged, so every client reads it as
 // before; only this directory writes it.
 export const PQ_KEY_HEADER = 'X-Freertc-Pq-Key';
 export const PQ_SIGNATURE_HEADER = 'X-Freertc-Pq-Signature';
 const PQ_PIN_TABLE = 'psp_directory_pq';
+let warnedNoPins = false;
 
 async function sha256Hex(text) {
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)));
@@ -123,6 +125,10 @@ async function postQuantumCheck(request, env, signed, now) {
   const signature = request.headers.get(PQ_SIGNATURE_HEADER);
   const db = env.DB || null;
   if (db) await pinTable(db);
+  else if (!warnedNoPins) {
+    warnedNoPins = true;
+    console.warn('[directory] no database (env.DB): relays\' post-quantum keys are checked but not pinned');
+  }
   const pinned = db
     ? (await db.prepare(`SELECT key_sha256 FROM ${PQ_PIN_TABLE} WHERE node_id = ?1`).bind(signed.node_id).first())?.key_sha256 ?? null
     : null;

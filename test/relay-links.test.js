@@ -200,3 +200,43 @@ test('a relay without a post-quantum key is not linked by one that requires it',
     strict.links.stop();
   }
 });
+
+test('a post-quantum link is encrypted end to end: a relay in the middle sees and can change nothing', async () => {
+  const one = await relay('home-a', { pq: { pins: memoryPins() } });
+  const two = await relay('home-b', { pq: { pins: memoryPins() } });
+  // Everything crosses a middle that records it, and can tamper with it.
+  const [sa, ma] = socketPair();
+  const [mb, sb] = socketPair();
+  const seen = [];
+  let tamper = false;
+  ma.on('message', (data) => {
+    seen.push(String(data));
+    let out = String(data);
+    if (tamper && out.includes('"t":"enc"')) out = out.replace(/"c":"(.)/, (m, ch) => `"c":"${ch === 'A' ? 'B' : 'A'}`);
+    mb.send(out);
+  });
+  mb.on('message', (data) => { seen.push(String(data)); ma.send(String(data)); });
+  one.links.accept(sa, { via: 'lan', expectNodeId: two.identity.nodeId });
+  two.links.accept(sb, { via: 'lan' });
+  try {
+    await until(() => one.links.links.get(two.identity.nodeId)?.open && two.links.links.get(one.identity.nodeId)?.open);
+    const viaLinks = one.links.wrapFetch(async () => new Response('direct'));
+    const response = await viaLinks(`https://home-b.example/t/${two.identity.nodeId}/api/v1/idp`, { method: 'POST', body: 'secret-body' });
+    assert.deepEqual(await response.json(), { from: 'home-b', body: 'secret-body' });
+    const wire = seen.join('\n');
+    assert.ok(!wire.includes('secret-body') && !wire.includes(Buffer.from('secret-body').toString('base64')), 'the body never crosses in the clear');
+    assert.ok(!/"t":"(req|res)"/.test(wire), 'no unsealed requests or responses');
+    // An unsealed request sent into the link is ignored.
+    ma.emit('message', JSON.stringify({ t: 'req', id: 'x', method: 'GET', path: '/injected', headers: [] }));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.ok(!two.handled.includes('GET /injected'));
+    // A changed sealed frame closes the link.
+    tamper = true;
+    viaLinks(`https://home-b.example/t/${two.identity.nodeId}/api/v1/idp`, { method: 'POST', body: 'again' }).catch(() => {});
+    await until(() => !two.links.links.get(one.identity.nodeId)?.open);
+    assert.ok(!two.handled.some((line) => line.includes('again')));
+  } finally {
+    one.links.stop();
+    two.links.stop();
+  }
+});

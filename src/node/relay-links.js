@@ -15,7 +15,12 @@
 //                                                   with its post-quantum key (relay-pq.js),
 //                                                   also a hybrid one. A relay with pq set
 //                                                   links only to relays that prove one,
-//                                                   the same one as the first time.
+//                                                   the same one as the first time, and the
+//                                                   link is then encrypted end to end
+//                                                   (link-crypto.js): hello carries fresh
+//                                                   keys, then each side sends
+//                                                   { t: 'key', c } and every frame after is
+//                                                   { t: 'enc', n, c }.
 // then requests flow both ways in the tunnel's own frame format:
 //   { t: 'req', id, method, path, headers, body }  →  { t: 'res', id, status, headers, body }
 // The relay's fetch is wrapped (wrapFetch) so a federation call to a linked
@@ -27,7 +32,9 @@
 // the lower node ID dials, so two relays make one link between them.
 
 import { decodeBody, encodeBody, forwardHeaders } from '../tunnel/frames.js';
+import { decryptMessageWithMeta, encryptMessageWithMeta, generateRandomPair } from 'unsea';
 import { signLinkChallenge, signLinkChallengePq, verifyLinkChallenge, verifyLinkChallengePq, verifySignedRelayRecord } from '../relay-identity.js';
+import { createLinkChannel, ephemeralDigest, randomLinkSecret } from './link-crypto.js';
 
 export const LINK_CHANNEL_LABEL = 'freertc-federation';
 export const LINK_PATH = '/api/v1/link';
@@ -89,7 +96,7 @@ export function createRelayLinks({
 
   // A post-quantum answer: valid, and the key pinned for that node id (or the
   // first one seen, which is pinned now).
-  async function pqOk(record, frame, nonce) {
+  async function pqOk(record, frame, nonce, peerEphemeralDigest) {
     const pinned = pq.pins?.get(record.node_id) ?? null;
     const short = record.node_id.slice(0, 8);
     if (typeof frame.pq_public_key !== 'string') {
@@ -103,7 +110,7 @@ export function createRelayLinks({
       log(`refused a link from ${short}: its post-quantum key is not the one it had before`);
       return false;
     }
-    if (!await verifyLinkChallengePq(record.public_key, frame.pq_public_key, record.node_id, nonce, frame.pq_signature)) {
+    if (!await verifyLinkChallengePq(record.public_key, frame.pq_public_key, record.node_id, nonce, frame.pq_signature, peerEphemeralDigest)) {
       log(`refused a link from ${short}: its post-quantum signature did not check out`);
       return false;
     }
@@ -117,6 +124,15 @@ export function createRelayLinks({
     const answered = new Set();
     let peerNodeId = null;
     let closed = false;
+    // Encrypted links (with post-quantum keys): this link's fresh keys, the
+    // secret this side contributes, and the channel once both are in.
+    const secure = Boolean(pq?.identity);
+    const ephemeral = secure ? generateRandomPair() : null;
+    const mySecret = secure ? randomLinkSecret() : null;
+    let peerNonce = null;
+    let verified = null; // { record, ephemeral } once the peer's hello checks out
+    let peerKeyFrame = null;
+    let channel = null;
     const link = {
       via,
       get nodeId() { return peerNodeId; },
@@ -124,7 +140,9 @@ export function createRelayLinks({
       request,
       close: () => { try { socket.close(); } catch {} },
     };
-    const send = (frame) => { try { socket.send(JSON.stringify(frame)); } catch {} };
+    const sendRaw = (frame) => { try { socket.send(JSON.stringify(frame)); } catch {} };
+    // Requests and responses go sealed on an encrypted link.
+    const send = (frame) => (channel && (frame.t === 'req' || frame.t === 'res') ? channel.seal(frame, sendRaw) : sendRaw(frame));
     const helloTimer = setTimeout(() => { if (!peerNodeId) { log(`link over ${via} did not identify itself`); link.close(); } }, HELLO_TIMEOUT_MS);
     helloTimer.unref?.();
 
@@ -148,16 +166,33 @@ export function createRelayLinks({
       try { frame = JSON.parse(String(raw)); } catch { return; }
       if (frame?.t === 'challenge' && typeof frame.nonce === 'string') {
         if (answered.has(frame.nonce)) return;
+        if (secure && peerNonce && peerNonce !== frame.nonce) return; // one handshake per link
         answered.add(frame.nonce);
-        send({
+        peerNonce = frame.nonce;
+        const fresh = secure ? await ephemeral : null;
+        const freshPublic = fresh ? { epub: fresh.epub, kpub: fresh.kpub } : null;
+        sendRaw({
           t: 'hello',
           record: await nodeRecord(),
           signature: await signLinkChallenge(identity, frame.nonce),
           ...(pq?.identity ? {
             pq_public_key: pq.identity.qpub,
-            pq_signature: await signLinkChallengePq(pq.identity, identity.nodeId, frame.nonce),
+            pq_signature: await signLinkChallengePq(pq.identity, identity.nodeId, frame.nonce, await ephemeralDigest(freshPublic)),
+            ephemeral: freshPublic,
           } : {}),
         });
+        return;
+      }
+      if (frame?.t === 'key' && secure) {
+        if (channel || peerKeyFrame) return;
+        peerKeyFrame = frame;
+        await finishSecure();
+        return;
+      }
+      if (frame?.t === 'enc' && channel) {
+        const inner = await channel.open(frame);
+        if (!inner) { log(`link to ${peerNodeId?.slice(0, 8) ?? '?'}: a frame did not open; closing`); link.close(); return; }
+        if (inner.t === 'req' || inner.t === 'res') await handleFrame(inner);
         return;
       }
       if (frame?.t === 'hello') {
@@ -168,17 +203,64 @@ export function createRelayLinks({
           && await verifyRecord(record)
           && await verifyLinkChallenge(record.public_key, myNonce, frame.signature);
         if (!ok) { log(`link over ${via} failed to identify itself`); link.close(); return; }
-        if (pq && !await pqOk(record, frame, myNonce)) { link.close(); return; }
-        clearTimeout(helloTimer);
-        const existing = links.get(record.node_id);
-        if (existing?.open) { log(`already linked to ${record.node_id.slice(0, 8)}; closing the second link`); link.close(); return; }
-        peerNodeId = record.node_id;
-        link.url = typeof record.url === 'string' ? record.url : null;
-        links.set(peerNodeId, link);
-        log(`linked to ${peerNodeId.slice(0, 8)} over ${via}`);
+        const peerEphemeral = frame.ephemeral && typeof frame.ephemeral.epub === 'string' && typeof frame.ephemeral.kpub === 'string'
+          ? { epub: frame.ephemeral.epub, kpub: frame.ephemeral.kpub } : null;
+        if (secure && !peerEphemeral && frame.pq_public_key) { log(`refused a link from ${record.node_id.slice(0, 8)}: no keys for an encrypted link`); link.close(); return; }
+        if (pq && !await pqOk(record, frame, myNonce, peerEphemeral ? await ephemeralDigest(peerEphemeral) : '')) { link.close(); return; }
+        if (verified || peerNodeId) return;
+        if (!secure || !frame.pq_public_key) {
+          // Without post-quantum keys on both ends (FREERTC_PQ=off and pq not
+          // required): the link as before, unencrypted.
+          open(record);
+          return;
+        }
+        verified = { record, ephemeral: peerEphemeral };
+        // This side's secret, encrypted to the other side's fresh keys.
+        sendRaw({ t: 'key', c: await encryptMessageWithMeta(mySecret, peerEphemeral) });
+        await finishSecure();
         return;
       }
-      if (!peerNodeId) return; // nothing but the handshake before it completes
+      if (!peerNodeId || channel) return; // nothing but the handshake before it completes; sealed frames only on an encrypted link
+      await handleFrame(frame);
+    });
+
+    function open(record) {
+      if (peerNodeId || closed) return;
+      clearTimeout(helloTimer);
+      const existing = links.get(record.node_id);
+      if (existing?.open) { log(`already linked to ${record.node_id.slice(0, 8)}; closing the second link`); link.close(); return; }
+      peerNodeId = record.node_id;
+      link.url = typeof record.url === 'string' ? record.url : null;
+      links.set(peerNodeId, link);
+      log(`linked to ${peerNodeId.slice(0, 8)} over ${via}${channel ? ' (encrypted, post-quantum)' : ''}`);
+    }
+
+    // Both secrets in (ours sent, theirs received): make the channel and open the link.
+    async function finishSecure() {
+      if (channel || !verified || !peerKeyFrame) return;
+      const keyFrame = peerKeyFrame;
+      let peerSecret;
+      try {
+        peerSecret = await decryptMessageWithMeta(keyFrame.c, await ephemeral);
+      } catch {
+        log(`link from ${verified.record.node_id.slice(0, 8)}: its link key did not open; closing`);
+        link.close();
+        return;
+      }
+      if (channel) return;
+      channel = await createLinkChannel({
+        selfId: identity.nodeId,
+        peerId: verified.record.node_id,
+        selfNonce: myNonce,
+        peerNonce,
+        selfSecret: mySecret,
+        peerSecret,
+      }).catch(() => null);
+      if (!channel) { link.close(); return; }
+      open(verified.record);
+    }
+
+    async function handleFrame(frame) {
       if (frame?.t === 'req' && typeof frame.id === 'string' && typeof frame.path === 'string') {
         try {
           const request = new Request(new URL(frame.path, 'http://relay-link'), {
@@ -196,7 +278,7 @@ export function createRelayLinks({
         return;
       }
       if (frame?.t === 'res' && pending.has(frame.id)) pending.get(frame.id)(frame);
-    });
+    }
     socket.on('close', () => {
       closed = true;
       clearTimeout(helloTimer);

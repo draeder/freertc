@@ -10,7 +10,10 @@
 // kept in <data dir>/relay-pins.json, and from then on a link from that node
 // id must prove that same key. So someone who could forge the relay's P-256
 // signature (a quantum computer) still cannot pose as it: they would need its
-// ML-DSA key as well.
+// ML-DSA key as well. The link itself is encrypted end to end with keys bound
+// to those signatures (link-crypto.js), so passing the handshake along from
+// the middle gains nothing either. A relay is protected from the first link
+// that pins it, not before.
 
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
