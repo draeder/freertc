@@ -45,6 +45,9 @@
 //   FREERTC_LINKS              on (default) | off — link to other local relays (punched data
 //                              channels, or the LAN) and send federation calls to them over the
 //                              link instead of out through a cloud tunnel home
+//   FREERTC_STATS              local (default) | public | off — the relay's dashboard at
+//                              /stats (and /api/v1/stats): local answers only this machine and
+//                              its network (loopback and private addresses)
 //   FREERTC_PQ                 on (default) | off — give this relay a post-quantum (ML-DSA-65) key
 //                              next to its P-256 one (<data dir>/relay-pq.json): links to other
 //                              local relays need a hybrid proof, pinned per relay on first sight
@@ -63,6 +66,8 @@ import WsClient, { WebSocketServer } from 'ws';
 import { installWebSocketPair, serverSocketOf } from '../src/node/websocket-pair.js';
 import { openSqliteD1 } from '../src/node/d1-sqlite.js';
 import { createCostMeter } from '../src/node/cost-meter.js';
+import { createRelayStats, isLocalAddress } from '../src/node/relay-stats.js';
+import { STATS_PAGE } from '../src/node/stats-page.js';
 import { PUNCH_OFFER_PATH, createPunchOfferHandler, punchOfferAvailable } from '../src/punch/offer.js';
 import { DataChannelSocket } from '../src/punch/transport.js';
 import { LINK_CHANNEL_LABEL, LINK_PATH, createRelayLinks } from '../src/node/relay-links.js';
@@ -197,6 +202,11 @@ if (!FEDERATION) {
 
 // What this relay would cost as a Cloudflare worker (src/node/cost-meter.js); GET /debug/cost.
 const meter = createCostMeter();
+// The relay's own numbers for its dashboard (src/node/relay-stats.js); GET /stats.
+const STATS_MODE = ['public', 'off'].includes(String(process.env.FREERTC_STATS || '').trim().toLowerCase())
+  ? String(process.env.FREERTC_STATS).trim().toLowerCase()
+  : 'local';
+const stats = createRelayStats();
 // Punched connections need WebRTC in this process (werift, an optional dependency).
 const PUNCH = !isOff(process.env.FREERTC_PUNCH) && await punchOfferAvailable();
 const env = {
@@ -237,6 +247,7 @@ try {
 } catch {
   // a new database has no table yet
 }
+let accountsShared = false;
 // Accounts: a local relay is a PigeonIdP server for the browsers connected to
 // it, keeping signed account records in DATA_DIR/identities.json so they
 // survive restarts (pigeonidp/relay). On unless FREERTC_IDP=off.
@@ -250,13 +261,25 @@ if (!isOff(process.env.FREERTC_IDP)) {
       // the cloud relays): their POST /api/v1/idp. Looked up on each use, as
       // federation comes up after this; fetch is the relay's own, so linked
       // relays are reached over their link.
+      fetch: (url, init) => {
+        try { stats.accountOutbound(JSON.parse(String(init?.body ?? '{}'))); } catch { /* not ours to count */ }
+        return globalThis.fetch(url, init);
+      },
       otherRelays: federating
         ? async () => (await listKnownRelays(env, env.RELAY_URL).catch(() => []))
           .filter((relay) => relay.relay_kind === 'local' && relay.url && relay.url !== env.RELAY_URL)
           .map((relay) => relay.url.replace(/^ws(s?):\/\//, 'http$1://').replace(/\/ws$/, ''))
         : null,
     });
-    env.RELAY_REQUEST_HANDLER = (body) => store.handle(body);
+    // Counted for the dashboard: requests from browsers and other relays, and
+    // what this store asks of other relays.
+    env.RELAY_REQUEST_HANDLER = async (body) => {
+      const result = await store.handle(body);
+      stats.account(body, result);
+      return result;
+    };
+    stats.setAccountCount(() => store.size());
+    accountsShared = federating;
     console.log(`[node-relay] accounts: kept for browsers on this relay in ${path.relative(process.cwd(), store.file) || store.file} (${store.size()} so far)`);
   } catch (error) {
     console.log(`[node-relay] accounts: off (${error?.code === 'ERR_MODULE_NOT_FOUND' ? 'pigeonidp is not installed: npm install' : error?.message || error})`);
@@ -307,7 +330,9 @@ async function writeResponse(res, response) {
   const headers = {};
   response.headers.forEach((value, name) => { headers[name] = value; });
   res.writeHead(response.status, headers);
-  res.end(Buffer.from(await response.arrayBuffer()));
+  const body = Buffer.from(await response.arrayBuffer());
+  res.end(body);
+  return body.length;
 }
 
 // Set once acceptSocket exists (below); requests can't arrive before the server listens.
@@ -323,6 +348,21 @@ const handler = async (req, res) => {
       await writeResponse(res, await handlePunchOffer(toRequest(req, chunks.length ? Buffer.concat(chunks) : undefined)));
       return;
     }
+    if ((pathname === '/stats' || pathname === '/api/v1/stats') && req.method === 'GET' && STATS_MODE !== 'off') {
+      if (STATS_MODE === 'local' && !isLocalAddress(req.socket?.remoteAddress)) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('Not found');
+        return;
+      }
+      if (pathname === '/stats') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(STATS_PAGE);
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(stats.snapshot()));
+      }
+      return;
+    }
     if (pathname === '/debug/cost' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
       res.end(JSON.stringify({ ok: true, relay: env.RELAY_URL, name: env.RELAY_NAME, cost: meter.snapshot() }));
@@ -331,8 +371,9 @@ const handler = async (req, res) => {
     meter.request(req.method, pathname, false);
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
-    const response = await worker.fetch(toRequest(req, chunks.length ? Buffer.concat(chunks) : undefined), env, ctx);
-    await writeResponse(res, response);
+    const bodyIn = chunks.length ? Buffer.concat(chunks) : undefined;
+    const response = await worker.fetch(toRequest(req, bodyIn), env, ctx);
+    stats.http(bodyIn?.length ?? 0, await writeResponse(res, response));
   } catch (error) {
     // A client that hung up mid-request is not a relay error: count it.
     if (error?.message === 'aborted' || error?.code === 'ECONNRESET') {
@@ -395,6 +436,7 @@ server.on('upgrade', async (req, socket, head) => {
     wss.handleUpgrade(req, socket, head, (ws) => {
       ws.on('message', (data) => meter.wsMessage(data));
       watchLiveness(ws);
+      stats.watchSocket(ws);
       serverSocket.attach(ws);
     });
   } catch (error) {
@@ -414,7 +456,7 @@ async function acceptSocket(socket, pathname = '/ws', headers = []) {
   upgrade.headers.set('Upgrade', 'websocket');
   const response = await worker.fetch(upgrade, env, ctx);
   const serverSocket = serverSocketOf(response);
-  if (serverSocket) serverSocket.attach(socket);
+  if (serverSocket) serverSocket.attach(stats.watchSocket(socket));
   else socket.close(1011, `Relay answered ${response.status}`);
 }
 
@@ -497,6 +539,18 @@ if (PUNCH) {
 // Say whether federation actually holds: which relays answered this relay's
 // announcement, logged whenever that changes.
 let federationState = null;
+stats.setLinks(() => {
+  const relays = relayLinks?.linkedRelayUrls?.() ?? [];
+  return { linked: relays.length, relays };
+});
+stats.setReach(() => ({
+  name: env.RELAY_NAME,
+  kind: env.RELAY_KIND,
+  url: env.RELAY_URL,
+  federation: federating ? (federationState || federationNote) : federationNote,
+  postQuantum: Boolean(relayPq),
+  accountsShared,
+}));
 // Say plainly what this relay's public address costs.
 function howReached(url) {
   if (!tunnelNodeIdOf(url)) return ' (open port, no tunnel)';
@@ -869,6 +923,9 @@ server.on('clientError', (error, socket) => {
 server.on('error', (error) => noteTrouble(`server errors (${error?.code || 'unknown'})`));
 server.listen(PORT, HOST, () => {
   console.log(`[node-relay] ${env.RELAY_NAME} on ${TLS ? 'https' : 'http'}://${HOST}:${PORT} (relay ${env.RELAY_URL})`);
+  if (STATS_MODE !== 'off') {
+    console.log(`[node-relay] stats: ${TLS ? 'https' : 'http'}://${['0.0.0.0', '::'].includes(HOST) ? 'localhost' : HOST}:${PORT}/stats (${STATS_MODE === 'public' ? 'open to anyone' : 'this machine and its network only'})`);
+  }
   console.log(`[node-relay] federation: ${federationNote}; data in ${DATA_DIR}`);
   console.log(`[node-relay] punched connections: ${PUNCH ? `accepted when a peer asks for one, introduced through this relay's public address (POST ${PUNCH_OFFER_PATH})` : (isOff(process.env.FREERTC_PUNCH) ? 'off (FREERTC_PUNCH=off)' : 'off: no WebRTC here (npm install werift)')}`);
   heartbeat();
