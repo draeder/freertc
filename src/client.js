@@ -1884,10 +1884,18 @@ export function createSignalingClient(options = {}) {
       }
 
       if (msg?.type === 'pong') {
+        const pingSentAt = lastPingSentAt
         lastPongAt = Date.now()
         lastPingSentAt = 0
         const pongEntry = mesh.connections.get(remotePeerId)
         if (pongEntry?.connection === pc && pongEntry.channel === channel) {
+          // Round trip on this link, on our own clock only (smoothed): what a
+          // host can use to estimate how long a frame takes to cross it.
+          const sent = pongEntry.lastPingSentAt || pingSentAt
+          if (sent > 0 && lastPongAt >= sent) {
+            const rtt = lastPongAt - sent
+            pongEntry.rttMs = pongEntry.rttMs > 0 ? Math.round(pongEntry.rttMs * 0.7 + rtt * 0.3) : rtt
+          }
           pongEntry.lastPongAt = lastPongAt
           pongEntry.lastPingSentAt = 0
         }
