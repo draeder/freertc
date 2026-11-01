@@ -1735,6 +1735,31 @@ async function handleClientMessage(
     } else if (type === "discover") {
       await deferWork(ctx, env, { kind: "discover", network, room, peerId, selfRelayUrl });
 
+    } else if (type === "ext" && message.body?.relay_request === true) {
+      // A request to this relay itself (not to a peer), answered on the same
+      // socket. A node relay can serve such requests through
+      // env.RELAY_REQUEST_HANDLER (body) -> result | null, such as the
+      // PigeonIdP account store; a relay without one, or one the handler does
+      // not know, answers unsupported so the client does not wait it out.
+      let result = null;
+      if (typeof env.RELAY_REQUEST_HANDLER === "function") {
+        try {
+          result = await env.RELAY_REQUEST_HANDLER(message.body, { peerId, network, room });
+        } catch (error) {
+          result = { ok: false, error: String(error?.message || error).slice(0, 200) };
+        }
+      }
+      try {
+        socket.send(JSON.stringify({
+          psp_version: PSP_VERSION, type: "ext", network,
+          session_id: room,
+          from: relayPeerId, to: peerId,
+          message_id: crypto.randomUUID(), timestamp: Date.now(),
+          ttl_ms: DEFAULT_TTL_MS, reply_to: message.message_id ?? null,
+          body: { ...(result ?? { ok: false, error: "unsupported" }), relay_response: true, request_id: message.body.request_id ?? null },
+        }));
+      } catch { /* the socket went away */ }
+
     } else if (type === "ext" && message.body?.action === "relay_list") {
       // Remote relay is sharing its known relay list — cache any new entries
       if (db) {

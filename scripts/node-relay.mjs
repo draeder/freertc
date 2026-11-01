@@ -39,6 +39,8 @@
 //                              behind NAT) and talks to this relay over a direct data channel;
 //                              needs WebRTC (the optional werift dependency)
 //   RELAY_KIND                 local (default) | cloud — what this relay tells clients it is
+//   FREERTC_IDP                on (default) | off — keep PigeonIdP accounts for the browsers on this
+//                              relay, in <data dir>/identities.json (needs the pigeonidp package)
 //   FREERTC_LINKS              on (default) | off — link to other local relays (punched data
 //                              channels, or the LAN) and send federation calls to them over the
 //                              link instead of out through a cloud tunnel home
@@ -229,6 +231,24 @@ try {
   if (n) console.log(`[node-relay] forgot ${n} peer announcement${n === 1 ? '' : 's'} left from the last run`);
 } catch {
   // a new database has no table yet
+}
+// Accounts: a local relay is a PigeonIdP server for the browsers connected to
+// it, keeping signed account records in DATA_DIR/identities.json so they
+// survive restarts (pigeonidp/relay). On unless FREERTC_IDP=off.
+if (!isOff(process.env.FREERTC_IDP)) {
+  try {
+    const { createRelayIdentityStore } = await import('pigeonidp/relay');
+    const store = await createRelayIdentityStore({
+      dataDir: DATA_DIR,
+      log: (line) => console.log(`[node-relay:accounts] ${line}`),
+    });
+    env.RELAY_REQUEST_HANDLER = (body) => store.handle(body);
+    console.log(`[node-relay] accounts: kept for browsers on this relay in ${path.relative(process.cwd(), store.file) || store.file} (${store.size()} so far)`);
+  } catch (error) {
+    console.log(`[node-relay] accounts: off (${error?.code === 'ERR_MODULE_NOT_FOUND' ? 'pigeonidp is not installed: npm install' : error?.message || error})`);
+  }
+} else {
+  console.log('[node-relay] accounts: off (FREERTC_IDP=off)');
 }
 const ctx = { waitUntil: (work) => { Promise.resolve(work).catch((error) => console.error('[node-relay] background task failed:', error?.message || error)); } };
 

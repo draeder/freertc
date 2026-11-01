@@ -749,6 +749,8 @@ export function createSignalingClient(options = {}) {
   const linkFailures = new Map()   // peer id -> failed WebRTC attempts in a row
   const dialAttempts = new Map()   // peer id -> when the open-pending WebRTC dial started
   const relayedLinks = new Map()   // peer id -> link
+  // Requests to the relay itself (relayRequest), by request id.
+  const relayRequests = new Map()
 
   function relayedLinksAllowed() {
     if (relayedLinksOption === false || relayedLinksOption === 'never') return false
@@ -2748,7 +2750,15 @@ export function createSignalingClient(options = {}) {
         break
 
       case 'ext':
-        if (String(msg.body?.action ?? '').startsWith('link-')) handleLinkFrame(msg)
+        if (msg.body?.relay_response === true) {
+          const pending = relayRequests.get(msg.body.request_id)
+          if (pending) {
+            relayRequests.delete(msg.body.request_id)
+            clearTimeout(pending.timer)
+            const { relay_response: _r, request_id: _id, ...result } = msg.body
+            pending.resolve(result)
+          }
+        } else if (String(msg.body?.action ?? '').startsWith('link-')) handleLinkFrame(msg)
         break
 
       case 'pong':
@@ -3179,6 +3189,32 @@ export function createSignalingClient(options = {}) {
     },
 
     injectSignal,
+
+    /**
+     * Ask the relay this client is registered on to do something itself, such
+     * as a PigeonIdP account lookup ({ action: 'idp-get', ... }). Resolves
+     * with the relay's answer; { ok: false, error: 'unsupported' } from a
+     * relay that does not serve it, and a rejection when not registered or
+     * when no answer comes in time (a relay too old to know the request).
+     */
+    relayRequest(body, { timeoutMs = 5000 } = {}) {
+      if (!registered || !ws) return Promise.reject(new Error('not registered on a relay'))
+      const requestId = generateMessageId()
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          relayRequests.delete(requestId)
+          reject(new Error('the relay did not answer'))
+        }, timeoutMs)
+        relayRequests.set(requestId, { resolve, reject, timer })
+        try {
+          send(pspEnvelope('ext', { body: { ...body, relay_request: true, request_id: requestId } }))
+        } catch (error) {
+          clearTimeout(timer)
+          relayRequests.delete(requestId)
+          reject(error)
+        }
+      })
+    },
 
     sendData(data, preferredPeerId) {
       // The gate is isChannelLive (above, with its reasoning): transient states
