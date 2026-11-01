@@ -80,8 +80,31 @@ export async function startDirectRelay({
   let stopped = false;
   const endpoint = directoryUrl ? new URL(DIRECTORY_PATH, directoryUrl).toString() : null;
 
+  // A relay that cannot be listed here (no public address on this network,
+  // or the directory sees a different one) takes down the entry it may have
+  // left from its last network: otherwise browsers keep dialing an address
+  // where nothing answers until that entry expires.
+  let withdrawnStale = false;
+  async function withdrawStale(why) {
+    if (withdrawnStale || !endpoint) return;
+    withdrawnStale = true;
+    try {
+      const withdrawal = await createSignedWithdrawal(identity);
+      const response = await fetchImpl(endpoint, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(withdrawal), signal: AbortSignal.timeout(5_000) });
+      const body = await response.json().catch(() => null);
+      if (body?.removed) log(`directory: removed this relay's old entry (${why})`);
+    } catch (error) {
+      withdrawnStale = false;
+      log(`directory: could not remove this relay's old entry: ${error?.message || error}`);
+    }
+  }
+
   async function publish() {
-    if (stopped || !externalIp || !endpoint) return;
+    if (stopped || !endpoint) return;
+    if (!externalIp) {
+      await withdrawStale('not reachable directly on this network');
+      return;
+    }
     const record = await createSignedDirectoryRecord(identity, {
       direct: directRelayUrl({ host: externalIp, port: externalPort, fingerprint: cert.fingerprint }),
       tunnel: tunnelUrl() || null,
@@ -97,7 +120,10 @@ export async function startDirectRelay({
       if (!response.ok || !body?.ok) {
         const why = body?.error || `status ${response.status}`;
         log(`directory: not listed (${why}${body?.seen ? `; it sees ${body.seen}, the router says ${externalIp}` : ''})`);
-        if (body?.seen && body.seen !== externalIp) externalIp = null; // a second NAT: stop trying
+        if (body?.seen && body.seen !== externalIp) {
+          externalIp = null; // a second NAT: stop trying
+          await withdrawStale('behind a second NAT');
+        }
         // Changed too soon after the last write: try again once that has passed.
         if (response.status === 429 && !retryTimer) {
           retryTimer = setTimeout(() => { retryTimer = null; publish().catch(() => {}); }, 75_000);
