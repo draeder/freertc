@@ -691,7 +691,7 @@ async function handleFetch(request, env, ctx) {
       if (text.length > 64 * 1024) return jsonResponse({ ok: false, error: "too large" }, 413);
       let body = null;
       try { body = JSON.parse(text); } catch { /* answered below */ }
-      if (!body || (body.action !== "idp-get" && body.action !== "idp-put")) return jsonResponse({ ok: false, error: "unsupported" }, 200);
+      if (!body || !["idp-get", "idp-put", "idp-sync"].includes(body.action)) return jsonResponse({ ok: false, error: "unsupported" }, 200);
       try {
         const result = await env.RELAY_REQUEST_HANDLER({ ...body, from_relay: true }, { fromRelay: true });
         return jsonResponse(result ?? { ok: false, error: "unsupported" }, 200);

@@ -68,7 +68,7 @@ import { openSqliteD1 } from '../src/node/d1-sqlite.js';
 import { createCostMeter } from '../src/node/cost-meter.js';
 import { createRelayStats, isLocalAddress } from '../src/node/relay-stats.js';
 import { STATS_PAGE } from '../src/node/stats-page.js';
-import { ACCOUNT_SYNC_EVERY_MS, createAccountSync } from '../src/node/account-sync.js';
+import { ACCOUNT_SYNC_ACTION, ACCOUNT_SYNC_EVERY_MS, createAccountSync, createSyncRequest, verifySyncRequest } from '../src/node/account-sync.js';
 import { PUNCH_OFFER_PATH, createPunchOfferHandler, punchOfferAvailable } from '../src/punch/offer.js';
 import { DataChannelSocket } from '../src/punch/transport.js';
 import { LINK_CHANNEL_LABEL, LINK_PATH, createRelayLinks } from '../src/node/relay-links.js';
@@ -292,6 +292,7 @@ if (!isOff(process.env.FREERTC_IDP)) {
     // Counted for the dashboard: requests from browsers and other relays, and
     // what this store asks of other relays.
     env.RELAY_REQUEST_HANDLER = async (body) => {
+      if (body?.action === ACCOUNT_SYNC_ACTION) return answerSyncRequest(body);
       const result = await store.handle(body);
       stats.account(body, result);
       return result;
@@ -489,6 +490,77 @@ if (PQ) {
   const { nodeId } = await createRelayIdentity(publicKey, privateKey);
   relayPq = { identity: loadRelayPqIdentity(DATA_DIR, { publicKey, privateKey, nodeId }), pins: loadRelayPins(DATA_DIR), required: true };
   console.log(`[node-relay] post-quantum key: ML-DSA-65 with P-256 (hybrid) for links to other local relays and the directory${relayPq.pins.size() ? ` (${relayPq.pins.size()} relay${relayPq.pins.size() === 1 ? '' : 's'} pinned)` : ''}`);
+}
+
+// The same without a link, over the ordinary federation path: this relay asks
+// every local relay it knows for its whole store (signed with its own keys),
+// 15 s after it starts, whenever it meets a local relay it has not synced with
+// in the last 5 minutes, and every 5 minutes; and answers such requests from
+// local relays it knows. So an account reaches every local relay without
+// anyone having to log in.
+const PULL_EVERY_MS = 5 * 60_000;
+const lastPulled = new Map(); // node id -> when
+async function localRelayRecords() {
+  return (await listKnownRelays(env, env.RELAY_URL).catch(() => []))
+    .filter((relay) => relay.relay_kind === 'local' && relay.url && relay.url !== env.RELAY_URL && relay.node_id);
+}
+async function answerSyncRequest(body) {
+  if (!accountStore) return { ok: false, error: 'no accounts here' };
+  if (body?.from_relay !== true) return { ok: false, error: 'only between relays' };
+  const verdict = await verifySyncRequest(body, {
+    selfUrl: env.RELAY_URL,
+    knownLocalNodeIds: async () => new Set((await localRelayRecords()).map((relay) => relay.node_id)),
+    pinnedPqKey: (nodeId) => relayPq?.pins?.get(nodeId) ?? null,
+  });
+  const who = `relay ${String(body?.node_id || '?').slice(0, 8)}`;
+  if (!verdict.ok) {
+    relayEvent(`accounts: refused ${who} its sync (${verdict.error})`);
+    return { ok: false, error: verdict.error };
+  }
+  // Its post-quantum key is remembered on first sight, as a link would.
+  if (typeof body.pq_public_key === 'string' && relayPq?.pins && !relayPq.pins.get(body.node_id)) relayPq.pins.set(body.node_id, body.pq_public_key);
+  relayEvent(`accounts: gave ${who} all ${accountStore.size()}`);
+  return { ok: true, records: accountStore.exportRecords() };
+}
+let syncIdentity = null;
+async function pullAccountsFrom(relay) {
+  syncIdentity ??= await (async () => {
+    const { publicKey, privateKey } = decodeRelayIdentitySecret(env.RELAY_IDENTITY_SECRET);
+    return createRelayIdentity(publicKey, privateKey);
+  })();
+  const who = (() => { try { return new URL(relay.url).host; } catch { return relay.url; } })();
+  lastPulled.set(relay.node_id, Date.now());
+  try {
+    const base = relay.url.replace(/^ws(s?):\/\//, 'http$1://').replace(/\/ws$/, '');
+    const body = await createSyncRequest({ identity: syncIdentity, pqIdentity: relayPq?.identity ?? null, target: relay.url });
+    const response = await globalThis.fetch(`${base}/api/v1/idp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const answer = await response.json().catch(() => null);
+    if (!response.ok || !answer?.ok) {
+      relayEvent(`accounts: ${who}: no sync (${answer?.error || `answered ${response.status}`})`);
+      return;
+    }
+    const { stored } = await accountStore.importRecords(answer.records, { from: who });
+    if (stored) console.log(`[node-relay] accounts: ${stored} from ${who}`);
+  } catch (error) {
+    relayEvent(`accounts: ${who}: no sync (${error?.name === 'TimeoutError' ? 'no answer' : error?.message || error})`);
+  }
+}
+async function pullAccounts({ onlyNew = false } = {}) {
+  if (!accountStore || !federating || !env.RELAY_IDENTITY_SECRET) return;
+  for (const relay of await localRelayRecords()) {
+    if (onlyNew && Date.now() - (lastPulled.get(relay.node_id) ?? 0) < PULL_EVERY_MS) continue;
+    await pullAccountsFrom(relay);
+  }
+}
+if (federating) {
+  setTimeout(() => { pullAccounts().catch(() => {}); }, 15_000).unref();
+  // A relay met for the first time (or again after a while) is synced within 30 s.
+  setInterval(() => { pullAccounts({ onlyNew: true }).catch(() => {}); }, 30_000).unref();
 }
 
 // Accounts between linked relays (src/node/account-sync.js): each side takes
