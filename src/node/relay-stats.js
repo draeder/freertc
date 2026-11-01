@@ -54,6 +54,7 @@ export function createRelayStats({ now = () => Date.now() } = {}) {
   };
   let links = () => ({ linked: 0, relays: [] });
   let reach = () => ({});
+  let events = () => [];
 
   // Node's measurement includes its own sampling interval: subtract it, so an
   // idle relay reads about 0 ms.
@@ -184,6 +185,7 @@ export function createRelayStats({ now = () => Date.now() } = {}) {
         memoryFreeMb: os.freemem() / 1048576,
         uptimeSeconds: Math.round(os.uptime()),
       },
+      events: events(),
       history,
     };
   }
@@ -200,6 +202,8 @@ export function createRelayStats({ now = () => Date.now() } = {}) {
     setLinks: (fn) => { links = fn; },
     /** How the relay is reached, its name and kind, its federation line. */
     setReach: (fn) => { reach = fn; },
+    /** Recent account events between relays (newest last). */
+    setEvents: (fn) => { events = fn; },
     stop: () => { clearInterval(timer); loopDelay.disable(); },
   };
 }

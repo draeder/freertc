@@ -89,6 +89,9 @@ export function createRelayLinks({
   verifyRecord = verifySignedRelayRecord,
   // { identity: { pub, priv, qpub, qpriv }, pins: { get, set }, required = true }
   pq = null,
+  // Called once a link has proved both ends (and, with pq, is encrypted):
+  // the place to exchange what only proved relays may have.
+  onLinked = () => {},
 }) {
   const links = new Map(); // node id -> link
   const lastDial = new Map(); // node id -> when we last tried
@@ -133,6 +136,10 @@ export function createRelayLinks({
     let verified = null; // { record, ephemeral } once the peer's hello checks out
     let peerKeyFrame = null;
     let channel = null;
+    // Sealed frames that arrive while this side is still opening the other's
+    // link key (the other side may finish first and send at once): held, and
+    // opened in order once the channel exists.
+    const earlySealed = [];
     const link = {
       via,
       get nodeId() { return peerNodeId; },
@@ -189,10 +196,12 @@ export function createRelayLinks({
         await finishSecure();
         return;
       }
-      if (frame?.t === 'enc' && channel) {
-        const inner = await channel.open(frame);
-        if (!inner) { log(`link to ${peerNodeId?.slice(0, 8) ?? '?'}: a frame did not open; closing`); link.close(); return; }
-        if (inner.t === 'req' || inner.t === 'res') await handleFrame(inner);
+      if (frame?.t === 'enc' && secure) {
+        if (!channel) {
+          if (earlySealed.length < 64) earlySealed.push(frame);
+          return;
+        }
+        await openSealed(frame);
         return;
       }
       if (frame?.t === 'hello') {
@@ -233,11 +242,22 @@ export function createRelayLinks({
       link.url = typeof record.url === 'string' ? record.url : null;
       links.set(peerNodeId, link);
       log(`linked to ${peerNodeId.slice(0, 8)} over ${via}${channel ? ' (encrypted, post-quantum)' : ''}`);
+      try { Promise.resolve(onLinked(peerNodeId, link)).catch(() => {}); } catch { /* the link stands either way */ }
     }
 
     // Both secrets in (ours sent, theirs received): make the channel and open the link.
-    async function finishSecure() {
-      if (channel || !verified || !peerKeyFrame) return;
+    // Runs once: the hello and the key frame can each be the one that
+    // completes the handshake, and both may arrive while the other's
+    // decryption is still under way; a second channel would restart the
+    // frame numbering and every later frame would fail to open.
+    let finishing = null;
+    function finishSecure() {
+      if (channel || !verified || !peerKeyFrame) return finishing ?? Promise.resolve();
+      finishing ??= finishSecureOnce();
+      return finishing;
+    }
+
+    async function finishSecureOnce() {
       const keyFrame = peerKeyFrame;
       let peerSecret;
       try {
@@ -258,6 +278,13 @@ export function createRelayLinks({
       }).catch(() => null);
       if (!channel) { link.close(); return; }
       open(verified.record);
+      for (const frame of earlySealed.splice(0)) openSealed(frame);
+    }
+
+    async function openSealed(frame) {
+      const inner = await channel.open(frame);
+      if (!inner) { log(`link to ${peerNodeId?.slice(0, 8) ?? '?'}: a frame did not open; closing`); link.close(); return; }
+      if (inner.t === 'req' || inner.t === 'res') await handleFrame(inner);
     }
 
     async function handleFrame(frame) {

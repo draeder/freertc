@@ -59,7 +59,7 @@
 //   PUNCH_LISTENER_ID          the id to register there
 import { createServer } from 'node:http';
 import { createServer as createTlsServer } from 'node:https';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, createReadStream } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, createReadStream, appendFileSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WsClient, { WebSocketServer } from 'ws';
@@ -68,6 +68,7 @@ import { openSqliteD1 } from '../src/node/d1-sqlite.js';
 import { createCostMeter } from '../src/node/cost-meter.js';
 import { createRelayStats, isLocalAddress } from '../src/node/relay-stats.js';
 import { STATS_PAGE } from '../src/node/stats-page.js';
+import { ACCOUNT_SYNC_EVERY_MS, createAccountSync } from '../src/node/account-sync.js';
 import { PUNCH_OFFER_PATH, createPunchOfferHandler, punchOfferAvailable } from '../src/punch/offer.js';
 import { DataChannelSocket } from '../src/punch/transport.js';
 import { LINK_CHANNEL_LABEL, LINK_PATH, createRelayLinks } from '../src/node/relay-links.js';
@@ -248,6 +249,22 @@ try {
   // a new database has no table yet
 }
 let accountsShared = false;
+let accountStore = null;
+// What happened with accounts between relays, for the dashboard and for
+// whoever has to find out why an account did not arrive: kept in memory and
+// appended to <data dir>/relay-events.log (rolled over at 1 MB).
+const EVENTS_FILE = path.join(DATA_DIR, 'relay-events.log');
+const relayEvents = [];
+function relayEvent(text) {
+  const line = `${new Date().toISOString()} ${text}`;
+  relayEvents.push(line);
+  if (relayEvents.length > 200) relayEvents.shift();
+  try {
+    if (existsSync(EVENTS_FILE) && statSync(EVENTS_FILE).size > 1_048_576) renameSync(EVENTS_FILE, `${EVENTS_FILE}.1`);
+    appendFileSync(EVENTS_FILE, `${line}\n`);
+  } catch { /* the log is a convenience */ }
+}
+stats.setEvents(() => relayEvents.slice(-60));
 // Accounts: a local relay is a PigeonIdP server for the browsers connected to
 // it, keeping signed account records in DATA_DIR/identities.json so they
 // survive restarts (pigeonidp/relay). On unless FREERTC_IDP=off.
@@ -257,6 +274,7 @@ if (!isOff(process.env.FREERTC_IDP)) {
     const store = await createRelayIdentityStore({
       dataDir: DATA_DIR,
       log: (line) => console.log(`[node-relay:accounts] ${line}`),
+      onEvent: (text) => relayEvent(`accounts: ${text}`),
       // Shared with the other local relays this one federates with (never
       // the cloud relays): their POST /api/v1/idp. Looked up on each use, as
       // federation comes up after this; fetch is the relay's own, so linked
@@ -279,6 +297,8 @@ if (!isOff(process.env.FREERTC_IDP)) {
       return result;
     };
     stats.setAccountCount(() => store.size());
+    accountStore = store;
+    relayEvent(`accounts: started with ${store.size()} kept`);
     accountsShared = federating;
     console.log(`[node-relay] accounts: kept for browsers on this relay in ${path.relative(process.cwd(), store.file) || store.file} (${store.size()} so far)`);
   } catch (error) {
@@ -471,6 +491,14 @@ if (PQ) {
   console.log(`[node-relay] post-quantum key: ML-DSA-65 with P-256 (hybrid) for links to other local relays and the directory${relayPq.pins.size() ? ` (${relayPq.pins.size()} relay${relayPq.pins.size() === 1 ? '' : 's'} pinned)` : ''}`);
 }
 
+// Accounts between linked relays (src/node/account-sync.js): each side takes
+// the other's whole store when a link opens and every 10 minutes.
+const accountSync = createAccountSync({
+  store: () => accountStore,
+  event: relayEvent,
+  log: (line) => console.log(`[node-relay] ${line}`),
+});
+
 // Links to other local relays (src/node/relay-links.js): federation calls to
 // a linked relay go over the link, not out through a cloud tunnel home.
 let relayLinks = null;
@@ -489,7 +517,10 @@ if (LINKS) {
       relayKind: env.RELAY_KIND,
       reach: relayReachOf(env, env.RELAY_URL),
     }),
-    handleRequest: (request) => worker.fetch(request, env, ctx),
+    // Only a linked relay (proved, and encrypted with post-quantum keys) can
+    // ask for the whole account store.
+    handleRequest: (request) => accountSync.handleLinkRequest(request) ?? worker.fetch(request, env, ctx),
+    onLinked: (nodeId, link) => accountSync.syncOver(nodeId, link),
     dialPunch: PeerConnection
       ? async (offerUrl) => {
         const { pc, channel } = await punchRelayChannel(offerUrl, {
@@ -511,6 +542,9 @@ if (LINKS) {
     pq: relayPq,
   });
   globalThis.fetch = relayLinks.wrapFetch(directFetch);
+  setInterval(() => {
+    for (const [nodeId, link] of relayLinks.links) if (link.open) accountSync.syncOver(nodeId, link);
+  }, ACCOUNT_SYNC_EVERY_MS).unref();
   env.LINKED_RELAY_URLS = () => relayLinks.linkedRelayUrls();
   setTimeout(() => relayLinks.maintain().catch(() => {}), 5_000).unref();
   const lanHost = !['127.0.0.1', 'localhost', '::1'].includes(HOST);

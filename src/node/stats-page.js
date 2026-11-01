@@ -95,6 +95,11 @@ export const STATS_PAGE = `<!doctype html>
   </section>
 
   <section>
+    <h2>Account events between relays</h2>
+    <ul class="relays" id="events"></ul>
+  </section>
+
+  <section>
     <h2>Federation</h2>
     <p class="state" id="fed-state"></p>
     <div class="cols">
@@ -225,6 +230,10 @@ export const STATS_PAGE = `<!doctype html>
       ['Post-quantum links', f.postQuantum ? 'on' : '<span class="muted">off</span>'],
       ['Accounts shared with relays', f.accountsShared ? 'yes' : '<span class="muted">no</span>'],
     ]);
+    const events = (s.events || []).slice().reverse();
+    $('events').innerHTML = events.length
+      ? events.map((x) => '<li>' + x.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</li>').join('')
+      : '<li class="muted">Nothing yet.</li>';
     const relays = f.relays || [];
     $('links').innerHTML = relays.length
       ? relays.map((x) => '<li>' + x + '</li>').join('')
