@@ -739,6 +739,40 @@ if (process.env.FREERTC_RELAY_CHILD) {
       .finally(() => process.exit(NETWORK_CHANGED_EXIT));
   }, 10_000).unref();
 }
+// The direct (WebRTC) listener can stop answering while the rest of the
+// relay keeps working: browsers then fail on the address the directory
+// lists, and nothing said so. Every minute the relay opens a direct channel
+// to itself on loopback; after two failures in a row it restarts (the parent
+// starts it again), which brings the listener back.
+function watchDirectListener(port, fingerprint) {
+  let failures = 0;
+  const check = async () => {
+    if (stopping) return;
+    let pc = null;
+    try {
+      const { RTCPeerConnection } = await import('node-datachannel/polyfill');
+      const { directRelayChannel } = await import('../src/direct/dial.js');
+      const opened = await directRelayChannel(`webrtc-direct://127.0.0.1:${port}/sha256/${fingerprint}`, { PeerConnection: RTCPeerConnection, timeoutMs: 8_000 });
+      pc = opened.pc;
+      failures = 0;
+      if (process.env.FREERTC_VERBOSE === '1') console.log('[node-relay:direct] self-check: direct listener answered');
+    } catch (error) {
+      failures += 1;
+      console.log(`${new Date().toLocaleTimeString([], { hour12: false })} [node-relay:direct] self-check: direct listener did not answer (${error?.message || error})${failures >= 2 ? '; restarting' : ''}`);
+      if (failures >= 2 && !stopping) {
+        stopping = true;
+        stoppingAt = Date.now();
+        setTimeout(() => process.exit(NETWORK_CHANGED_EXIT), 3_000);
+        Promise.all([directRelay?.stop().catch(() => {}), openPortMapping?.close().catch(() => {})])
+          .finally(() => process.exit(NETWORK_CHANGED_EXIT));
+      }
+    } finally {
+      try { pc?.close(); } catch {}
+    }
+  };
+  setInterval(() => { check().catch(() => {}); }, Number(process.env.FREERTC_DIRECT_SELFCHECK_MS || 60_000)).unref();
+}
+
 if (!isOff(process.env.FREERTC_DIRECT)) {
   // Set up in the background: asking the router takes a few seconds and the
   // relay serves its own address meanwhile.
@@ -764,6 +798,7 @@ if (!isOff(process.env.FREERTC_DIRECT)) {
     acceptSocket: (socket) => acceptSocket(socket),
     log: (line) => console.log(`${new Date().toLocaleTimeString([], { hour12: false })} [node-relay:direct] ${line}`),
   });
+  if (directRelay && process.env.FREERTC_RELAY_CHILD) watchDirectListener(Number(process.env.FREERTC_DIRECT_PORT || 9443), directRelay.fingerprint);
   })().catch((error) => console.log(`[node-relay:direct] direct connections: off (${error?.message || error})`));
 }
 
