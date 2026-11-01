@@ -1150,8 +1150,10 @@ async function forwardToRelayResult(relayUrl, message, selfRelayId) {
       }
     }
     relayLog(outcome === 'delivered' ? 'messages forwarded to other relays' : `forwards ${outcome}${why ? ` (${why})` : ''}`, `[FED] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} via ${relayUrl}: ${outcome} (${response.status})`);
+    if (outcome !== 'delivered') debugNote({ op: "forward-to-relay", type: message.type, to: message.to?.slice(0, 8), relay: relayUrl, outcome, why, status: response.status });
     return outcome;
   } catch (error) {
+    debugNote({ op: "forward-to-relay", type: message.type, to: message.to?.slice(0, 8), relay: relayUrl, outcome: "failed", why: String(error?.message || error).slice(0, 160) });
     relayLog('forwards failed (the other relay did not answer)', `[FED] ${message.type} ${message.from?.slice(0, 8)} → ${message.to?.slice(0, 8)} via ${relayUrl}: fetch failed (${error?.message})`);
     return "failed";
   }
