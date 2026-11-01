@@ -14,6 +14,7 @@
 // Off unless all three are set.
 
 import { decodeDirectoryTxt, encodeDirectoryTxt, verifyDirectoryRecord, verifyWithdrawal } from './record.js';
+import { verifyDirectoryPq } from '../relay-identity.js';
 import { parseDirectRelayUrl } from './common.js';
 
 export const DIRECTORY_PATH = '/api/v1/directory';
@@ -96,6 +97,47 @@ async function cleanup(env, fetchImpl, entries, now) {
   return removed;
 }
 
+// Post-quantum keys (local relays, src/node/relay-pq.js): a relay may send its
+// ML-DSA-65 public key and a hybrid signature over its signed record (or
+// withdrawal) in two headers. The first key a node id shows is pinned in D1;
+// from then on that node id is listed or withdrawn only with that same key, so
+// forging the relay's P-256 signature alone (a quantum computer) is no longer
+// enough. The TXT record itself is unchanged, so every client reads it as
+// before; only this directory writes it.
+export const PQ_KEY_HEADER = 'X-Freertc-Pq-Key';
+export const PQ_SIGNATURE_HEADER = 'X-Freertc-Pq-Signature';
+const PQ_PIN_TABLE = 'psp_directory_pq';
+
+async function sha256Hex(text) {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)));
+  return Array.from(digest, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function pinTable(db) {
+  await db.prepare(`CREATE TABLE IF NOT EXISTS ${PQ_PIN_TABLE} (node_id TEXT PRIMARY KEY, key_sha256 TEXT NOT NULL, pinned_at_ms INTEGER NOT NULL)`).run();
+}
+
+/** null when the request may go ahead, or why it may not. */
+async function postQuantumCheck(request, env, signed, now) {
+  const key = request.headers.get(PQ_KEY_HEADER);
+  const signature = request.headers.get(PQ_SIGNATURE_HEADER);
+  const db = env.DB || null;
+  if (db) await pinTable(db);
+  const pinned = db
+    ? (await db.prepare(`SELECT key_sha256 FROM ${PQ_PIN_TABLE} WHERE node_id = ?1`).bind(signed.node_id).first())?.key_sha256 ?? null
+    : null;
+  if (!key && !signature) {
+    return pinned ? 'this relay was listed with a post-quantum key: prove it' : null;
+  }
+  if (!await verifyDirectoryPq(signed, key, signature)) return 'bad post-quantum signature';
+  const hash = await sha256Hex(key);
+  if (pinned && pinned !== hash) return 'not the post-quantum key this relay was listed with';
+  if (!pinned && db) {
+    await db.prepare(`INSERT OR IGNORE INTO ${PQ_PIN_TABLE} (node_id, key_sha256, pinned_at_ms) VALUES (?1, ?2, ?3)`).bind(signed.node_id, hash, now).run();
+  }
+  return null;
+}
+
 export async function handleDirectoryRequest(request, env, { fetchImpl = globalThis.fetch, now = Date.now() } = {}) {
   if (!directoryEnabled(env)) return json({ ok: false, error: 'no directory on this relay' }, 404);
   if (request.method !== 'POST' && request.method !== 'DELETE') return json({ ok: false, error: 'method not allowed' }, 405);
@@ -107,6 +149,8 @@ export async function handleDirectoryRequest(request, env, { fetchImpl = globalT
   try {
     if (request.method === 'DELETE') {
       if (!await verifyWithdrawal(body, { now })) return json({ ok: false, error: 'bad withdrawal' }, 400);
+      const refused = await postQuantumCheck(request, env, body, now);
+      if (refused) return json({ ok: false, error: refused }, 403);
       const mine = await listDirectory(env, fetchImpl, `&comment.exact=${encodeURIComponent(commentFor(body.node_id))}`);
       for (const entry of mine) await cloudflare(env, 'DELETE', `/dns_records/${entry.id}`, undefined, fetchImpl);
       return json({ ok: true, removed: mine.length });
@@ -118,6 +162,8 @@ export async function handleDirectoryRequest(request, env, { fetchImpl = globalT
     if (!sameIp(direct.host, from)) {
       return json({ ok: false, error: 'the direct address must be the address this request came from', seen: from || null }, 400);
     }
+    const refused = await postQuantumCheck(request, env, body, now);
+    if (refused) return json({ ok: false, error: refused }, 403);
 
     const all = await listDirectory(env, fetchImpl);
     const mine = all.filter((entry) => entry.comment === commentFor(body.node_id));

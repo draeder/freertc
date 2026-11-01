@@ -77,13 +77,13 @@
     "deploy:local-prod:stop": "docker-compose -f docker-compose.prod.yml down"
   },
   "dependencies": {
-    "unsea": "https://codeload.github.com/draeder/unsea/tar.gz/5425b41d39cea5aa2116241af0fed82865ffea29",
+    "unsea": "https://codeload.github.com/draeder/unsea/tar.gz/98ec176eede8639c44a783456b2c1a017b824c16",
     "ws": "^8.18.0"
   },
   "optionalDependencies": {
     "node-datachannel": "^0.33.4",
     "werift": "^0.24.4",
-    "pigeonidp": "https://codeload.github.com/PeerPigeon/PigeonIdP/tar.gz/4c18a43d150167c5a15b1bbe2cc9d7a8dcd3b5b1"
+    "pigeonidp": "https://codeload.github.com/PeerPigeon/PigeonIdP/tar.gz/d20213a24934ee6f10b4aa8e0cba9d698c495b1f"
   },
   "devDependencies": {
     "wrangler": "^4.123.0"

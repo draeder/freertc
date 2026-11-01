@@ -45,6 +45,10 @@
 //   FREERTC_LINKS              on (default) | off — link to other local relays (punched data
 //                              channels, or the LAN) and send federation calls to them over the
 //                              link instead of out through a cloud tunnel home
+//   FREERTC_PQ                 on (default) | off — give this relay a post-quantum (ML-DSA-65) key
+//                              next to its P-256 one (<data dir>/relay-pq.json): links to other
+//                              local relays need a hybrid proof, pinned per relay on first sight
+//                              (<data dir>/relay-pins.json), and the directory pins it too
 //   FREERTC_LAN                on (default) | off — find relays on this network by UDP broadcast
 //                              (only when HOST is a LAN address, e.g. 0.0.0.0; never loopback)
 //   FREERTC_LAN_PORT           UDP port for LAN beacons (default 41235)
@@ -414,6 +418,17 @@ async function acceptSocket(socket, pathname = '/ws', headers = []) {
   else socket.close(1011, `Relay answered ${response.status}`);
 }
 
+// This relay's post-quantum key (src/node/relay-pq.js), when it federates.
+const PQ = federating && !isOff(process.env.FREERTC_PQ);
+let relayPq = null;
+if (PQ) {
+  const { loadRelayPqIdentity, loadRelayPins } = await import('../src/node/relay-pq.js');
+  const { publicKey, privateKey } = decodeRelayIdentitySecret(env.RELAY_IDENTITY_SECRET);
+  const { nodeId } = await createRelayIdentity(publicKey, privateKey);
+  relayPq = { identity: loadRelayPqIdentity(DATA_DIR, { publicKey, privateKey, nodeId }), pins: loadRelayPins(DATA_DIR), required: true };
+  console.log(`[node-relay] post-quantum key: ML-DSA-65 with P-256 (hybrid) for links to other local relays and the directory${relayPq.pins.size() ? ` (${relayPq.pins.size()} relay${relayPq.pins.size() === 1 ? '' : 's'} pinned)` : ''}`);
+}
+
 // Links to other local relays (src/node/relay-links.js): federation calls to
 // a linked relay go over the link, not out through a cloud tunnel home.
 let relayLinks = null;
@@ -451,6 +466,7 @@ if (LINKS) {
     }),
     listRelays: () => listKnownRelays(env, env.RELAY_URL),
     log: (line) => console.log(`[node-relay:links] ${line}`),
+    pq: relayPq,
   });
   globalThis.fetch = relayLinks.wrapFetch(directFetch);
   env.LINKED_RELAY_URLS = () => relayLinks.linkedRelayUrls();
@@ -826,6 +842,7 @@ if (!isOff(process.env.FREERTC_DIRECT)) {
     wsUrl: () => (openPortMapping ? env.RELAY_URL : null),
     name: env.RELAY_NAME,
     acceptSocket: (socket) => acceptSocket(socket),
+    pqIdentity: relayPq?.identity ?? null,
     log: (line) => console.log(`${new Date().toLocaleTimeString([], { hour12: false })} [node-relay:direct] ${line}`),
   });
   if (directRelay && process.env.FREERTC_RELAY_CHILD) watchDirectListener(Number(process.env.FREERTC_DIRECT_PORT || 9443), directRelay.fingerprint);

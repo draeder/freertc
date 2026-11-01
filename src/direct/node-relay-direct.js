@@ -13,7 +13,8 @@ import { startDirectListener, directListenerAvailable } from './listener.js';
 import { mapUdpPort, isNonPublicIPv4 } from './portmap.js';
 import { directRelayUrl } from './common.js';
 import { createSignedDirectoryRecord, createSignedWithdrawal } from './record.js';
-import { DIRECTORY_PATH } from './directory.js';
+import { DIRECTORY_PATH, PQ_KEY_HEADER, PQ_SIGNATURE_HEADER } from './directory.js';
+import { signDirectoryPq } from '../relay-identity.js';
 import { networkInterfaces } from 'node:os';
 import { isLanEndpoint } from './record.js';
 
@@ -42,7 +43,13 @@ export async function startDirectRelay({
   acceptSocket,
   fetchImpl = globalThis.fetch,
   log = () => {},
+  pqIdentity = null,        // { pub, priv, qpub, qpriv }: prove the relay's post-quantum key too
 }) {
+  // JSON headers, and the post-quantum proof when this relay has a key.
+  const headersFor = async (signed) => ({
+    'Content-Type': 'application/json',
+    ...(pqIdentity ? { [PQ_KEY_HEADER]: pqIdentity.qpub, [PQ_SIGNATURE_HEADER]: await signDirectoryPq(pqIdentity, signed) } : {}),
+  });
   if (!await directListenerAvailable()) {
     log('direct connections: off (needs node-datachannel 0.33 or later: npm install node-datachannel)');
     return null;
@@ -90,7 +97,7 @@ export async function startDirectRelay({
     withdrawnStale = true;
     try {
       const withdrawal = await createSignedWithdrawal(identity);
-      const response = await fetchImpl(endpoint, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(withdrawal), signal: AbortSignal.timeout(5_000) });
+      const response = await fetchImpl(endpoint, { method: 'DELETE', headers: await headersFor(withdrawal), body: JSON.stringify(withdrawal), signal: AbortSignal.timeout(5_000) });
       const body = await response.json().catch(() => null);
       if (body?.removed) log(`directory: removed this relay's old entry (${why})`);
     } catch (error) {
@@ -115,7 +122,7 @@ export async function startDirectRelay({
       ws: wsUrl() || null,
     });
     try {
-      const response = await fetchImpl(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(record) });
+      const response = await fetchImpl(endpoint, { method: 'POST', headers: await headersFor(record), body: JSON.stringify(record) });
       const body = await response.json().catch(() => null);
       if (!response.ok || !body?.ok) {
         const why = body?.error || `status ${response.status}`;
@@ -153,7 +160,7 @@ export async function startDirectRelay({
       if (published && endpoint) {
         try {
           const withdrawal = await createSignedWithdrawal(identity);
-          await fetchImpl(endpoint, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(withdrawal), signal: AbortSignal.timeout(3_000) });
+          await fetchImpl(endpoint, { method: 'DELETE', headers: await headersFor(withdrawal), body: JSON.stringify(withdrawal), signal: AbortSignal.timeout(3_000) });
         } catch {}
       }
       await mapping?.close().catch(() => {});

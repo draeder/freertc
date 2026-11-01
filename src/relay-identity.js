@@ -248,3 +248,48 @@ export async function verifyLinkChallenge(publicKey, nonce, signature) {
     return false;
   }
 }
+
+// Post-quantum relay keys (local relays: src/node/relay-pq.js). A local relay
+// also holds an ML-DSA-65 key next to its P-256 one, and proves both together
+// (an unsea 3 hybrid signature) where only local relays check: on links
+// between local relays, and to the directory when it lists the relay. Cloud
+// relays do not: on the Workers free plan an ML-DSA signature costs more CPU
+// than a request may use.
+//
+// pqIdentity: { pub, priv, qpub, qpriv } with pub/priv the relay's P-256 keys.
+
+function pqLinkChallengeMessage(nonce, nodeId) {
+  return canonicalJson(['freertc-link-pq', 1, String(nonce), String(nodeId)]);
+}
+
+/** A hybrid signature over a link challenge, bound to this relay's node id. */
+export async function signLinkChallengePq(pqIdentity, nodeId, nonce) {
+  return signMessage(pqLinkChallengeMessage(nonce, nodeId), pqIdentity);
+}
+
+export async function verifyLinkChallengePq(publicKey, pqPublicKey, nodeId, nonce, signature) {
+  try {
+    if (typeof pqPublicKey !== 'string' || typeof signature !== 'string') return false;
+    return await verifyMessage(pqLinkChallengeMessage(nonce, nodeId), signature, { pub: publicKey, qpub: pqPublicKey });
+  } catch {
+    return false;
+  }
+}
+
+/** What a relay signs to show the directory its post-quantum key: the whole signed record (or withdrawal). */
+function pqDirectoryMessage(signed) {
+  return canonicalJson(['freertc-directory-pq', 1, signed]);
+}
+
+export async function signDirectoryPq(pqIdentity, signed) {
+  return signMessage(pqDirectoryMessage(signed), pqIdentity);
+}
+
+export async function verifyDirectoryPq(signed, pqPublicKey, signature) {
+  try {
+    if (typeof pqPublicKey !== 'string' || typeof signature !== 'string') return false;
+    return await verifyMessage(pqDirectoryMessage(signed), signature, { pub: signed.public_key, qpub: pqPublicKey });
+  } catch {
+    return false;
+  }
+}

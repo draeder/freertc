@@ -10,8 +10,12 @@
 //     share a network (see lan-beacon.js).
 // Either way both ends prove who they are before anything else crosses:
 //   each side  → { t: 'challenge', nonce }
-//   each side  → { t: 'hello', record, signature }   its signed node record, and
-//                                                   a signature over the other's nonce
+//   each side  → { t: 'hello', record, signature,    its signed node record, and
+//                  pq_public_key, pq_signature }     a signature over the other's nonce;
+//                                                   with its post-quantum key (relay-pq.js),
+//                                                   also a hybrid one. A relay with pq set
+//                                                   links only to relays that prove one,
+//                                                   the same one as the first time.
 // then requests flow both ways in the tunnel's own frame format:
 //   { t: 'req', id, method, path, headers, body }  →  { t: 'res', id, status, headers, body }
 // The relay's fetch is wrapped (wrapFetch) so a federation call to a linked
@@ -23,7 +27,7 @@
 // the lower node ID dials, so two relays make one link between them.
 
 import { decodeBody, encodeBody, forwardHeaders } from '../tunnel/frames.js';
-import { signLinkChallenge, verifyLinkChallenge, verifySignedRelayRecord } from '../relay-identity.js';
+import { signLinkChallenge, signLinkChallengePq, verifyLinkChallenge, verifyLinkChallengePq, verifySignedRelayRecord } from '../relay-identity.js';
 
 export const LINK_CHANNEL_LABEL = 'freertc-federation';
 export const LINK_PATH = '/api/v1/link';
@@ -76,10 +80,36 @@ export function createRelayLinks({
   maxLinks = MAX_LINKS,
   log = () => {},
   verifyRecord = verifySignedRelayRecord,
+  // { identity: { pub, priv, qpub, qpriv }, pins: { get, set }, required = true }
+  pq = null,
 }) {
   const links = new Map(); // node id -> link
   const lastDial = new Map(); // node id -> when we last tried
   let stopped = false;
+
+  // A post-quantum answer: valid, and the key pinned for that node id (or the
+  // first one seen, which is pinned now).
+  async function pqOk(record, frame, nonce) {
+    const pinned = pq.pins?.get(record.node_id) ?? null;
+    const short = record.node_id.slice(0, 8);
+    if (typeof frame.pq_public_key !== 'string') {
+      if (pinned || pq.required !== false) {
+        log(`refused a link from ${short}: it did not prove a post-quantum key${pinned ? ' (it had one before)' : ''}`);
+        return false;
+      }
+      return true;
+    }
+    if (pinned && pinned !== frame.pq_public_key) {
+      log(`refused a link from ${short}: its post-quantum key is not the one it had before`);
+      return false;
+    }
+    if (!await verifyLinkChallengePq(record.public_key, frame.pq_public_key, record.node_id, nonce, frame.pq_signature)) {
+      log(`refused a link from ${short}: its post-quantum signature did not check out`);
+      return false;
+    }
+    if (!pinned) pq.pins?.set(record.node_id, frame.pq_public_key);
+    return true;
+  }
 
   function attach(socket, { via = 'punch', expectNodeId = null } = {}) {
     const myNonce = randomNonce();
@@ -119,7 +149,15 @@ export function createRelayLinks({
       if (frame?.t === 'challenge' && typeof frame.nonce === 'string') {
         if (answered.has(frame.nonce)) return;
         answered.add(frame.nonce);
-        send({ t: 'hello', record: await nodeRecord(), signature: await signLinkChallenge(identity, frame.nonce) });
+        send({
+          t: 'hello',
+          record: await nodeRecord(),
+          signature: await signLinkChallenge(identity, frame.nonce),
+          ...(pq?.identity ? {
+            pq_public_key: pq.identity.qpub,
+            pq_signature: await signLinkChallengePq(pq.identity, identity.nodeId, frame.nonce),
+          } : {}),
+        });
         return;
       }
       if (frame?.t === 'hello') {
@@ -130,6 +168,7 @@ export function createRelayLinks({
           && await verifyRecord(record)
           && await verifyLinkChallenge(record.public_key, myNonce, frame.signature);
         if (!ok) { log(`link over ${via} failed to identify itself`); link.close(); return; }
+        if (pq && !await pqOk(record, frame, myNonce)) { link.close(); return; }
         clearTimeout(helloTimer);
         const existing = links.get(record.node_id);
         if (existing?.open) { log(`already linked to ${record.node_id.slice(0, 8)}; closing the second link`); link.close(); return; }

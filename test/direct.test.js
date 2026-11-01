@@ -304,3 +304,51 @@ test('a resolver still holding an empty answer does not hide a relay another res
   const found = await lookupDirectRelays({ name: '_stale.test', dohUrls: ['https://stale/dns-query', 'https://fresh/dns-query'], fetchImpl, useCache: false });
   assert.deepEqual(found.map((r) => r.node_id), [record.node_id]);
 });
+
+test('a relay that showed the directory a post-quantum key is listed or withdrawn only with that key', async () => {
+  const { openSqliteD1 } = await import('../src/node/d1-sqlite.js');
+  const { signDirectoryPq } = await import('../src/relay-identity.js');
+  const { PQ_KEY_HEADER, PQ_SIGNATURE_HEADER } = await import('../src/direct/directory.js');
+  const emptyMigrations = mkdtempSync(path.join(tmpdir(), 'freertc-mig-'));
+  const env = { ...ENV, DB: await openSqliteD1({ filename: ':memory:', migrationsDir: emptyMigrations }) };
+  const cf = fakeCloudflare();
+  const pair = await generateRandomPair();
+  const id = await createRelayIdentity(pair.pub, pair.priv);
+  const pq = { pub: pair.pub, priv: pair.priv, qpub: pair.qpub, qpriv: pair.qpriv };
+  const send = async (body, keys, method = 'POST') => {
+    const headers = { 'CF-Connecting-IP': '203.0.113.7' };
+    if (keys) Object.assign(headers, { [PQ_KEY_HEADER]: keys.qpub, [PQ_SIGNATURE_HEADER]: await signDirectoryPq(keys, body) });
+    return handleDirectoryRequest(new Request('https://peer.ooo/api/v1/directory', { method, body: JSON.stringify(body), headers }), env, { fetchImpl: cf.fetchImpl });
+  };
+  const direct = directRelayUrl({ host: '203.0.113.7', port: 9443, fingerprint: FP });
+
+  const first = await send(await createSignedDirectoryRecord(id, { direct }), pq);
+  assert.equal(first.status, 200, await first.clone().text());
+  assert.equal((await first.json()).published, true);
+
+  // P-256 alone (what a forger of the relay's ECDSA signature has) is refused now.
+  const plain = await send(await createSignedDirectoryRecord(id, { direct, name: 'changed' }), null);
+  assert.equal(plain.status, 403);
+  // So is another post-quantum key for the same node id.
+  const other = await generateRandomPair();
+  const swapped = await send(await createSignedDirectoryRecord(id, { direct, name: 'changed' }), { ...pq, qpub: other.qpub, qpriv: other.qpriv });
+  assert.equal(swapped.status, 403);
+  assert.match((await swapped.json()).error, /not the post-quantum key/);
+  // A signature over another record does not carry over.
+  const record = await createSignedDirectoryRecord(id, { direct });
+  const mismatched = await handleDirectoryRequest(new Request('https://peer.ooo/api/v1/directory', {
+    method: 'POST', body: JSON.stringify(record),
+    headers: { 'CF-Connecting-IP': '203.0.113.7', [PQ_KEY_HEADER]: pq.qpub, [PQ_SIGNATURE_HEADER]: await signDirectoryPq(pq, { ...record, name: 'x' }) },
+  }), env, { fetchImpl: cf.fetchImpl });
+  assert.equal(mismatched.status, 403);
+
+  assert.equal((await send(await createSignedWithdrawal(id), null, 'DELETE')).status, 403, 'nor withdrawn without it');
+  const withdrawn = await send(await createSignedWithdrawal(id), pq, 'DELETE');
+  assert.equal((await withdrawn.json()).removed, 1);
+
+  // A relay that never showed a key (older code) is listed as before.
+  const plainPair = await generateRandomPair();
+  const plainId = await createRelayIdentity(plainPair.pub, plainPair.priv);
+  const old = await handleDirectoryRequest(post(await createSignedDirectoryRecord(plainId, { direct: directRelayUrl({ host: '203.0.113.9', port: 9443, fingerprint: FP }) }), '203.0.113.9'), env, { fetchImpl: cf.fetchImpl });
+  assert.equal(old.status, 200);
+});
