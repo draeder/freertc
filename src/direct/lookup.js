@@ -58,7 +58,9 @@ export async function lookupDirectRelays({
     }
   }
   if (!records) return [];
-  const live = records.filter((record) => Number(record.expires_at_ms) > now);
+  // Newest first: an older entry is likelier to be a relay that went away.
+  const live = records.filter((record) => Number(record.expires_at_ms) > now)
+    .sort((a, b) => Number(b.issued_at_ms) - Number(a.issued_at_ms));
   return network !== undefined && room !== undefined ? rankDirectoryRecords(live, network, room) : live;
 }
 

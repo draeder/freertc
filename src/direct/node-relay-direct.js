@@ -28,7 +28,7 @@ function lanEndpoints(port) {
   return out.slice(0, 4);
 }
 
-const REPUBLISH_MS = 30 * 60_000;
+const REPUBLISH_MS = 20 * 60_000;
 
 export async function startDirectRelay({
   identity,

@@ -73,7 +73,7 @@ function tunnelUrlOk(value, nodeId) {
   }
 }
 
-export async function createSignedDirectoryRecord(identity, { direct, tunnel = null, name = null, capacity = 10_000, ttlMs = 24 * 60 * 60_000, now = Date.now(), lan = [], ws = null }) {
+export async function createSignedDirectoryRecord(identity, { direct, tunnel = null, name = null, capacity = 10_000, ttlMs = 2 * 60 * 60_000, now = Date.now(), lan = [], ws = null }) {
   if (!parseDirectRelayUrl(direct)) throw new TypeError('direct must be a webrtc-direct URL');
   if (!tunnelUrlOk(tunnel, identity.nodeId)) throw new TypeError('tunnel must be this relay\'s own tunnel URL');
   const payload = {

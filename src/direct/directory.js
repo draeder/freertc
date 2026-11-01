@@ -19,7 +19,8 @@ import { parseDirectRelayUrl } from './common.js';
 export const DIRECTORY_PATH = '/api/v1/directory';
 const CLOUDFLARE_API = 'https://api.cloudflare.com/client/v4';
 const MIN_PUBLISH_INTERVAL_MS = 60_000;
-const REFRESH_BEFORE_EXPIRY_MS = 12 * 60 * 60_000;
+const REFRESH_BEFORE_EXPIRY_MS = 60 * 60_000;
+const PROBE_TIMEOUT_MS = 4_000;
 const DNS_TTL_SECONDS = 300;
 const MAX_CLEANUP_PER_CALL = 5;
 
@@ -59,15 +60,36 @@ async function listDirectory(env, fetchImpl, extra = '') {
   return (await cloudflare(env, 'GET', `/dns_records?type=TXT&name=${name}&per_page=100${extra}`, undefined, fetchImpl)) || [];
 }
 
-// Drop entries whose record has expired or no longer verifies (a relay that
-// went away without withdrawing). Bounded per call.
+// Is the relay behind this entry still there? Only entries with an open ws
+// port can be checked from here: its /health must answer, and with this
+// entry's node id when it reports one. A relay that stopped without
+// withdrawing (crash, lost network, the cloud was down when it tried) fails
+// this, and so does an old entry whose forwarded port now reaches a
+// different relay on the same network.
+async function stillThere(record, fetchImpl) {
+  if (!record.ws) return true;
+  const url = String(record.ws).replace(/^ws:/, 'http:').replace(/\/ws$/, '/health');
+  try {
+    const response = await fetchImpl(url, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+    if (!response.ok) return false;
+    const health = await response.json().catch(() => null);
+    return !health?.node_id || health.node_id === record.node_id;
+  } catch {
+    return false;
+  }
+}
+
+// Drop entries whose record has expired, no longer verifies, or whose relay
+// is gone. Bounded per call; the checks run side by side.
 async function cleanup(env, fetchImpl, entries, now) {
-  let removed = 0;
-  for (const entry of entries) {
-    if (removed >= MAX_CLEANUP_PER_CALL) break;
-    if (!String(entry.comment || '').startsWith('freertc:')) continue;
+  const ours = entries.filter((entry) => String(entry.comment || '').startsWith('freertc:')).slice(0, 4 * MAX_CLEANUP_PER_CALL);
+  const verdicts = await Promise.all(ours.map(async (entry) => {
     const record = decodeDirectoryTxt(entry.content);
-    if (record && await verifyDirectoryRecord(record, { now })) continue;
+    if (!record || !await verifyDirectoryRecord(record, { now })) return entry;
+    return await stillThere(record, fetchImpl) ? null : entry;
+  }));
+  let removed = 0;
+  for (const entry of verdicts.filter(Boolean).slice(0, MAX_CLEANUP_PER_CALL)) {
     await cloudflare(env, 'DELETE', `/dns_records/${entry.id}`, undefined, fetchImpl).catch(() => {});
     removed += 1;
   }
@@ -105,8 +127,12 @@ export async function handleDirectoryRequest(request, env, { fetchImpl = globalT
       || !sameList(current.lan, body.lan) || (current.ws ?? null) !== (body.ws ?? null);
     // An unchanged entry is rewritten only as it nears expiry, so a relay that
     // republishes on a timer costs no DNS writes.
+    const others = all.filter((entry) => entry.comment !== commentFor(body.node_id));
     if (!changed && Number(current.expires_at_ms) - now > REFRESH_BEFORE_EXPIRY_MS) {
-      return json({ ok: true, published: false, reason: 'unchanged' });
+      // Republishes are the directory's heartbeat: each one also clears out
+      // relays that went away.
+      const removed = await cleanup(env, fetchImpl, others, now);
+      return json({ ok: true, published: false, reason: 'unchanged', cleaned: removed });
     }
     if (changed && current && now - Number(current.issued_at_ms) < MIN_PUBLISH_INTERVAL_MS) {
       return json({ ok: false, error: 'changed too recently; try again in a few minutes' }, 429);
@@ -122,7 +148,7 @@ export async function handleDirectoryRequest(request, env, { fetchImpl = globalT
     if (mine[0]) await cloudflare(env, 'PUT', `/dns_records/${mine[0].id}`, entry, fetchImpl);
     else await cloudflare(env, 'POST', '/dns_records', entry, fetchImpl);
     for (const extra of mine.slice(1)) await cloudflare(env, 'DELETE', `/dns_records/${extra.id}`, undefined, fetchImpl).catch(() => {});
-    const removed = await cleanup(env, fetchImpl, all.filter((entry) => entry.comment !== commentFor(body.node_id)), now);
+    const removed = await cleanup(env, fetchImpl, others, now);
     return json({ ok: true, published: true, cleaned: removed });
   } catch (error) {
     return json({ ok: false, error: String(error?.message || error).slice(0, 200) }, 502);

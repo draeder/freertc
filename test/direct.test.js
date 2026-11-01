@@ -130,12 +130,18 @@ test('peers find relays with one DNS-over-HTTPS lookup and keep only valid ones'
   assert.deepEqual(again.map((r) => r.node_id), found.map((r) => r.node_id), 'the same order for the same room');
 });
 
-function fakeCloudflare() {
+function fakeCloudflare(health = {}) {
   const records = new Map();
   let next = 1;
   const calls = [];
   const fetchImpl = async (url, options = {}) => {
     const u = new URL(url);
+    if (u.hostname !== 'api.cloudflare.com') {
+      calls.push(`PROBE ${u.host}${u.pathname}`);
+      const answer = health[u.host];
+      if (!answer) throw new TypeError('fetch failed');
+      return new Response(JSON.stringify(answer));
+    }
     const method = options.method || 'GET';
     calls.push(`${method} ${u.pathname.replace(/^.*dns_records/, 'dns_records')}`);
     assert.equal(options.headers.Authorization, 'Bearer token-1');
@@ -209,6 +215,46 @@ test('a relay withdraws only its own entry, and dead entries are cleaned up', as
   const withdrawn = await (await handleDirectoryRequest(post(await createSignedWithdrawal(a), '1.1.1.1', 'DELETE'), ENV, { fetchImpl: cf.fetchImpl })).json();
   assert.equal(withdrawn.removed, 1);
   assert.equal([...cf.records.values()].some((r) => r.comment === `freertc:${a.nodeId}`), false);
+});
+
+test('republishing clears out listed relays that are gone or answered by another relay', async () => {
+  const a = await identity();
+  const gone = await identity();
+  const replaced = await identity();
+  const alive = await identity();
+  const cf = fakeCloudflare({
+    '203.0.113.9:8788': { ok: true, node_id: a.nodeId }, // the port now reaches relay a
+    '203.0.113.10:8788': { ok: true, node_id: null }, // says nothing about who it is
+  });
+  const listed = async (id, host, ws) => {
+    const record = await createSignedDirectoryRecord(id, { direct: directRelayUrl({ host, port: 9443, fingerprint: FP }), ws });
+    cf.records.set(id.nodeId, { id: id.nodeId, type: 'TXT', name: '_relays.peer.ooo', content: encodeDirectoryTxt(record), comment: `freertc:${id.nodeId}` });
+  };
+  await listed(a, '203.0.113.9', 'ws://203.0.113.9:8788/ws');
+  await listed(gone, '203.0.113.8', 'ws://203.0.113.8:8788/ws');
+  await listed(replaced, '203.0.113.9', 'ws://203.0.113.9:8788/ws');
+  await listed(alive, '203.0.113.10', 'ws://203.0.113.10:8788/ws');
+  const behindNat = await identity();
+  const noPort = await createSignedDirectoryRecord(behindNat, { direct: directRelayUrl({ host: '203.0.113.11', port: 9443, fingerprint: FP }) });
+  cf.records.set('nat', { id: 'nat', type: 'TXT', name: '_relays.peer.ooo', content: encodeDirectoryTxt(noPort), comment: `freertc:${behindNat.nodeId}` });
+
+  const again = await createSignedDirectoryRecord(a, { direct: directRelayUrl({ host: '203.0.113.9', port: 9443, fingerprint: FP }), ws: 'ws://203.0.113.9:8788/ws' });
+  const result = await (await handleDirectoryRequest(post(again, '203.0.113.9'), ENV, { fetchImpl: cf.fetchImpl })).json();
+  assert.equal(result.published, false, 'unchanged');
+  assert.equal(result.cleaned, 2);
+  assert.equal(cf.records.has(gone.nodeId), false, 'nobody answers: removed');
+  assert.equal(cf.records.has(replaced.nodeId), false, 'another relay answers its port: removed');
+  assert.equal(cf.records.has(alive.nodeId), true);
+  assert.equal(cf.records.has('nat'), true, 'no open port to check: kept');
+  assert.equal(cf.records.has(a.nodeId), true);
+});
+
+test('the directory lookup puts the newest entry first', async () => {
+  const older = await createSignedDirectoryRecord(await identity(), { direct: directRelayUrl({ host: '203.0.113.20', port: 9443, fingerprint: FP }), now: Date.now() - 60 * 60_000 });
+  const newer = await createSignedDirectoryRecord(await identity(), { direct: directRelayUrl({ host: '203.0.113.21', port: 9443, fingerprint: FP }) });
+  const fetchImpl = async () => new Response(JSON.stringify({ Answer: [older, newer].map((r) => ({ type: 16, data: encodeDirectoryTxt(r) })) }));
+  const found = await lookupDirectRelays({ name: '_newest.test', dohUrls: ['https://x/dns-query'], fetchImpl, useCache: false });
+  assert.deepEqual(found.map((r) => r.node_id), [newer.node_id, older.node_id]);
 });
 
 test('the directory is off without a token', async () => {
