@@ -195,7 +195,7 @@ export const STATS_PAGE = `<!doctype html>
     const c = s.credit;
     if (c) {
       $('credit').textContent = c.total.toLocaleString(undefined, { maximumFractionDigits: c.total < 10 ? 3 : 1 });
-      $('credit-sub').textContent = num(Math.round(c.connectionMinutes)) + ' connection-min · ' + num(c.messagesDelivered) + ' delivered · since ' + new Date(c.since).toLocaleDateString();
+      $('credit-sub').textContent = (c.connectionMinutes / 60).toLocaleString(undefined, { maximumFractionDigits: c.connectionMinutes < 600 ? 1 : 0 }) + ' connection-hr · ' + num(c.messagesDelivered) + ' delivered · since ' + new Date(c.since).toLocaleDateString();
     }
     // Account numbers come only to this machine itself (localhost).
     for (const id of ['acc-tile', 'acc-section', 'events-section']) $(id).hidden = !a;
