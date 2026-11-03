@@ -72,3 +72,15 @@ test('relay stats: account numbers only for this machine itself', async () => {
     assert.deepEqual(statsFor(snap, other), { traffic: {} }, String(other));
   }
 });
+
+test('relay stats: credit adds up connection-minutes and messages delivered, from where it was kept', async () => {
+  const { creditOf } = await import('../src/node/relay-stats.js');
+  assert.equal(creditOf({ connectionMinutes: 1000 }), 1);
+  assert.equal(creditOf({ messagesDelivered: 400 }), 1);
+  const stats = createRelayStats({ credit: { since: 5, connectionMinutes: 2000, messagesDelivered: 0 } });
+  try {
+    const c = stats.snapshot().credit;
+    assert.equal(c.since, 5);
+    assert.equal(c.total, 2);
+  } finally { stats.stop(); }
+});

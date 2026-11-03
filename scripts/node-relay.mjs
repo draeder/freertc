@@ -208,7 +208,17 @@ const meter = createCostMeter();
 const STATS_MODE = ['public', 'off'].includes(String(process.env.FREERTC_STATS || '').trim().toLowerCase())
   ? String(process.env.FREERTC_STATS).trim().toLowerCase()
   : 'local';
-const stats = createRelayStats();
+// Credit (what this relay has served) is kept in <data dir>/credit.json across restarts.
+const CREDIT_FILE = path.join(DATA_DIR, 'credit.json');
+const stats = createRelayStats({ credit: (() => { try { return JSON.parse(readFileSync(CREDIT_FILE, 'utf8')); } catch { return null; } })() });
+const saveCredit = () => {
+  try {
+    writeFileSync(`${CREDIT_FILE}.tmp`, JSON.stringify(stats.creditState()));
+    renameSync(`${CREDIT_FILE}.tmp`, CREDIT_FILE);
+  } catch {}
+};
+setInterval(saveCredit, 60_000).unref();
+process.on('exit', saveCredit);
 // Punched connections need WebRTC in this process (werift, an optional dependency).
 const PUNCH = !isOff(process.env.FREERTC_PUNCH) && await punchOfferAvailable();
 const env = {
@@ -946,6 +956,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     stopping = true;
     stoppingAt = Date.now();
     console.log('[node-relay] stopping (Ctrl-C again to stop at once)');
+    saveCredit();
     setTimeout(() => process.exit(0), 3_000);
     Promise.all([directRelay?.stop().catch(() => {}), openPortMapping?.close().catch(() => {})])
       .finally(() => process.exit(0));

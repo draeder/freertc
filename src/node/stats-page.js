@@ -73,6 +73,7 @@ export const STATS_PAGE = `<!doctype html>
     <div class="tile"><h2>Connections</h2><p class="big" id="conn">–</p><p class="sub" id="conn-sub"></p></div>
     <div class="tile"><h2>Messages</h2><p class="big" id="msgs">–</p><p class="sub" id="msgs-sub"></p></div>
     <div class="tile"><h2>Bandwidth</h2><p class="big" id="bw">–</p><p class="sub" id="bw-sub"></p></div>
+    <div class="tile"><h2>Credit</h2><p class="big" id="credit">–</p><p class="sub" id="credit-sub"></p></div>
     <div class="tile" id="acc-tile"><h2>Accounts kept</h2><p class="big" id="acc">–</p><p class="sub" id="acc-sub"></p></div>
   </div>
 
@@ -191,6 +192,11 @@ export const STATS_PAGE = `<!doctype html>
     $('msgs-sub').textContent = num(t.messagesIn) + ' in · ' + num(t.messagesOut) + ' out';
     $('bw').innerHTML = bytes(r.bytesInPerSecond + r.bytesOutPerSecond) + '<small>/s</small>';
     $('bw-sub').textContent = bytes(t.bytesIn + t.httpBytesIn) + ' in · ' + bytes(t.bytesOut + t.httpBytesOut) + ' out';
+    const c = s.credit;
+    if (c) {
+      $('credit').textContent = c.total.toLocaleString(undefined, { maximumFractionDigits: c.total < 10 ? 3 : 1 });
+      $('credit-sub').textContent = num(Math.round(c.connectionMinutes)) + ' connection-min · ' + num(c.messagesDelivered) + ' delivered · since ' + new Date(c.since).toLocaleDateString();
+    }
     // Account numbers come only to this machine itself (localhost).
     for (const id of ['acc-tile', 'acc-section', 'events-section']) $(id).hidden = !a;
     if (a) {

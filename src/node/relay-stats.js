@@ -9,6 +9,9 @@
 //   performance this process (CPU, memory, event-loop delay) and the machine
 //               (load, memory, CPUs)
 //   history     a sample every 5 s for the last hour, for the charts
+//   credit      what this relay has served, added up across restarts (kept
+//               by the caller, <data dir>/credit.json): connection-minutes and
+//               messages delivered, and one number weighing them (CREDIT_PER)
 //
 // Counters only: no peer IDs, addresses or account names are kept.
 
@@ -16,6 +19,17 @@ import os from 'node:os';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 
 const SAMPLE_MS = 5_000;
+
+// One credit for every 1,000 connection-minutes, or every 400 messages
+// delivered: the same weighing as a hosted realtime service's list price
+// (about $1 per million connection-minutes, $2.50 per million messages), so a
+// credit is about a tenth of a US cent of service. Unnamed for now.
+export const CREDIT_PER = { connectionMinutes: 1 / 1000, messagesDelivered: 1 / 400 };
+
+/** The credit for what was served. */
+export function creditOf({ connectionMinutes = 0, messagesDelivered = 0 } = {}) {
+  return connectionMinutes * CREDIT_PER.connectionMinutes + messagesDelivered * CREDIT_PER.messagesDelivered;
+}
 const HISTORY_SAMPLES = 720; // an hour
 
 const byteLength = (data) => {
@@ -26,8 +40,14 @@ const byteLength = (data) => {
   return Buffer.byteLength(String(data));
 };
 
-export function createRelayStats({ now = () => Date.now() } = {}) {
+export function createRelayStats({ now = () => Date.now(), credit: earlier = null } = {}) {
   const startedAt = now();
+  // Added up across restarts: starts from what the caller kept.
+  const served = {
+    since: Number(earlier?.since) || startedAt,
+    connectionMinutes: Number(earlier?.connectionMinutes) || 0,
+    messagesDelivered: Number(earlier?.messagesDelivered) || 0,
+  };
   const traffic = {
     httpRequests: 0,
     httpBytesIn: 0,
@@ -142,6 +162,10 @@ export function createRelayStats({ now = () => Date.now() } = {}) {
       rssMb: memory.rss / 1048576,
     };
     loopDelay.reset();
+    // Connections held over this sample, and messages delivered in it.
+    served.connectionMinutes += (last.connectionsOpen ?? traffic.connectionsOpen) * seconds / 60;
+    served.messagesDelivered += traffic.messagesOut - last.messagesOut;
+    point.credit = creditOf(served);
     history.push(point);
     if (history.length > HISTORY_SAMPLES) history.shift();
     latest = point;
@@ -185,13 +209,20 @@ export function createRelayStats({ now = () => Date.now() } = {}) {
         memoryFreeMb: os.freemem() / 1048576,
         uptimeSeconds: Math.round(os.uptime()),
       },
+      credit: creditState(),
       events: events(),
       history,
     };
   }
 
+  /** What was served so far (to keep across restarts) and its credit. */
+  function creditState() {
+    return { ...served, total: creditOf(served) };
+  }
+
   return {
     watchSocket,
+    creditState,
     http,
     account,
     accountOutbound,
