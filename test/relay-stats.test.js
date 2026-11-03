@@ -61,3 +61,14 @@ test('the dashboard answers only this machine and its network by default', () =>
     assert.equal(isLocalAddress(address), false, String(address));
   }
 });
+
+test('relay stats: account numbers only for this machine itself', async () => {
+  const { statsFor } = await import('../src/node/relay-stats.js');
+  const snap = { traffic: {}, accounts: { stored: 1 }, events: ['x'] };
+  assert.deepEqual(statsFor(snap, '127.0.0.1'), snap);
+  assert.deepEqual(statsFor(snap, '::ffff:127.0.0.1'), snap);
+  assert.deepEqual(statsFor(snap, '::1'), snap);
+  for (const other of ['192.168.50.5', '67.52.200.58', '', undefined]) {
+    assert.deepEqual(statsFor(snap, other), { traffic: {} }, String(other));
+  }
+});

@@ -208,6 +208,19 @@ export function createRelayStats({ now = () => Date.now() } = {}) {
   };
 }
 
+/** Whether an address is this machine itself (loopback). */
+export function isLoopbackAddress(address) {
+  const value = String(address || '').replace(/^::ffff:/, '').toLowerCase();
+  return value === '::1' || value === 'localhost' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(value);
+}
+
+/** The stats as one caller may see them: accounts only on this machine itself. */
+export function statsFor(snapshot, address) {
+  if (isLoopbackAddress(address)) return snapshot;
+  const { accounts, events, ...rest } = snapshot;
+  return rest;
+}
+
 /** Whether an address is this machine or the local network (loopback, private, link-local). */
 export function isLocalAddress(address) {
   const value = String(address || '').replace(/^::ffff:/, '').toLowerCase();

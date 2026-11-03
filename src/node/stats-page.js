@@ -42,6 +42,7 @@ export const STATS_PAGE = `<!doctype html>
   .key { display: flex; gap: 14px; font-size: 0.75rem; color: var(--bone-3); margin-top: 4px; }
   .key i { display: inline-block; width: 10px; height: 2px; vertical-align: middle; margin-right: 5px; }
   section { margin-top: 28px; }
+  [hidden] { display: none !important; }
   section > h2 { font-size: 1rem; font-weight: 700; margin-bottom: 10px; }
   .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; align-items: start; }
   .state { color: var(--bone-2); margin: -2px 0 12px; word-break: break-word; }
@@ -72,7 +73,7 @@ export const STATS_PAGE = `<!doctype html>
     <div class="tile"><h2>Connections</h2><p class="big" id="conn">–</p><p class="sub" id="conn-sub"></p></div>
     <div class="tile"><h2>Messages</h2><p class="big" id="msgs">–</p><p class="sub" id="msgs-sub"></p></div>
     <div class="tile"><h2>Bandwidth</h2><p class="big" id="bw">–</p><p class="sub" id="bw-sub"></p></div>
-    <div class="tile"><h2>Accounts kept</h2><p class="big" id="acc">–</p><p class="sub" id="acc-sub"></p></div>
+    <div class="tile" id="acc-tile"><h2>Accounts kept</h2><p class="big" id="acc">–</p><p class="sub" id="acc-sub"></p></div>
   </div>
 
   <div class="charts">
@@ -86,7 +87,7 @@ export const STATS_PAGE = `<!doctype html>
     <div class="chart"><div class="chart-head"><h3>Memory (this relay)</h3><span id="c-mem"></span></div><svg id="g-mem" preserveAspectRatio="none"></svg></div>
   </div>
 
-  <section>
+  <section id="acc-section">
     <h2>Accounts</h2>
     <div class="cols">
       <dl id="acc-browsers"></dl>
@@ -94,7 +95,7 @@ export const STATS_PAGE = `<!doctype html>
     </div>
   </section>
 
-  <section>
+  <section id="events-section">
     <h2>Account events between relays</h2>
     <ul class="relays" id="events"></ul>
   </section>
@@ -190,6 +191,9 @@ export const STATS_PAGE = `<!doctype html>
     $('msgs-sub').textContent = num(t.messagesIn) + ' in · ' + num(t.messagesOut) + ' out';
     $('bw').innerHTML = bytes(r.bytesInPerSecond + r.bytesOutPerSecond) + '<small>/s</small>';
     $('bw-sub').textContent = bytes(t.bytesIn + t.httpBytesIn) + ' in · ' + bytes(t.bytesOut + t.httpBytesOut) + ' out';
+    // Account numbers come only to this machine itself (localhost).
+    for (const id of ['acc-tile', 'acc-section', 'events-section']) $(id).hidden = !a;
+    if (a) {
     $('acc').textContent = num(a.stored);
     $('acc-sub').textContent = num(a.lookups) + ' looked up · ' + num(a.registrations) + ' saved';
 
@@ -223,12 +227,13 @@ export const STATS_PAGE = `<!doctype html>
       ['Received from other relays', num(a.receivedFromRelays)],
       ['Looked up by other relays', num(a.askedByRelays)],
     ]);
+    }
 
     $('fed-state').textContent = f.federation || 'Federation is off.';
     rows($('fed'), [
       ['Linked local relays', num(f.linked || 0)],
       ['Post-quantum links', f.postQuantum ? 'on' : '<span class="muted">off</span>'],
-      ['Accounts shared with relays', f.accountsShared ? 'yes' : '<span class="muted">no</span>'],
+      ...(a ? [['Accounts shared with relays', f.accountsShared ? 'yes' : '<span class="muted">no</span>']] : []),
     ]);
     const events = (s.events || []).slice().reverse();
     $('events').innerHTML = events.length

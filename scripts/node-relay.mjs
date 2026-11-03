@@ -66,7 +66,7 @@ import WsClient, { WebSocketServer } from 'ws';
 import { installWebSocketPair, serverSocketOf } from '../src/node/websocket-pair.js';
 import { openSqliteD1 } from '../src/node/d1-sqlite.js';
 import { createCostMeter } from '../src/node/cost-meter.js';
-import { createRelayStats, isLocalAddress } from '../src/node/relay-stats.js';
+import { createRelayStats, isLocalAddress, statsFor } from '../src/node/relay-stats.js';
 import { STATS_PAGE } from '../src/node/stats-page.js';
 import { ACCOUNT_SYNC_ACTION, ACCOUNT_SYNC_EVERY_MS, createAccountSync, createSyncRequest, verifySyncRequest } from '../src/node/account-sync.js';
 import { PUNCH_OFFER_PATH, createPunchOfferHandler, punchOfferAvailable } from '../src/punch/offer.js';
@@ -381,7 +381,7 @@ const handler = async (req, res) => {
         res.end(STATS_PAGE);
       } else {
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-        res.end(JSON.stringify(stats.snapshot()));
+        res.end(JSON.stringify(statsFor(stats.snapshot(), req.socket?.remoteAddress))); // accounts: this machine only
       }
       return;
     }
@@ -799,6 +799,25 @@ function startHomeTunnel(startTunnel, identity, directoryHomes) {
 // call this relay there, and federate as ws://<public ip>:<port>/ws. Relays
 // call it straight (from a Worker, over a TCP socket); no tunnel is opened.
 let openPortMapping = null;
+let openPortUrl = null; // ws://<public ip>:<port>/ws, kept to fall back to
+
+// Federate as wss://<name>:<tls port>/ws once the TLS listener is up, when this
+// relay is reached through its open port (the same router forwards both).
+// If no relay accepts that address, go back to the bare ws:// one.
+async function federateUnderName() {
+  if (!servingWss || !openPortMapping || env.RELAY_URL === servingWss) return;
+  const before = env.RELAY_URL;
+  env.RELAY_URL = servingWss;
+  console.log(`[node-relay] federating under its name: ${servingWss}`);
+  await heartbeat();
+  if (!String(federationState || '').startsWith('federated as') && openPortUrl) {
+    console.log(`[node-relay] no relay took ${servingWss}; back to ${openPortUrl}`);
+    env.RELAY_URL = before || openPortUrl;
+    await heartbeat();
+    return;
+  }
+  setTimeout(() => directRelay?.republish().catch(() => {}), 2_000).unref();
+}
 async function openPublicPort() {
   const log = (line) => console.log(`${new Date().toLocaleTimeString([], { hour12: false })} [node-relay:open-port] ${line}`);
   const { mapTcpPort, isNonPublicIPv4 } = await import('../src/direct/portmap.js');
@@ -832,10 +851,12 @@ async function openPublicPort() {
         break;
       }
       openPortMapping = mapping;
-      env.RELAY_URL = url;
+      openPortUrl = url;
+      // A relay with its own name and certificate federates under that name.
+      env.RELAY_URL = servingWss || url;
       log(`router forwards tcp ${mapping.externalIp}:${mapping.externalPort} here (${mapping.method}) and ${new URL(home).host} reached it: no tunnel`);
       setTimeout(() => directRelay?.republish().catch(() => {}), 2_000).unref();
-      console.log(`[node-relay] joining federation as ${url}`);
+      console.log(`[node-relay] joining federation as ${env.RELAY_URL}`);
       heartbeat();
       setTimeout(() => relayLinks?.maintain().catch(() => {}), 5_000).unref();
       return true;
@@ -1044,6 +1065,7 @@ if (nameSettings) {
         tlsServer.listen(TLS_PORT, HOST, () => {
           servingWss = `wss://${name}:${TLS_PORT}/ws`;
           log(`serving ${servingWss} and https://${name}:${TLS_PORT}/stats`);
+          federateUnderName().catch((error) => log(`federating under the name: ${error?.message || error}`));
         });
       },
       onAddress: (url) => {
