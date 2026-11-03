@@ -85,3 +85,9 @@ test('freertc name: arguments, and the same relay identity the relay uses', asyn
   const a = await relayIdentity(dir), b = await relayIdentity(dir);
   assert.equal(a.nodeId, b.nodeId, 'kept in the data directory, as the relay keeps it');
 });
+
+test('freertc name: reads the token wrangler prints over several lines', async () => {
+  const { tokenFromOutput } = await import('../scripts/name-setup.mjs');
+  assert.equal(tokenFromOutput('{\n    "type": "oauth",\n    "token": "abc123.def-456_xyz7890"\n}\n'), 'abc123.def-456_xyz7890');
+  assert.equal(tokenFromOutput('Not logged in.'), null);
+});

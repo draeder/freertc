@@ -71,14 +71,27 @@ function wrangler(args, options = {}) {
   return spawnSync(npx, ['--yes', LOGIN_WRANGLER, ...args], { cwd: ROOT, encoding: 'utf8', env: process.env, shell: process.platform === 'win32', ...options });
 }
 
-function oauthToken() {
-  const result = wrangler(['auth', 'token', '--json'], { stdio: ['ignore', 'pipe', 'pipe'] });
-  try {
-    const parsed = JSON.parse(String(result.stdout).trim().split('\n').filter((l) => l.trim().startsWith('{')).pop());
-    return parsed?.token || null;
-  } catch {
-    return null;
+/** The login's token, from `wrangler auth token --json` (printed over several lines). */
+export function tokenFromOutput(stdout) {
+  const text = String(stdout || '');
+  const start = text.indexOf('{'), end = text.lastIndexOf('}');
+  if (start >= 0 && end > start) {
+    try {
+      const parsed = JSON.parse(text.slice(start, end + 1));
+      if (typeof parsed?.token === 'string' && parsed.token) return parsed.token;
+    } catch { /* not JSON */ }
   }
+  return null;
+}
+
+function oauthToken() {
+  const json = wrangler(['auth', 'token', '--json'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const token = tokenFromOutput(json.stdout);
+  if (token) return token;
+  // Without --json it prints just the token, on its own line.
+  const plain = wrangler(['auth', 'token'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const line = String(plain.stdout || '').trim().split('\n').map((l) => l.trim()).filter(Boolean).pop() || '';
+  return /^[A-Za-z0-9._-]{20,}$/.test(line) ? line : null;
 }
 
 function login() {
