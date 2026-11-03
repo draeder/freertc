@@ -45,9 +45,11 @@
 //   FREERTC_LINKS              on (default) | off — link to other local relays (punched data
 //                              channels, or the LAN) and send federation calls to them over the
 //                              link instead of out through a cloud tunnel home
-//   FREERTC_STATS              local (default) | public | off — the relay's dashboard at
-//                              /stats (and /api/v1/stats): local answers only this machine and
-//                              its network (loopback and private addresses)
+//   FREERTC_STATS              local (default) | private | public | off — the relay's dashboard
+//                              at /stats (and /api/v1/stats): local answers this machine, its
+//                              network (loopback and private addresses), and anyone through the
+//                              relay's own https name; private only this machine and its network.
+//                              Account numbers only ever go to this machine itself
 //   FREERTC_PQ                 on (default) | off — give this relay a post-quantum (ML-DSA-65) key
 //                              next to its P-256 one (<data dir>/relay-pq.json): links to other
 //                              local relays need a hybrid proof, pinned per relay on first sight
@@ -66,7 +68,7 @@ import WsClient, { WebSocketServer } from 'ws';
 import { installWebSocketPair, serverSocketOf } from '../src/node/websocket-pair.js';
 import { openSqliteD1 } from '../src/node/d1-sqlite.js';
 import { createCostMeter } from '../src/node/cost-meter.js';
-import { createRelayStats, isLocalAddress, statsFor } from '../src/node/relay-stats.js';
+import { createRelayStats, isLocalAddress, statsAllowed, statsFor } from '../src/node/relay-stats.js';
 import { STATS_PAGE } from '../src/node/stats-page.js';
 import { ACCOUNT_SYNC_ACTION, ACCOUNT_SYNC_EVERY_MS, createAccountSync, createSyncRequest, verifySyncRequest } from '../src/node/account-sync.js';
 import { PUNCH_OFFER_PATH, createPunchOfferHandler, punchOfferAvailable } from '../src/punch/offer.js';
@@ -205,7 +207,7 @@ if (!FEDERATION) {
 // What this relay would cost as a Cloudflare worker (src/node/cost-meter.js); GET /debug/cost.
 const meter = createCostMeter();
 // The relay's own numbers for its dashboard (src/node/relay-stats.js); GET /stats.
-const STATS_MODE = ['public', 'off'].includes(String(process.env.FREERTC_STATS || '').trim().toLowerCase())
+const STATS_MODE = ['public', 'private', 'off'].includes(String(process.env.FREERTC_STATS || '').trim().toLowerCase())
   ? String(process.env.FREERTC_STATS).trim().toLowerCase()
   : 'local';
 // Credit (what this relay has served) is kept in <data dir>/credit.json across restarts.
@@ -381,7 +383,7 @@ const handler = async (req, res) => {
       return;
     }
     if ((pathname === '/stats' || pathname === '/api/v1/stats') && req.method === 'GET' && STATS_MODE !== 'off') {
-      if (STATS_MODE === 'local' && !isLocalAddress(req.socket?.remoteAddress)) {
+      if (!statsAllowed({ mode: STATS_MODE, address: req.socket?.remoteAddress, encrypted: req.socket?.encrypted, host: req.headers.host, name: relayName?.name })) {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('Not found');
         return;
@@ -1109,7 +1111,7 @@ server.on('error', (error) => noteTrouble(`server errors (${error?.code || 'unkn
 server.listen(PORT, HOST, () => {
   console.log(`[node-relay] ${env.RELAY_NAME} on ${TLS ? 'https' : 'http'}://${HOST}:${PORT} (relay ${env.RELAY_URL})`);
   if (STATS_MODE !== 'off') {
-    console.log(`[node-relay] stats: ${TLS ? 'https' : 'http'}://${['0.0.0.0', '::'].includes(HOST) ? 'localhost' : HOST}:${PORT}/stats (${STATS_MODE === 'public' ? 'open to anyone' : 'this machine and its network only'})`);
+    console.log(`[node-relay] stats: ${TLS ? 'https' : 'http'}://${['0.0.0.0', '::'].includes(HOST) ? 'localhost' : HOST}:${PORT}/stats (${STATS_MODE === 'public' ? 'open to anyone' : STATS_MODE === 'private' ? 'this machine and its network only' : "this machine, its network, and anyone through the relay's own https name"})`);
   }
   console.log(`[node-relay] federation: ${federationNote}; data in ${DATA_DIR}`);
   console.log(`[node-relay] punched connections: ${PUNCH ? `accepted when a peer asks for one, introduced through this relay's public address (POST ${PUNCH_OFFER_PATH})` : (isOff(process.env.FREERTC_PUNCH) ? 'off (FREERTC_PUNCH=off)' : 'off: no WebRTC here (npm install werift)')}`);

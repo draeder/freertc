@@ -84,3 +84,16 @@ test('relay stats: credit adds up connection-minutes and messages delivered, fro
     assert.equal(c.total, 2);
   } finally { stats.stop(); }
 });
+
+test('relay stats: who may see them', async () => {
+  const { statsAllowed } = await import('../src/node/relay-stats.js');
+  const name = 'ef0d4c0a988ec0d2.decentralize.ooo';
+  const outsider = { address: '172.58.1.2', encrypted: true, host: `${name}:8443`, name };
+  assert.equal(statsAllowed({ mode: 'local', ...outsider }), true, 'through its own https name');
+  assert.equal(statsAllowed({ mode: 'local', ...outsider, encrypted: false }), false, 'not over plain http');
+  assert.equal(statsAllowed({ mode: 'local', ...outsider, host: '67.52.200.58:8443' }), false, 'not by bare address');
+  assert.equal(statsAllowed({ mode: 'private', ...outsider }), false);
+  assert.equal(statsAllowed({ mode: 'private', address: '192.168.50.5' }), true);
+  assert.equal(statsAllowed({ mode: 'public', address: '172.58.1.2' }), true);
+  assert.equal(statsAllowed({ mode: 'off', address: '127.0.0.1' }), false);
+});

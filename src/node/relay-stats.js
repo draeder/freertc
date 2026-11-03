@@ -245,6 +245,18 @@ export function isLoopbackAddress(address) {
   return value === '::1' || value === 'localhost' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(value);
 }
 
+/**
+ * Who may see the stats. local (default): this machine, its network, and
+ * anyone asking through the relay's own name over https (its TLS listener);
+ * private: this machine and its network only; public: anyone.
+ */
+export function statsAllowed({ mode = 'local', address, encrypted = false, host = '', name = null }) {
+  if (mode === 'off') return false;
+  if (mode === 'public' || isLocalAddress(address)) return true;
+  return mode === 'local' && Boolean(encrypted && name)
+    && String(host || '').toLowerCase().replace(/:\d+$/, '') === String(name).toLowerCase();
+}
+
 /** The stats as one caller may see them: accounts only on this machine itself. */
 export function statsFor(snapshot, address) {
   if (isLoopbackAddress(address)) return snapshot;
