@@ -102,7 +102,9 @@ export async function isRegistered(env, nodeId) {
 }
 
 export async function handleNameRequest(request, env, { fetchImpl = globalThis.fetch, now = Date.now() } = {}) {
-  if (!namesEnabled(env)) return json({ ok: false, error: 'this Worker gives no names' }, 404);
+  // `names` tells `freertc name` this Worker can give names (and on which domain, not secret).
+  if (!namesEnabled(env)) return json({ ok: false, names: false, error: 'this Worker gives no names yet' }, 404);
+  if (request.method === 'GET') return json({ ok: true, names: true, domain: String(env.NAMES_DOMAIN).toLowerCase(), open: env.NAMES_OPEN === '1' });
   if (request.method !== 'POST') return json({ ok: false, error: 'method not allowed' }, 405);
   const text = await request.text();
   if (text.length > 4 * 1024) return json({ ok: false, error: 'too large' }, 413);

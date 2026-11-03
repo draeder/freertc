@@ -5,13 +5,15 @@
 // domain, kept by your own FreeRTC Worker (src/direct/names.js,
 // src/node/relay-name.js). Run it once on each machine that runs a relay:
 //
-//   1. Log in to Cloudflare with wrangler, adding two permissions to the usual
-//      ones: edit DNS, and create API tokens. (A browser window: click Allow.)
+//   1. Log in to Cloudflare with wrangler (a browser window, if not already).
 //   2. Find your FreeRTC Worker (by its /health) and the domain (a zone in
 //      your account).
-//   3. The first time: create an API token that can only edit DNS on that
-//      domain, and store it in the Worker (NAMES_DNS_TOKEN, NAMES_ZONE_ID,
-//      NAMES_DOMAIN). The token is never shown or kept on this machine.
+//   3. The first time for a domain: the Worker needs an API token that can
+//      only edit DNS on that domain. Wrangler's login cannot make tokens, so
+//      this opens Cloudflare's token page already filled in (DNS edit, that
+//      domain only): click Create Token and paste it here, once. It is
+//      checked, stored in the Worker (NAMES_DNS_TOKEN, NAMES_ZONE_ID,
+//      NAMES_DOMAIN) and never written on this machine.
 //   4. Register this relay with the Worker: its node id goes in the Worker's
 //      database (table freertc_name_owners), so the Worker gives names only
 //      to your relays.
@@ -28,20 +30,9 @@ import { pathToFileURL } from 'node:url';
 import { generateRandomPair } from 'unsea';
 import { createRelayIdentity, decodeRelayIdentitySecret, encodeRelayIdentitySecret } from '../src/relay-identity.js';
 import { OWNERS_TABLE, relayHostname } from '../src/direct/names.js';
-import { resolveProjectRoot, resolveWranglerCommand } from './project-bootstrap.mjs';
+import { resolveProjectRoot } from './project-bootstrap.mjs';
 
 const API = 'https://api.cloudflare.com/client/v4';
-/** Wrangler's usual login permissions (wrangler 4.x), plus the two this needs. */
-const USUAL_SCOPES = [
-  'account:read', 'user:read', 'workers:write', 'workers_kv:write', 'workers_routes:write', 'workers_scripts:write',
-  'workers_tail:read', 'd1:write', 'pages:write', 'zone:read', 'ssl_certs:write', 'ai:write', 'queues:write',
-  'pipelines:write', 'secrets_store:write', 'containers:write', 'cloudchamber:write', 'connectivity:admin',
-  'email_routing:write', 'email_sending:write', 'browser:write',
-];
-const CORE_SCOPES = ['account:read', 'user:read', 'workers:write', 'workers_scripts:write', 'workers_routes:write', 'workers_kv:write', 'workers_tail:read', 'd1:write', 'pages:write', 'zone:read'];
-const EXTRA_SCOPES = ['dns_records:edit', 'account_api_tokens:create'];
-/** Cloudflare's permission group "DNS Write" (zone scope), if the list cannot be read. */
-const DNS_WRITE_GROUP = '4755a26eedb94da69e1066d98aa820be';
 
 const ROOT = resolveProjectRoot(process.cwd());
 const say = (line) => console.log(`[freertc name] ${line}`);
@@ -72,9 +63,12 @@ export async function relayIdentity(dataDir) {
   return createRelayIdentity(publicKey, privateKey);
 }
 
+/** `wrangler auth token` (reading the login's token) needs a recent wrangler: npx fetches it once. */
+const LOGIN_WRANGLER = 'wrangler@4.156.0';
+
 function wrangler(args, options = {}) {
-  const w = resolveWranglerCommand(ROOT);
-  return spawnSync(w.command, [...w.baseArgs, ...args], { cwd: ROOT, encoding: 'utf8', env: process.env, ...options });
+  const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx';
+  return spawnSync(npx, ['--yes', LOGIN_WRANGLER, ...args], { cwd: ROOT, encoding: 'utf8', env: process.env, shell: process.platform === 'win32', ...options });
 }
 
 function oauthToken() {
@@ -88,10 +82,54 @@ function oauthToken() {
 }
 
 function login() {
-  say('opening Cloudflare in your browser: allow wrangler to edit DNS and create API tokens');
-  let result = wrangler(['login', '--scopes', ...USUAL_SCOPES, ...EXTRA_SCOPES], { stdio: 'inherit' });
-  if (result.status !== 0) result = wrangler(['login', '--scopes', ...CORE_SCOPES, ...EXTRA_SCOPES], { stdio: 'inherit' });
+  say('logging in to Cloudflare (a browser window)');
+  const result = wrangler(['login'], { stdio: 'inherit' });
   if (result.status !== 0) throw new Error('wrangler login did not finish');
+}
+
+function openInBrowser(url) {
+  const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'cmd' : 'xdg-open';
+  const args = process.platform === 'win32' ? ['/c', 'start', '', url] : [url];
+  spawnSync(opener, args, { stdio: 'ignore' });
+}
+
+/** Ask for a secret on the terminal without echoing it. */
+async function askHidden(question) {
+  if (!process.stdin.isTTY) throw new Error('needs a terminal to paste the token into');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+  const write = rl._writeToOutput?.bind(rl);
+  rl._writeToOutput = (text) => { if (text.includes(question)) write?.(text); };
+  try {
+    return (await rl.question(question)).trim();
+  } finally {
+    rl.close();
+    process.stdout.write('\n');
+  }
+}
+
+/** Cloudflare's token page, filled in: DNS edit on this one zone. */
+export function tokenTemplateUrl(account, zone) {
+  const keys = encodeURIComponent(JSON.stringify([{ key: 'dns', type: 'edit' }]));
+  return `https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=${keys}&accountId=${account}&zoneId=${zone.id}&name=${encodeURIComponent(`freertc names ${zone.name}`)}`;
+}
+
+/** Get the DNS token from the owner, once, and check it can edit this zone's DNS. */
+async function dnsTokenFromOwner(account, zone) {
+  const url = tokenTemplateUrl(account, zone);
+  say(`the Worker needs a token that can edit DNS on ${zone.name} only. Opening Cloudflare's token page, filled in:`);
+  console.log(`  ${url}`);
+  say('check that it says Zone / DNS / Edit and Include / Specific zone / ' + zone.name + ', then click Continue to summary and Create Token');
+  openInBrowser(url);
+  for (let tries = 0; tries < 3; tries++) {
+    const pasted = await askHidden('[freertc name] paste the token here (it is not shown): ');
+    try {
+      await api(pasted, 'GET', `/zones/${zone.id}/dns_records?per_page=1`);
+      return pasted;
+    } catch (error) {
+      say(`that token cannot read ${zone.name}'s DNS (${error.message}); try again`);
+    }
+  }
+  throw new Error('no working token');
 }
 
 async function api(token, method, pathname, body) {
@@ -167,20 +205,15 @@ export async function main(argv = process.argv.slice(2)) {
 
   // The Worker's DNS token, the first time (or for a new domain).
   const settings = await api(token, 'GET', `/accounts/${account}/workers/scripts/${worker.name}/settings`);
-  const secrets = new Set(((await api(token, 'GET', `/accounts/${account}/workers/scripts/${worker.name}/secrets`)) || []).map((s) => s.name));
+  // Does the Worker already name relays on this domain (set up from this or another machine)?
+  const naming = await fetch(new URL('/api/v1/name', worker.url)).then((r) => r.json()).catch(() => null);
+  if (!naming || !('names' in naming)) {
+    throw new Error(`${worker.name} runs an older FreeRTC without relay names; redeploy it first (the Deploy button, or npx freertc deploy), then run this again`);
+  }
   const nameFile = path.join(dataDir, 'names.json');
-  const previous = existsSync(nameFile) ? JSON.parse(readFileSync(nameFile, 'utf8')) : null;
-  const sameDomain = previous?.domain === domain && previous?.worker === worker.url;
-  if (!secrets.has('NAMES_DNS_TOKEN') || !sameDomain) {
-    let created;
-    try {
-      created = await createDnsToken(token, account, zone, worker.name);
-    } catch (error) {
-      if (error.status !== 403 && error.status !== 401) throw error;
-      login();
-      token = oauthToken();
-      created = await createDnsToken(token, account, zone, worker.name);
-    }
+  const sameDomain = naming?.ok === true && naming.domain === domain;
+  if (!sameDomain) {
+    const created = await dnsTokenFromOwner(account, zone);
     for (const [name, text] of [['NAMES_DNS_TOKEN', created], ['NAMES_ZONE_ID', zone.id], ['NAMES_DOMAIN', domain]]) {
       await api(token, 'PUT', `/accounts/${account}/workers/scripts/${worker.name}/secrets`, { name, text, type: 'secret_text' });
     }
@@ -204,20 +237,6 @@ export async function main(argv = process.argv.slice(2)) {
   say(`registered. This relay will be ${name}`);
   say('restart the relay (npm run dev): it claims the name, gets its Let\'s Encrypt certificate, and serves');
   say(`  wss://${name}:8443/ws`);
-}
-
-async function createDnsToken(token, account, zone, workerName) {
-  let group = DNS_WRITE_GROUP;
-  try {
-    const groups = (await api(token, 'GET', `/accounts/${account}/tokens/permission_groups`)) || [];
-    group = groups.find((g) => g.name === 'DNS Write')?.id || group;
-  } catch { /* use the known id */ }
-  const created = await api(token, 'POST', `/accounts/${account}/tokens`, {
-    name: `freertc names ${zone.name} (${workerName})`,
-    policies: [{ effect: 'allow', permission_groups: [{ id: group }], resources: { [`com.cloudflare.api.account.zone.${zone.id}`]: '*' } }],
-  });
-  if (!created?.value) throw new Error('Cloudflare made the token but did not return it');
-  return created.value;
 }
 
 const entry = process.argv[1] ? pathToFileURL(process.argv[1]).href : null;

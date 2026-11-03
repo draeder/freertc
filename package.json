@@ -89,6 +89,6 @@
     "pigeonidp": "https://codeload.github.com/PeerPigeon/PigeonIdP/tar.gz/01a69993f755718cee297b900b14e18e9250cf71"
   },
   "devDependencies": {
-    "wrangler": "^4.123.0"
+    "wrangler": "^4.156.0"
   }
 }

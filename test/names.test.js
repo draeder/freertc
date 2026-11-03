@@ -93,3 +93,15 @@ test('names: an open naming service answers any relay; without a token there are
   const off = await call(await createNameRequest(me, { action: 'claim' }), { NAMES_DOMAIN: 'x.y' }, dns.fetchImpl);
   assert.equal(off.status, 404);
 });
+
+test('names: a Worker says whether it names relays, and on which domain; the token page is filled in for one zone', async () => {
+  const get = (env) => handleNameRequest(new Request('https://w.example/api/v1/name'), env).then((r) => r.json());
+  assert.deepEqual(await get({}), { ok: false, names: false, error: 'this Worker gives no names yet' });
+  assert.deepEqual(await get({ NAMES_DNS_TOKEN: 't', NAMES_ZONE_ID: 'z', NAMES_DOMAIN: 'Decentralize.ooo' }), { ok: true, names: true, domain: 'decentralize.ooo', open: false });
+  const { tokenTemplateUrl } = await import('../scripts/name-setup.mjs');
+  const url = new URL(tokenTemplateUrl('acct1', { id: 'zone1', name: 'decentralize.ooo' }));
+  assert.equal(url.origin + url.pathname, 'https://dash.cloudflare.com/profile/api-tokens');
+  assert.deepEqual(JSON.parse(url.searchParams.get('permissionGroupKeys')), [{ key: 'dns', type: 'edit' }]);
+  assert.equal(url.searchParams.get('zoneId'), 'zone1');
+  assert.equal(url.searchParams.get('accountId'), 'acct1');
+});
