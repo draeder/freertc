@@ -77,6 +77,7 @@ import { nodeDurableNamespace } from '../src/node/durable-object.js';
 import { createRelayIdentity, createSignedNodeRecord, decodeRelayIdentitySecret, isPrivateRelayUrl, tunnelNodeIdOf } from '../src/relay-identity.js';
 import { heartbeatKademlia, isPublicRelay, listKnownRelays, relayReachOf } from '../src/relay-overlay.js';
 import { RelayTunnel } from '../src/tunnel/home.js';
+import { loadNameSettings } from '../src/node/relay-name.js';
 
 // The relay runs as a child of this process, which restarts it when the
 // machine moves to another network (exit code NETWORK_CHANGED_EXIT): a new
@@ -439,7 +440,7 @@ setInterval(() => {
     try { ws.ping(); } catch {}
   }
 }, LIVENESS_PING_MS).unref();
-server.on('upgrade', async (req, socket, head) => {
+const onUpgrade = async (req, socket, head) => {
   try {
     if (new URL(req.url, 'http://x').pathname === LINK_PATH) {
       if (!relayLinks) { socket.end('HTTP/1.1 404 No links here\r\n\r\n'); return; }
@@ -465,7 +466,8 @@ server.on('upgrade', async (req, socket, head) => {
     console.error('[node-relay] upgrade failed:', error?.stack || error);
     socket.destroy();
   }
-});
+};
+server.on('upgrade', onUpgrade);
 
 /**
  * Hand a socket that did not arrive as an HTTP upgrade (a hole-punched channel,
@@ -904,6 +906,8 @@ if (process.stdout.isTTY) {
 // channel on a UDP port the router forwards, found through the DNS relay
 // directory, with no cloud relay in the way. Needs node-datachannel 0.33+.
 let directRelay = null;
+let relayName = null;   // src/node/relay-name.js: this relay's own name and certificate
+let tlsServer = null;
 // On exit, withdraw from the directory and remove the router's port forwards.
 // Ctrl-C always ends the relay: the cleanup gets 3 s (a router or the
 // directory that does not answer must not keep it running), and a second
@@ -1000,13 +1004,50 @@ if (!isOff(process.env.FREERTC_DIRECT)) {
     tunnelUrl: () => (tunnelNodeIdOf(env.RELAY_URL) && String(env.RELAY_URL).startsWith('wss:') ? env.RELAY_URL : null),
     // Listed with its open TCP port, so relays behind NAT can make it their home.
     wsUrl: () => (openPortMapping ? env.RELAY_URL : null),
-    name: env.RELAY_NAME,
+    // Its wss:// name once it has one (src/node/relay-name.js), so browsers can use TLS.
+    name: () => relayName?.wssUrl || env.RELAY_NAME,
     acceptSocket: (socket) => acceptSocket(socket),
     pqIdentity: relayPq?.identity ?? null,
     log: (line) => console.log(`${new Date().toLocaleTimeString([], { hour12: false })} [node-relay:direct] ${line}`),
   });
   if (directRelay && process.env.FREERTC_RELAY_CHILD) watchDirectListener(Number(process.env.FREERTC_DIRECT_PORT || 9443), directRelay.fingerprint);
   })().catch((error) => console.log(`[node-relay:direct] direct connections: off (${error?.message || error})`));
+}
+
+// A name and a Let's Encrypt certificate on the owner's own domain, kept by
+// the owner's Worker (src/node/relay-name.js), once `npx freertc name` has
+// registered this relay there. Then it also serves wss:// (and https) on
+// FREERTC_TLS_PORT (default 8443), forwarded by the router.
+const nameSettings = isOff(process.env.FREERTC_NAMES) ? null : loadNameSettings(DATA_DIR);
+if (nameSettings) {
+  (async () => {
+    const { startRelayName } = await import('../src/node/relay-name.js');
+    const { mapTcpPort } = await import('../src/direct/portmap.js');
+    const log = (line) => console.log(`${new Date().toLocaleTimeString([], { hour12: false })} [node-relay:name] ${line}`);
+    const TLS_PORT = Number(process.env.FREERTC_TLS_PORT || 8443);
+    const { publicKey, privateKey } = decodeRelayIdentitySecret(await relayIdentitySecret());
+    relayName = await startRelayName({
+      identity: await createRelayIdentity(publicKey, privateKey),
+      dataDir: DATA_DIR,
+      worker: nameSettings.worker,
+      tlsPort: TLS_PORT,
+      staging: process.env.FREERTC_ACME_STAGING === '1',
+      mapPort: (port) => mapTcpPort({ internalPort: port, externalPort: port, description: `freertc relay tls ${port}`, log }),
+      onCertificate: ({ key, cert, name }) => {
+        if (tlsServer) { tlsServer.setSecureContext({ key, cert }); log('serving the renewed certificate'); return; }
+        tlsServer = createTlsServer({ key, cert }, handler);
+        tlsServer.on('upgrade', onUpgrade);
+        tlsServer.on('clientError', (error, socket) => { noteTrouble(`tls connection errors (${error?.code || 'client'})`); try { socket.destroy(); } catch {} });
+        tlsServer.on('error', (error) => log(`tls server: ${error?.code || error?.message || error}`));
+        tlsServer.listen(TLS_PORT, HOST, () => log(`serving wss://${name}:${TLS_PORT}/ws and https://${name}:${TLS_PORT}/stats`));
+      },
+      onAddress: (url) => {
+        if (url) log(`directory: listing ${url}`);
+        directRelay?.republish?.().catch?.(() => {});
+      },
+      log,
+    });
+  })().catch((error) => console.log(`[node-relay:name] names: off (${error?.message || error})`));
 }
 
 if (process.env.PUNCH_RENDEZVOUS_URL) {

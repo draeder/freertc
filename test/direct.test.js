@@ -7,7 +7,7 @@ import path from 'node:path';
 import { generateRandomPair } from 'unsea';
 import { createRelayIdentity } from '../src/relay-identity.js';
 import {
-  directAnswerSdp, directRelayUrl, directRelayLan, directoryRecordUrl, isDirectRelayUrl, parseDirectRelayUrl, parseRelayIceCredential, relayIceCredentialFor,
+  directAnswerSdp, directRelayUrl, directRelayLan, directoryRecordUrl, isDirectRelayUrl, parseDirectRelayUrl, parseRelayIceCredential, recordWssUrl, relayIceCredentialFor,
 } from '../src/direct/common.js';
 import {
   createSignedDirectoryRecord, createSignedWithdrawal, decodeDirectoryTxt, encodeDirectoryTxt, verifyDirectoryRecord,
@@ -351,4 +351,27 @@ test('a relay that showed the directory a post-quantum key is listed or withdraw
   const plainId = await createRelayIdentity(plainPair.pub, plainPair.priv);
   const old = await handleDirectoryRequest(post(await createSignedDirectoryRecord(plainId, { direct: directRelayUrl({ host: '203.0.113.9', port: 9443, fingerprint: FP }) }), '203.0.113.9'), env, { fetchImpl: cf.fetchImpl });
   assert.equal(old.status, 200);
+});
+
+test('a directory entry carries a wss name only when DNS for it points at the relay', async () => {
+  const id = await identity();
+  const direct = directRelayUrl({ host: '203.0.113.7', port: 9443, fingerprint: FP });
+  const name = 'wss://abcdef0123456789abcd.decentralize.ooo:8443/ws';
+  const record = await createSignedDirectoryRecord(id, { direct, name });
+  assert.equal(recordWssUrl(record), name);
+  // DNS points the name elsewhere: refused, nothing listed.
+  const wrong = fakeCloudflare({ 'cloudflare-dns.com': { Answer: [{ type: 1, data: '198.51.100.1' }] } });
+  const refused = await handleDirectoryRequest(post(record, '203.0.113.7'), ENV, { fetchImpl: wrong.fetchImpl });
+  assert.equal(refused.status, 400);
+  assert.equal(wrong.records.size, 0);
+  // DNS points it at the relay: listed, name and all.
+  const right = fakeCloudflare({ 'cloudflare-dns.com': { Answer: [{ type: 1, data: '203.0.113.7' }] } });
+  const listed = await (await handleDirectoryRequest(post(record, '203.0.113.7'), ENV, { fetchImpl: right.fetchImpl })).json();
+  assert.equal(listed.ok, true);
+  const entry = decodeDirectoryTxt([...right.records.values()][0].content);
+  assert.equal(recordWssUrl(entry), name);
+  assert.equal(await verifyDirectoryRecord(entry), true);
+  // A plain name (a label) needs no DNS check, and is no wss address.
+  assert.equal(recordWssUrl({ name: 'freertc-node-127.0.0.1-8788' }), null);
+  assert.equal(recordWssUrl({ name: 'wss://203.0.113.7:8443/ws' }), null);
 });

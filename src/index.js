@@ -17,6 +17,7 @@ import {
 import { relayPeerIdFor } from "./relay-id.js";
 import { tunnelRoute } from "./tunnel/frames.js";
 import { DIRECTORY_PATH, directoryEnabled, handleDirectoryRequest } from "./direct/directory.js";
+import { NAMES_PATH, handleNameRequest } from "./direct/names.js";
 import { REACHABLE_PATH, handleReachableRequest } from "./direct/reachable.js";
 
 // Per-message log lines (one for every offer, answer and ICE candidate a relay
@@ -615,6 +616,9 @@ async function handleFetch(request, env, ctx) {
       if (!directoryEnabled(env)) return jsonResponse({ ok: false, error: "No relay directory here" }, 404);
       return handleDirectoryRequest(request, env);
     }
+    // Names for the owner's local relays on the owner's domain, and their
+    // Let's Encrypt challenges (src/direct/names.js).
+    if (url.pathname === NAMES_PATH) return handleNameRequest(request, env);
     // A local relay checks that relays can call it on its public address
     // before it federates there without a tunnel (src/direct/reachable.js).
     if (url.pathname === REACHABLE_PATH) return handleReachableRequest(request);

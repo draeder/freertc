@@ -169,3 +169,19 @@ export function directBrowserOfferSdp({ ufrag, pwd }) {
     '',
   ].join('\r\n');
 }
+
+/**
+ * A directory record's TLS name: its `name` when that is a wss:// address of
+ * a DNS name (wss://<name>:<port>/ws), else null. Records carry it in `name`,
+ * which clients that do not know it simply show as a label.
+ */
+export function recordWssUrl(record) {
+  try {
+    const url = new URL(String(record?.name ?? ''));
+    if (url.protocol !== 'wss:' || url.pathname !== '/ws' || url.search || url.hash) return null;
+    if (/^[0-9.]+$/.test(url.hostname) || url.hostname.includes(':') || !url.hostname.includes('.')) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}

@@ -39,7 +39,7 @@ export async function startDirectRelay({
   publicIp = null,          // set when this machine has a public address and no router to ask
   tunnelUrl = () => null,   // this relay's tunnel URL, when it has one
   wsUrl = () => null,       // ws://<public ip>:<port>/ws when the router forwards its TCP port
-  name = null,
+  name = null,              // a label, or a function giving it (a wss:// name once the relay has one)
   acceptSocket,
   fetchImpl = globalThis.fetch,
   log = () => {},
@@ -115,7 +115,7 @@ export async function startDirectRelay({
     const record = await createSignedDirectoryRecord(identity, {
       direct: directRelayUrl({ host: externalIp, port: externalPort, fingerprint: cert.fingerprint }),
       tunnel: tunnelUrl() || null,
-      name,
+      name: typeof name === 'function' ? name() : name,
       // The port the relay listens on (the router may forward a different
       // public one): machines on this network use these, not the public address.
       lan: lanEndpoints(port),

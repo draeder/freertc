@@ -15,7 +15,7 @@
 
 import { decodeDirectoryTxt, encodeDirectoryTxt, verifyDirectoryRecord, verifyWithdrawal } from './record.js';
 import { verifyDirectoryPq } from '../relay-identity.js';
-import { parseDirectRelayUrl } from './common.js';
+import { parseDirectRelayUrl, recordWssUrl } from './common.js';
 
 export const DIRECTORY_PATH = '/api/v1/directory';
 const CLOUDFLARE_API = 'https://api.cloudflare.com/client/v4';
@@ -24,6 +24,25 @@ const REFRESH_BEFORE_EXPIRY_MS = 60 * 60_000;
 const PROBE_TIMEOUT_MS = 4_000;
 const DNS_TTL_SECONDS = 300;
 const MAX_CLEANUP_PER_CALL = 5;
+const DOH_URL = 'https://cloudflare-dns.com/dns-query';
+
+// A record may carry a TLS name (name = wss://<host>:<port>/ws). It is
+// listed only if DNS for <host> points at the address the request came from,
+// so a relay cannot send browsers to a name that is not its own.
+async function nameIsOurs(record, from, fetchImpl) {
+  if (!String(record.name ?? '').startsWith('wss:')) return true;
+  const wss = recordWssUrl(record);
+  if (!wss) return false;
+  const host = new URL(wss).hostname;
+  const type = String(from).includes(':') ? 'AAAA' : 'A';
+  try {
+    const response = await fetchImpl(`${DOH_URL}?name=${encodeURIComponent(host)}&type=${type}`, { headers: { accept: 'application/dns-json' }, signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+    const answer = await response.json();
+    return (answer?.Answer || []).some((a) => sameIp(a.data, from));
+  } catch {
+    return false;
+  }
+}
 
 export function directoryEnabled(env) {
   return Boolean(env?.DIRECTORY_DNS_TOKEN && env?.DIRECTORY_ZONE_ID && env?.DIRECTORY_RECORD_NAME);
@@ -167,6 +186,9 @@ export async function handleDirectoryRequest(request, env, { fetchImpl = globalT
     const from = request.headers.get('CF-Connecting-IP');
     if (!sameIp(direct.host, from)) {
       return json({ ok: false, error: 'the direct address must be the address this request came from', seen: from || null }, 400);
+    }
+    if (!await nameIsOurs(body, from, fetchImpl)) {
+      return json({ ok: false, error: 'the record\'s wss name must point at the address this request came from', seen: from || null }, 400);
     }
     const refused = await postQuantumCheck(request, env, body, now);
     if (refused) return json({ ok: false, error: refused }, 403);

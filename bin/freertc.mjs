@@ -23,6 +23,7 @@ Usage:
   freertc deploy [-- <deploy-args>]
   freertc dev [-- <dev-args>]
   freertc dev:cf [-- <dev-args>]
+  freertc name [--domain example.com] [--worker <name>]
 
 Examples:
   npx freertc
@@ -31,6 +32,7 @@ Examples:
   npx freertc relay:keygen
   freertc
   npx freertc deploy
+  npx freertc name --domain example.com   (a name and Let's Encrypt certificate for this machine's relay)
 `);
 }
 
@@ -101,6 +103,10 @@ if (subcommand === 'deploy') {
     'production',
     ...rest,
   ]);
+}
+
+if (subcommand === 'name') {
+  runInProject(process.execPath, [path.join(PACKAGE_ROOT, 'scripts', 'name-setup.mjs'), ...rest]);
 }
 
 if (subcommand === 'dev') {

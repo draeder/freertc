@@ -152,6 +152,38 @@ between local relays does not pass through the cloud. PeerPigeon clients prefer
 a healthy local relay over a cloud one. See [docs/RELAYS.md](docs/RELAYS.md) for
 the design, the settings, and measured costs.
 
+### Your relay's own name and certificate
+
+A local relay can have its own name on your domain and a Let's Encrypt
+certificate, so browsers anywhere reach it as `wss://<name>:8443/ws`. Your
+FreeRTC Worker keeps the name (it holds the only DNS token); the relay asks it.
+On the machine that runs the relay, in this folder, once:
+
+```bash
+npx freertc name --domain example.com
+```
+
+It logs in with wrangler (a browser window: allow it to edit DNS and create API
+tokens), finds your FreeRTC Worker and the domain, stores a token that can only
+edit that domain's DNS in the Worker (the first time), and registers this
+relay with the Worker. Restart the relay; from then on it does the rest:
+
+- points `<first 16 characters of its id>.example.com` at your public address,
+  and again whenever that changes;
+- gets a certificate from Let's Encrypt by DNS-01 (the Worker writes the
+  challenge record; nothing needs to be reachable for it), renews it with 30
+  days left;
+- serves `wss://` and `https://` on `FREERTC_TLS_PORT` (8443) and asks the
+  router to forward it (UPnP or NAT-PMP);
+- lists `wss://<name>:8443/ws` in the relay directory, which accepts it only if
+  DNS for the name points at the relay's own address.
+
+Settings: `FREERTC_NAMES=off` turns it off; `FREERTC_ACME_STAGING=1` uses Let's
+Encrypt's staging service (test certificates); `FREERTC_NAMES_URL` points at a
+Worker without running `freertc name`. A Worker with `NAMES_OPEN=1` names any
+relay (a public naming service). The Worker side is `src/direct/names.js`; the
+relay side `src/node/relay-name.js`; the command `scripts/name-setup.mjs`.
+
 ## Kademlia relay overlay
 
 FreeRTC uses Kademlia between federated relays—not between browser peers. Relay IDs, scope keys, and exact-peer keys are deterministic 256-bit SHA-256 values produced by UnSEA. Relay and provider records are signed with stable UnSEA P-256 identities before they are accepted or replicated.
