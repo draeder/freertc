@@ -11,7 +11,8 @@
 //   3. The first time for a domain: the Worker needs an API token that can
 //      only edit DNS on that domain. Wrangler's login cannot make tokens, so
 //      this opens Cloudflare's token page already filled in (DNS edit, that
-//      domain only): click Create Token and paste it here, once. It is
+//      domain only): click Create Token, then Copy, and press Enter here (it is read from
+//      the clipboard, never shown or pasted in the terminal), once. It is
 //      checked, stored in the Worker (NAMES_DNS_TOKEN, NAMES_ZONE_ID,
 //      NAMES_DOMAIN) and never written on this machine.
 //   4. Register this relay with the Worker: its node id goes in the Worker's
@@ -106,18 +107,84 @@ function openInBrowser(url) {
   spawnSync(opener, args, { stdio: 'ignore' });
 }
 
-/** Ask for a secret on the terminal without echoing it. */
-async function askHidden(question) {
-  if (!process.stdin.isTTY) throw new Error('needs a terminal to paste the token into');
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
-  const write = rl._writeToOutput?.bind(rl);
-  rl._writeToOutput = (text) => { if (text.includes(question)) write?.(text); };
-  try {
-    return (await rl.question(question)).trim();
-  } finally {
-    rl.close();
-    process.stdout.write('\n');
+/** Does this look like a Cloudflare API token (and nothing else)? */
+export function looksLikeToken(text) {
+  return /^[A-Za-z0-9_-]{30,200}$/.test(String(text || '').trim());
+}
+
+const CLIPBOARD_READERS = {
+  darwin: [['pbpaste', []]],
+  win32: [['powershell', ['-NoProfile', '-Command', 'Get-Clipboard']]],
+  linux: [['wl-paste', ['-n']], ['xclip', ['-selection', 'clipboard', '-o']], ['xsel', ['-b', '-o']]],
+};
+const CLIPBOARD_CLEARERS = {
+  darwin: [['pbcopy', []]],
+  win32: [['powershell', ['-NoProfile', '-Command', 'Set-Clipboard -Value $null']]],
+  linux: [['wl-copy', ['--clear']], ['xclip', ['-selection', 'clipboard', '-i']], ['xsel', ['-b', '-c']]],
+};
+
+/** The clipboard's text, read here (nothing is pasted into the terminal), or null without a way to read it. */
+function readClipboard() {
+  for (const [command, args] of CLIPBOARD_READERS[process.platform] || []) {
+    const result = spawnSync(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    if (result.status === 0) return String(result.stdout || '').trim();
   }
+  return null;
+}
+
+/** Empty the clipboard, so the token does not stay there. */
+function clearClipboard() {
+  for (const [command, args] of CLIPBOARD_CLEARERS[process.platform] || []) {
+    if (spawnSync(command, args, { input: '', stdio: ['pipe', 'ignore', 'ignore'] }).status === 0) return true;
+  }
+  return false;
+}
+
+/**
+ * Read keys with nothing echoed: until Enter, returning what was typed (with
+ * any bracketed-paste markers removed). Ctrl-C quits.
+ */
+function readKeysSilently(prompt) {
+  if (!process.stdin.isTTY) throw new Error('needs a terminal');
+  process.stdout.write(prompt);
+  return new Promise((resolve) => {
+    let typed = '';
+    const done = (value) => {
+      process.stdin.off('data', onData);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      process.stdout.write('\n');
+      resolve(value);
+    };
+    const onData = (chunk) => {
+      const text = chunk.toString('utf8');
+      if (text.includes('\u0003')) { process.stdout.write('\n'); process.exit(130); }
+      typed += text;
+      const enter = typed.search(/[\r\n]/);
+      if (enter >= 0) done(typed.slice(0, enter).replace(/\x1b\[20[01]~/g, '').trim());
+    };
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on('data', onData);
+  });
+}
+
+/**
+ * Get the token without it ever showing on screen: copied in the browser, read
+ * here from the clipboard when Enter is pressed (no paste into the terminal,
+ * so no terminal shows it or warns about a paste), then the clipboard is
+ * emptied. Without a clipboard tool, it is typed or pasted with nothing echoed.
+ */
+async function tokenFromOwner() {
+  if (readClipboard() !== null) {
+    await readKeysSilently('[freertc name] click Copy next to the new token in the browser, then press Enter here (do not paste it): ');
+    const text = readClipboard();
+    if (!looksLikeToken(text)) return null;
+    say(clearClipboard() ? 'read the token from the clipboard and emptied the clipboard' : 'read the token from the clipboard (empty the clipboard yourself)');
+    return text.trim();
+  }
+  const typed = await readKeysSilently('[freertc name] paste the token here (nothing is shown): ');
+  return looksLikeToken(typed) ? typed : null;
 }
 
 /** Cloudflare's token page, filled in: DNS edit on this one zone. */
@@ -134,7 +201,8 @@ async function dnsTokenFromOwner(account, zone) {
   say('check that it says Zone / DNS / Edit and Include / Specific zone / ' + zone.name + ', then click Continue to summary and Create Token');
   openInBrowser(url);
   for (let tries = 0; tries < 3; tries++) {
-    const pasted = await askHidden('[freertc name] paste the token here (it is not shown): ');
+    const pasted = await tokenFromOwner();
+    if (!pasted) { say('that is not a Cloudflare token (nothing was shown or kept); copy the token itself and try again'); continue; }
     try {
       await api(pasted, 'GET', `/zones/${zone.id}/dns_records?per_page=1`);
       return pasted;

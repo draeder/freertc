@@ -166,9 +166,11 @@ npx freertc name --domain example.com
 It logs in with wrangler (a browser window, if you are not logged in), finds your
 FreeRTC Worker and the domain, and registers this relay with the Worker. The
 first time for a domain it also opens Cloudflare's API token page, already
-filled in for a token that can only edit DNS on that domain: click Create Token
-and paste it once (wrangler's login cannot make tokens). It is checked and
-stored in the Worker, never on the machine. Restart the relay; from then on it
+filled in for a token that can only edit DNS on that domain: click Create Token,
+then Copy, and press Enter in the terminal (wrangler's login cannot make
+tokens). Don't paste it: it is read from the clipboard, never shown, and the
+clipboard is emptied. It is checked and stored in the Worker, never on the
+machine. Restart the relay; from then on it
 does the rest:
 
 - points `<first 16 characters of its id>.example.com` at your public address,

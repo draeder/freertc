@@ -91,3 +91,11 @@ test('freertc name: reads the token wrangler prints over several lines', async (
   assert.equal(tokenFromOutput('{\n    "type": "oauth",\n    "token": "abc123.def-456_xyz7890"\n}\n'), 'abc123.def-456_xyz7890');
   assert.equal(tokenFromOutput('Not logged in.'), null);
 });
+
+test('freertc name: only a token-shaped clipboard is taken', async () => {
+  const { looksLikeToken } = await import('../scripts/name-setup.mjs');
+  assert.equal(looksLikeToken('abcDEF123_-abcDEF123_-abcDEF1234'), true);
+  assert.equal(looksLikeToken('https://dash.cloudflare.com/profile/api-tokens'), false);
+  assert.equal(looksLikeToken('two words'), false);
+  assert.equal(looksLikeToken(''), false);
+});
