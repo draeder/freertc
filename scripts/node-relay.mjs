@@ -652,9 +652,10 @@ stats.setLinks(() => {
   return { linked: relays.length, relays };
 });
 stats.setReach(() => ({
-  name: env.RELAY_NAME,
+  // Its own name and wss:// address once it has them (src/node/relay-name.js).
+  name: relayName?.name || env.RELAY_NAME,
   kind: env.RELAY_KIND,
-  url: env.RELAY_URL,
+  url: servingWss || env.RELAY_URL,
   federation: federating ? (federationState || federationNote) : federationNote,
   postQuantum: Boolean(relayPq),
   accountsShared,
@@ -908,6 +909,7 @@ if (process.stdout.isTTY) {
 let directRelay = null;
 let relayName = null;   // src/node/relay-name.js: this relay's own name and certificate
 let tlsServer = null;
+let servingWss = null;  // wss://<name>:<port>/ws once the TLS listener is up
 // On exit, withdraw from the directory and remove the router's port forwards.
 // Ctrl-C always ends the relay: the cleanup gets 3 s (a router or the
 // directory that does not answer must not keep it running), and a second
@@ -1039,7 +1041,10 @@ if (nameSettings) {
         tlsServer.on('upgrade', onUpgrade);
         tlsServer.on('clientError', (error, socket) => { noteTrouble(`tls connection errors (${error?.code || 'client'})`); try { socket.destroy(); } catch {} });
         tlsServer.on('error', (error) => log(`tls server: ${error?.code || error?.message || error}`));
-        tlsServer.listen(TLS_PORT, HOST, () => log(`serving wss://${name}:${TLS_PORT}/ws and https://${name}:${TLS_PORT}/stats`));
+        tlsServer.listen(TLS_PORT, HOST, () => {
+          servingWss = `wss://${name}:${TLS_PORT}/ws`;
+          log(`serving ${servingWss} and https://${name}:${TLS_PORT}/stats`);
+        });
       },
       onAddress: (url) => {
         if (url) log(`directory: listing ${url}`);
