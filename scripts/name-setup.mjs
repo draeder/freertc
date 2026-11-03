@@ -220,11 +220,14 @@ export async function main(argv = process.argv.slice(2)) {
   const settings = await api(token, 'GET', `/accounts/${account}/workers/scripts/${worker.name}/settings`);
   // Does the Worker already name relays on this domain (set up from this or another machine)?
   const naming = await fetch(new URL('/api/v1/name', worker.url)).then((r) => r.json()).catch(() => null);
-  if (!naming || !('names' in naming)) {
+  // Workers with names answer here: with `names` (now), or (the first version) 404 'gives no names' / 405 to a GET.
+  const hasNames = naming && ('names' in naming || /gives no names|method not allowed/.test(String(naming.error || '')));
+  if (!hasNames) {
     throw new Error(`${worker.name} runs an older FreeRTC without relay names; redeploy it first (the Deploy button, or npx freertc deploy), then run this again`);
   }
   const nameFile = path.join(dataDir, 'names.json');
   const sameDomain = naming?.ok === true && naming.domain === domain;
+  // (The first version cannot say its domain: then the token is asked for again, which replaces it; harmless.)
   if (!sameDomain) {
     const created = await dnsTokenFromOwner(account, zone);
     for (const [name, text] of [['NAMES_DNS_TOKEN', created], ['NAMES_ZONE_ID', zone.id], ['NAMES_DOMAIN', domain]]) {
