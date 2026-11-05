@@ -73,7 +73,7 @@ export const STATS_PAGE = `<!doctype html>
     <div class="tile"><h2>Connections</h2><p class="big" id="conn">–</p><p class="sub" id="conn-sub"></p></div>
     <div class="tile"><h2>Messages</h2><p class="big" id="msgs">–</p><p class="sub" id="msgs-sub"></p></div>
     <div class="tile"><h2>Bandwidth</h2><p class="big" id="bw">–</p><p class="sub" id="bw-sub"></p></div>
-    <div class="tile"><h2>Credit</h2><p class="big" id="credit">–</p><p class="sub" id="credit-sub"></p></div>
+    <div class="tile"><h2>Pigeon Seeds</h2><p class="big" id="credit">–</p><p class="sub" id="credit-sub"></p></div>
     <div class="tile" id="acc-tile"><h2>Accounts kept</h2><p class="big" id="acc">–</p><p class="sub" id="acc-sub"></p></div>
   </div>
 
