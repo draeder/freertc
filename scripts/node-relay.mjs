@@ -19,7 +19,8 @@
 //   KADEMLIA_BOOTSTRAP_URLS    comma-separated relays to join through (public
 //                              default: the public relays; private default: none)
 //   RELAY_IDENTITY_SECRET      signing identity; generated and kept in the data dir if unset
-//   FREERTC_DATA_DIR           where the database and identity live (default ./.freertc-relay)
+//   FREERTC_DATA_DIR           where the database, identity and name live (default ~/.freertc-relay,
+//                              the same wherever the relay starts; an earlier one is carried there)
 //   DB_PATH                    database file (default <data dir>/relay.sqlite)
 //   TLS_CERT_PATH, TLS_KEY_PATH  serve HTTPS/WSS with this certificate
 //   PROD_DOMAIN                host[:port] this relay is served as
@@ -67,6 +68,7 @@ import { fileURLToPath } from 'node:url';
 import WsClient, { WebSocketServer } from 'ws';
 import { installWebSocketPair, serverSocketOf } from '../src/node/websocket-pair.js';
 import { openSqliteD1 } from '../src/node/d1-sqlite.js';
+import { resolveDataDir } from '../src/node/data-dir.js';
 import { createCostMeter } from '../src/node/cost-meter.js';
 import { createRelayStats, isLocalAddress, statsAllowed, statsFor } from '../src/node/relay-stats.js';
 import { STATS_PAGE } from '../src/node/stats-page.js';
@@ -131,7 +133,8 @@ const HOST = process.env.HOST || '0.0.0.0';
 // were, and a private address is never announced to public relays.
 const SELF_HOST = ['0.0.0.0', '::'].includes(HOST) ? '127.0.0.1' : HOST;
 const PORT = Number(process.env.PORT || 8788);
-const DATA_DIR = path.resolve(process.env.FREERTC_DATA_DIR || path.join(process.cwd(), '.freertc-relay'));
+// One folder per user (~/.freertc-relay), wherever it starts from: it keeps its id and name (src/node/data-dir.js).
+const DATA_DIR = resolveDataDir({ log: (line) => console.log(`[node-relay] ${line}`) });
 const PUBLIC_DIR = path.join(ROOT, 'public');
 mkdirSync(DATA_DIR, { recursive: true });
 
