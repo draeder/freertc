@@ -581,12 +581,14 @@ export function createSignalingClient(options = {}) {
     relay: relayOptions = {},
     // Called with { state: 'up' | 'idle' | 'waking', ts } as the relay socket is released and woken.
     onRelayStateChange,
-    // Two peers that cannot reach each other over WebRTC (a router that does
+    // Relays are for signaling only: by default ('never', or false) no peer
+    // data ever goes through one, and a pair that cannot reach each other over
+    // WebRTC simply does not link. Two peers that cannot (a router that does
     // not loop UDP back, Safari offering only its public address, carrier
-    // NAT) can carry their link through the relay instead: 'local' (the
-    // default) does so only while this peer is on a local relay, which costs
-    // nothing per message; 'always' also on a cloud relay; false never.
-    relayedLinks: relayedLinksOption = 'local',
+    // NAT) may opt in to carrying their link through the relay instead:
+    // 'local' only while this peer is on a local relay, 'always' also on a
+    // cloud relay. A peer that has not opted in also refuses such a link.
+    relayedLinks: relayedLinksOption = 'never',
   } = options
 
   const roomId = configuredRoomId || legacyRoomId || networkId
@@ -932,6 +934,8 @@ export function createSignalingClient(options = {}) {
         }
         break
       case RELAYED_LINK_OPEN: {
+        // Not opted in: no data through the relay; the request goes unanswered.
+        if (!relayedLinksAllowed()) break
         // A working WebRTC link wins; the asker learns so when the link
         // request goes unanswered and keeps what it has.
         if (entry && !entry.relayed && entry.channel?.readyState === 'open') break

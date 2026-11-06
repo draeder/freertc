@@ -102,11 +102,11 @@ async function register(world, c, peerId) {
   return socket
 }
 
-test('a pair whose WebRTC never connects links through a local relay after two failures', async (t) => {
+test('opted in (relayedLinks: local): a pair whose WebRTC never connects links through a local relay after two failures', async (t) => {
   const world = installWorld()
   const gotA = []; const gotB = []; const statesA = []; const statesB = []
-  const a = client(A, 'ws://192.168.1.10:8788/ws', gotA, statesA)
-  const b = client(B, 'ws://192.168.1.10:8788/ws', gotB, statesB)
+  const a = client(A, 'ws://192.168.1.10:8788/ws', gotA, statesA, { relayedLinks: 'local' })
+  const b = client(B, 'ws://192.168.1.10:8788/ws', gotB, statesB, { relayedLinks: 'local' })
   t.after(() => { a.disconnect(); b.disconnect(); world.restore() })
   await register(world, a, A)
   await register(world, b, B)
@@ -152,7 +152,7 @@ test('a pair whose WebRTC never connects links through a local relay after two f
 
 test('on a cloud relay the pair keeps trying WebRTC (no per-message cost) unless told otherwise', async (t) => {
   const world = installWorld()
-  const a = client(A, 'wss://peer.ooo/ws', [], [])
+  const a = client(A, 'wss://peer.ooo/ws', [], [], { relayedLinks: 'local' })
   t.after(() => { a.disconnect(); world.restore() })
   await register(world, a, A)
   const realNow = Date.now
@@ -168,4 +168,32 @@ test('on a cloud relay the pair keeps trying WebRTC (no per-message cost) unless
   await a.initiateConnection(B)
   await nextTurn()
   assert.notEqual(a.mesh.connections.get(B)?.relayed, true)
+})
+
+test('by default no data goes through a relay: no relayed link is asked for, and one asked for is refused', async (t) => {
+  const world = installWorld()
+  const a = client(A, 'ws://192.168.1.10:8788/ws', [], [])
+  const b = client(B, 'ws://192.168.1.10:8788/ws', [], [])
+  t.after(() => { a.disconnect(); b.disconnect(); world.restore() })
+  const sa = await register(world, a, A)
+  const sb = await register(world, b, B)
+  const realNow = Date.now
+  let offset = 0
+  Date.now = () => realNow() + offset
+  t.after(() => { Date.now = realNow })
+  for (let i = 0; i < 3; i++) {
+    await a.initiateConnection(B)
+    await nextTurn()
+    offset += 10_000
+    a.closePeerConnection(B, 'stalled', false)
+  }
+  await a.initiateConnection(B)
+  await nextTurn(50)
+  assert.notEqual(a.mesh.connections.get(B)?.relayed, true, 'A keeps to WebRTC')
+  assert.ok(!sa.sent.some((m) => m.type === 'ext' && m.body?.action === 'link-open'), 'A never asks for a relayed link')
+  // A peer that asks anyway (an older client) gets no answer.
+  sa.send(JSON.stringify({ type: 'ext', from: A, to: B, body: { action: 'link-open' } }))
+  await nextTurn(50)
+  assert.notEqual(b.mesh.connections.get(A)?.relayed, true, 'B did not take it')
+  assert.ok(!sb.sent.some((m) => m.type === 'ext' && m.body?.action === 'link-accept'), 'B never accepts')
 })
