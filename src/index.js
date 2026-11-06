@@ -1319,7 +1319,21 @@ function idKey(id) {
 
 export function peersNearest(peers, forPeerId, limit = PEER_LIST_SIZE) {
   if (!Array.isArray(peers)) return [];
-  if (peers.length <= limit || !forPeerId) return peers.length <= limit ? peers : peers.slice(0, limit);
+  if (peers.length <= limit) return peers;
+  // Peers with a role (a storage server, say) come first, nearest first: a
+  // scope where many plain peers look for a few such peers must not cut them
+  // from the list. Then the rest, nearest first, as before.
+  if (peers.some((p) => p?.role)) {
+    const withRole = peers.filter((p) => p?.role), rest = peers.filter((p) => !p?.role);
+    const first = nearestOf(withRole, forPeerId, limit);
+    return first.length >= limit ? first : [...first, ...nearestOf(rest, forPeerId, limit - first.length)];
+  }
+  return nearestOf(peers, forPeerId, limit);
+}
+
+function nearestOf(peers, forPeerId, limit) {
+  if (peers.length <= limit) return peers;
+  if (!forPeerId) return peers.slice(0, limit);
   const target = idKey(forPeerId);
   if (target === null) return peers.slice(0, limit);
   const scored = [];
@@ -1385,18 +1399,14 @@ async function broadcastPeerList(env, selfRelayUrl, network, room, relayPeerId, 
 
   const now = Date.now();
   const result = await db.prepare(`
-    SELECT peer_id, session_id, updated_at_ms
+    SELECT peer_id, session_id, updated_at_ms, role
     FROM psp_announcements
     WHERE network = ?1 AND expires_at_ms > ?2
     ORDER BY peer_id ASC
     LIMIT ?3
   `).bind(storageScope, now, PEER_SCAN_LIMIT).all();
 
-  const localPeers = (result.results || []).map(row => ({
-    peer_id: row.peer_id,
-    session_id: row.session_id,
-    timestamp: row.updated_at_ms
-  }));
+  const localPeers = (result.results || []).map(peerRow);
   let remotePeers = Array.isArray(federatedPeers) ? federatedPeers : null;
   if (remotePeers === null && selfRelayUrl && isKademliaEnabled(env)) {
     remotePeers = await findFederatedPeers(env, selfRelayUrl, network, room, "", livePeers.size).catch(() => []);
@@ -1420,22 +1430,30 @@ async function broadcastPeerList(env, selfRelayUrl, network, room, relayPeerId, 
  * half its lease left, so a live peer is renewed well before it lapses at a fraction of the
  * writes, and a peer that is gone still ages out on the lease it was given.
  */
+// What the peer says it is (capabilities.role): a short lowercase word, or none.
+export function announcedRole(message) {
+  const role = message?.body?.capabilities?.role;
+  return typeof role === "string" && /^[a-z0-9][a-z0-9-]{0,31}$/.test(role) ? role : null;
+}
+
 export async function upsertAnnouncement(db, message) {
   const now = Date.now();
   const ttl = Math.min(message.ttl_ms || DEFAULT_TTL_MS, MAX_TTL_MS);
   const expiresAt = now + ttl;
 
   await db.prepare(`
-    INSERT INTO psp_announcements (network, peer_id, session_id, expires_at_ms, updated_at_ms)
-    VALUES (?1, ?2, ?3, ?4, ?5)
+    INSERT INTO psp_announcements (network, peer_id, session_id, expires_at_ms, updated_at_ms, role)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
     ON CONFLICT(network, peer_id) DO UPDATE SET
       session_id = excluded.session_id,
       expires_at_ms = excluded.expires_at_ms,
-      updated_at_ms = excluded.updated_at_ms
+      updated_at_ms = excluded.updated_at_ms,
+      role = excluded.role
     WHERE psp_announcements.session_id IS NOT excluded.session_id
+      OR psp_announcements.role IS NOT excluded.role
       OR (psp_announcements.expires_at_ms - excluded.updated_at_ms) * 2
          <= (excluded.expires_at_ms - excluded.updated_at_ms)
-  `).bind(scopeKey(message.network, normalizeRoom(message.session_id)), message.from, message.session_id, expiresAt, now).run();
+  `).bind(scopeKey(message.network, normalizeRoom(message.session_id)), message.from, message.session_id, expiresAt, now, announcedRole(message)).run();
 }
 
 async function deleteAnnouncement(db, network, room, peerId) {
@@ -1447,18 +1465,24 @@ async function findPeers(db, network, room, requesterPeerId) {
   const now = Date.now();
   const storageScope = scopeKey(network, room);
   const result = await db.prepare(`
-    SELECT peer_id, session_id, updated_at_ms
+    SELECT peer_id, session_id, updated_at_ms, role
     FROM psp_announcements
     WHERE network = ?1 AND peer_id != ?2 AND expires_at_ms > ?3
     ORDER BY peer_id ASC
     LIMIT ?4
   `).bind(storageScope, requesterPeerId, now, PEER_SCAN_LIMIT).all();
 
-  return (result.results || []).map(row => ({
+  return (result.results || []).map(peerRow);
+}
+
+// A listed peer: its id, room and when it last announced, and its role if it has one.
+function peerRow(row) {
+  return {
     peer_id: row.peer_id,
     session_id: row.session_id,
-    timestamp: row.updated_at_ms
-  }));
+    timestamp: row.updated_at_ms,
+    ...(row.role ? { role: row.role } : {}),
+  };
 }
 
 async function insertRelayMessage(db, message) {

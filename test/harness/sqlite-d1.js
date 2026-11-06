@@ -4,7 +4,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-const MIGRATIONS = ['0001_initial.sql', '0002_kademlia_overlay.sql'];
+const MIGRATIONS = ['0001_initial.sql', '0002_kademlia_overlay.sql', '0003_announcement_role.sql'];
 
 /** The table a write statement names, or null for a read. */
 function writtenTable(sql) {

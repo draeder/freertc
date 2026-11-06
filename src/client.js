@@ -2731,7 +2731,9 @@ export function createSignalingClient(options = {}) {
         const candidates = rawPeers.map((p) => ({
           peerId:       p.peer_id,
           networkId:    p.network ?? networkId,
-          capabilities: p.hints ?? {},
+          // What the peer said it is (its announce's capabilities.role), as the relay lists it.
+          capabilities: p.role ? { ...(p.hints ?? {}), role: p.role } : (p.hints ?? {}),
+          role:         p.role ?? null,
           advertisedAt: p.last_seen ?? p.timestamp ?? Date.now(),
           // When the relay sent this list, on the relay's clock: the age of an
           // advertisement is judged on one clock, not across two machines.

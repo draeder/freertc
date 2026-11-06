@@ -29,7 +29,7 @@ test("Deploy Button does not advertise optional local settings as required secre
 });
 
 test("Deploy Button configuration provisions D1, migrations, and private relay identity", async () => {
-  const [buttonConfig, workersDevConfig, packageText, deployScript, workerSource, initialMigration, kademliaMigration, schema] = await Promise.all([
+  const [buttonConfig, workersDevConfig, packageText, deployScript, workerSource, initialMigration, kademliaMigration, roleMigration, schema] = await Promise.all([
     read("wrangler.jsonc"),
     read("wrangler.workers-dev.jsonc"),
     read("package.json"),
@@ -37,6 +37,7 @@ test("Deploy Button configuration provisions D1, migrations, and private relay i
     read("src/index.js"),
     read("migrations/0001_initial.sql"),
     read("migrations/0002_kademlia_overlay.sql"),
+    read("migrations/0003_announcement_role.sql"),
     read("scripts/d1-schema.sql")
   ]);
   const packageJson = JSON.parse(packageText);
@@ -66,7 +67,7 @@ test("Deploy Button configuration provisions D1, migrations, and private relay i
   assert.match(initialMigration, /CREATE TABLE IF NOT EXISTS psp_relays/);
   assert.match(kademliaMigration, /CREATE TABLE IF NOT EXISTS psp_kad_nodes/);
   const normalizeSql = (sql) => sql.replace(/^--.*$/gm, "").replace(/\s+/g, " ").trim();
-  assert.equal(normalizeSql(`${initialMigration}\n${kademliaMigration}`), normalizeSql(schema));
+  assert.equal(normalizeSql(`${initialMigration}\n${kademliaMigration}\n${roleMigration}`), normalizeSql(schema));
   assert.match(deployScript, /'d1', 'migrations', 'apply', 'DB', '--remote'/);
   assert.match(deployScript, /generateRandomPair/);
   assert.match(deployScript, /'secret', 'bulk'/);

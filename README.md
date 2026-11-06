@@ -136,6 +136,8 @@ The browser UI uses two distinct scopes:
 
 Peers are discoverable and relay messages are deliverable only when both Network and Room match. The relay domain is not an isolation boundary: `peer.ooo` and `decentralize.ooo` can federate peers that deliberately use the same Network and Room.
 
+A peer can say what it is with `capabilities.role` in its announce (a short lowercase word, such as `storage`). Relays store it and list it with the peer, and list peers with a role before the rest, so a scope where many plain peers look for a few servers never cuts the servers from a list. Most peers have no role; relays without migration `0003` simply leave it out.
+
 ## Local relays
 
 A local relay runs the same relay code under Node, on your own machine:
