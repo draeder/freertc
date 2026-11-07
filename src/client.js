@@ -49,6 +49,11 @@ const DATA_BACKLOG_STALL_MS = 20000
 // pre-suspend pong and every state field still claims health, so an
 // expiry on the proof is what stops the resume-time send burst.
 const DATA_PROOF_FRESH_MS = DATA_PING_MS + DATA_PONG_TIMEOUT_MS + 5000
+// A link whose pings have gone unanswered this long, with nothing at all coming in, is suspect: no
+// frame is sent on it (a refusal callers retry, not a verdict) until a pong comes back or the pong
+// timeout executes it. Safari logs 'Error sending string through RTCDataChannel' for every send
+// into a link that died without closing, and sending on for the whole 20 s filled the console.
+const DATA_SUSPECT_MS = 4000
 // SCTP max-message-size is negotiated and small in WebKit: Safari advertises
 // 64 KiB where Chromium advertises 256 KiB, and a send over the remote's
 // limit fails — in Safari silently, as an uncatchable console error, on a
@@ -1277,8 +1282,15 @@ export function createSignalingClient(options = {}) {
     // ping goes unanswered past the pong timeout.
     const now = Date.now()
     if (!(entry.lastPongAt > 0) || now - entry.lastPongAt >= DATA_PROOF_FRESH_MS) return false
+    if (linkSuspect(entry, now)) return false
     return !(entry.lastPingSentAt > entry.lastPongAt
       && now - entry.lastPingSentAt >= DATA_PONG_TIMEOUT_MS)
+  }
+
+  function linkSuspect(entry, now = Date.now()) {
+    return entry.lastPingSentAt > (entry.lastPongAt ?? 0)
+      && now - entry.lastPingSentAt >= DATA_SUSPECT_MS
+      && now - Math.max(entry.lastInboundAt ?? 0, entry.lastPongAt ?? 0) >= DATA_SUSPECT_MS
   }
 
   // ── Relay on demand: who stays registered, and when the socket is released ─
@@ -1805,6 +1817,7 @@ export function createSignalingClient(options = {}) {
       lastInboundAt = Date.now()
       const currentEntry = mesh.connections.get(remotePeerId)
       const ownsCurrentEntry = currentEntry?.connection === pc && currentEntry.channel === channel
+      if (ownsCurrentEntry) currentEntry.lastInboundAt = lastInboundAt
       if (ownsCurrentEntry && currentEntry.dormantAt && String(event.data).indexOf(DATA_DORMANT_FRAME) === -1) {
         currentEntry.dormantAt = 0
       }
@@ -3292,6 +3305,8 @@ export function createSignalingClient(options = {}) {
         }
         const error = new Error(outboundDead
           ? 'WebRTC channel failed its pong proof'
+          : linkSuspect(target, now)
+            ? 'WebRTC channel has gone quiet (waiting for a pong)'
           : unproven
             ? 'WebRTC channel is awaiting a fresh pong'
             : `WebRTC connection is ${state}`)
@@ -3299,7 +3314,7 @@ export function createSignalingClient(options = {}) {
         // proof or a bad connection state is the edge telling the truth
         // about being gone.
         error.transient = !outboundDead
-          && (unproven || state === 'connecting' || state === 'disconnected' || state === 'new')
+          && (unproven || linkSuspect(target, now) || state === 'connecting' || state === 'disconnected' || state === 'new')
         throw error
       }
 

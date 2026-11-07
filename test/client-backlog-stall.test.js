@@ -168,3 +168,31 @@ test('a buffer that never reads 0 is not executed while our pings are answered (
     h.restore()
   }
 })
+
+test('a link whose pings go unanswered, with nothing coming in, takes no frames (a retryable refusal)', async () => {
+  const h = harness('a-local')
+  try {
+    const channel = await openProvenChannel(h)
+    h.client.sendData('first', 'z-remote')
+    assert.ok(channel.sent.includes('first'))
+    const realNow = Date.now
+    const base = realNow()
+    let offset = 0
+    Date.now = () => base + offset
+    try {
+      // The remote goes silent: our pings get no pong.
+      for (let i = 1; i <= 7; i++) { offset = i * 1000; await new Promise((r) => setTimeout(r, 1050)) }
+      const before = channel.sent.filter((m) => m === 'late').length
+      assert.throws(() => h.client.sendData('late', 'z-remote'), (e) => e.transient === true)
+      assert.equal(channel.sent.filter((m) => m === 'late').length, before, 'nothing sent into the quiet link')
+      // A pong: the link takes frames again.
+      channel.deliver({ type: 'pong', ts: Date.now() })
+      h.client.sendData('again', 'z-remote')
+      assert.ok(channel.sent.includes('again'))
+    } finally {
+      Date.now = realNow
+    }
+  } finally {
+    h.restore()
+  }
+})
