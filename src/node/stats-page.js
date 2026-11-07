@@ -10,6 +10,9 @@ export const STATS_PAGE = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="theme-color" content="#1b2430" />
 <title>Relay stats</title>
+<link rel="icon" type="image/svg+xml" href="/pigeonlogo.svg" />
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
+<link rel="apple-touch-icon" sizes="180x180" href="/icon-180.png" />
 <style>
   :root {
     /* Pickled Bluewood (deepened) and Cruise, as PigeonAI, PigeonFS, PigeonChess and the FreeRTC page. */
