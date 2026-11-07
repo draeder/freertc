@@ -116,3 +116,29 @@ test('a backlog that stops draining is executed at the stall window instead of l
     h.restore()
   }
 })
+
+test('a channel idle (empty buffer) past the stall window is not executed for one message in flight', async () => {
+  const h = harness('a-local')
+  try {
+    const channel = await openProvenChannel(h)
+    const realNow = Date.now
+    const base = realNow()
+    let offset = 0
+    Date.now = () => base + offset
+    try {
+      for (let i = 1; i <= 28; i++) {
+        offset = i * 1000
+        // Empty for 22 s, then a little in flight at each look (and it keeps moving: pongs come back).
+        channel.bufferedAmount = i <= 22 ? 0 : 300 + (i % 2) * 50
+        channel.deliver({ type: 'pong', ts: Date.now() })
+        await new Promise((resolve) => setTimeout(resolve, 1050))
+      }
+    } finally {
+      Date.now = realNow
+    }
+    assert.ok(!h.logs.some((m) => m.includes('backlog stalled')), h.logs.filter((m) => m.includes('stall')).join('\n'))
+    assert.equal(channel.readyState, 'open')
+  } finally {
+    h.restore()
+  }
+})

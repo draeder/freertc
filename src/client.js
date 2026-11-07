@@ -1491,10 +1491,17 @@ export function createSignalingClient(options = {}) {
     // receiver that stopped reading, and the keepalive verdict must run.
     let lastBufferedAmount = 0
     let lastBufferedProgressAt = Date.now()
+    // Progress is also the buffer emptying between two looks (the browser says so: bufferedamountlow at
+    // threshold 0), and an empty buffer at a look. Counting only a smaller amount than at the last look
+    // executed healthy channels: one idle (empty) for the stall window, caught with a message in flight
+    // at the next look, read as stalled since its last shrink 20 s before, and was closed, every 20 s.
+    try {
+      channel.addEventListener?.('bufferedamountlow', () => { lastBufferedProgressAt = Date.now() })
+    } catch { /* no such event here: the looks alone */ }
     const backlogged = () => {
       const buffered = Number(channel.bufferedAmount ?? 0)
       const now = Date.now()
-      if (buffered < lastBufferedAmount) lastBufferedProgressAt = now
+      if (buffered === 0 || buffered < lastBufferedAmount) lastBufferedProgressAt = now
       lastBufferedAmount = buffered
       return buffered > 0 && now - lastBufferedProgressAt < DATA_BACKLOG_STALL_MS
     }
