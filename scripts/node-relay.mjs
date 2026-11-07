@@ -63,6 +63,7 @@
 import { createServer } from 'node:http';
 import { createServer as createTlsServer } from 'node:https';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, createReadStream, appendFileSync, renameSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WsClient, { WebSocketServer } from 'ws';
@@ -317,7 +318,7 @@ if (!isOff(process.env.FREERTC_IDP)) {
     accountStore = store;
     relayEvent(`accounts: started with ${store.size()} kept`);
     accountsShared = federating;
-    console.log(`[node-relay] accounts: kept for browsers on this relay in ${path.relative(process.cwd(), store.file) || store.file} (${store.size()} so far)`);
+    console.log(`[node-relay] accounts: kept for browsers on this relay in ${store.file.startsWith(process.cwd() + path.sep) ? path.relative(process.cwd(), store.file) : store.file.replace(os.homedir(), '~')} (${store.size()} so far)`);
   } catch (error) {
     console.log(`[node-relay] accounts: off (${error?.code === 'ERR_MODULE_NOT_FOUND' ? 'pigeonidp is not installed: npm install' : error?.message || error})`);
   }
