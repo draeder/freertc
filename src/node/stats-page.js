@@ -8,19 +8,21 @@ export const STATS_PAGE = `<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<meta name="theme-color" content="#111518" />
+<meta name="theme-color" content="#1b2430" />
 <title>Relay stats</title>
 <style>
   :root {
-    --night: #111518; --night-2: #171c20; --line: #262e34; --line-strong: #3a454d;
-    --bone: #e4e7e9; --bone-2: #9aa5ad; --bone-3: #6b7780; --sheen: #56b09c; --warn: #d6b234; --stop: #e07a6d;
+    /* Pickled Bluewood (deepened) and Cruise, as PigeonAI, PigeonFS, PigeonChess and the FreeRTC page. */
+    --night: #1b2430; --night-2: #151d27; --line: #2c394a; --line-strong: #3d4c5f;
+    --bright: #e8f6f9; --bone: #bee6ee; --bone-2: #9dbfc8; --bone-3: #8aa7b3;
+    --sheen: #7fd8a6; --info: #9cc3f5; --warn: #f2c879; --stop: #f29b91;
     color-scheme: dark;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--night); color: var(--bone); font: 14px/1.45 system-ui, -apple-system, 'Segoe UI', sans-serif; -webkit-font-smoothing: antialiased; }
+  body { background: var(--night); color: var(--bone); font: 14px/1.45 'Archivo', system-ui, -apple-system, 'Segoe UI', sans-serif; -webkit-font-smoothing: antialiased; }
   main { max-width: 1180px; margin: 0 auto; padding: 28px clamp(16px, 4vw, 40px) 56px; }
   header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 24px; padding-bottom: 20px; border-bottom: 1px solid var(--line); }
-  h1 { font-size: 1.6rem; font-weight: 800; letter-spacing: -0.02em; }
+  h1 { font-size: 1.6rem; font-weight: 800; letter-spacing: -0.02em; color: var(--bright); }
   h1 small { font-size: 0.85rem; font-weight: 500; color: var(--bone-3); margin-left: 8px; letter-spacing: 0; }
   .where { color: var(--bone-2); font-family: ui-monospace, Menlo, monospace; font-size: 0.85rem; word-break: break-all; }
   .live { display: inline-flex; align-items: center; gap: 7px; color: var(--bone-3); font-size: 0.85rem; }
@@ -156,10 +158,10 @@ export const STATS_PAGE = `<!doctype html>
       const area = i === 0 ? '<polygon points="0,' + h + ' ' + points + ' ' + w + ',' + h + '" fill="' + colors[i] + '" fill-opacity="0.08"/>' : '';
       return area + '<polyline points="' + points + '" fill="none" stroke="' + colors[i] + '" stroke-width="1.5" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>';
     }).join('');
-    svg.innerHTML = '<line x1="0" x2="' + w + '" y1="' + (h - 0.5) + '" y2="' + (h - 0.5) + '" stroke="#262e34"/>' + lines;
+    svg.innerHTML = '<line x1="0" x2="' + w + '" y1="' + (h - 0.5) + '" y2="' + (h - 0.5) + '" stroke="#2c394a"/>' + lines;
   }
 
-  const SHEEN = '#56b09c', BONE = '#9aa5ad';
+  const SHEEN = '#7fd8a6', BONE = '#9dbfc8';
   let lastOk = 0;
 
   async function refresh() {
