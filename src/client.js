@@ -1900,6 +1900,9 @@ export function createSignalingClient(options = {}) {
         const pingSentAt = lastPingSentAt
         lastPongAt = Date.now()
         lastPingSentAt = 0
+        // Our ping got through, so everything queued before it did too: the send buffer is moving,
+        // whatever bufferedAmount says (WebKit can leave it above 0 on a channel that is working).
+        if (pingSentAt > 0) lastBufferedProgressAt = lastPongAt
         const pongEntry = mesh.connections.get(remotePeerId)
         if (pongEntry?.connection === pc && pongEntry.channel === channel) {
           // Round trip on this link, on our own clock only (smoothed): what a

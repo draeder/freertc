@@ -142,3 +142,29 @@ test('a channel idle (empty buffer) past the stall window is not executed for on
     h.restore()
   }
 })
+
+test('a buffer that never reads 0 is not executed while our pings are answered (WebKit)', async () => {
+  const h = harness('a-local')
+  try {
+    const channel = await openProvenChannel(h)
+    channel.bufferedAmount = 4096
+    const realNow = Date.now
+    const base = realNow()
+    let offset = 0
+    Date.now = () => base + offset
+    try {
+      for (let i = 1; i <= 30; i++) {
+        offset = i * 1000
+        await new Promise((resolve) => setTimeout(resolve, 1050))
+        // The remote answers each ping we send.
+        if (channel.sent.some((m) => m?.type === 'ping')) { channel.sent.length = 0; channel.deliver({ type: 'pong', ts: Date.now() }) }
+      }
+    } finally {
+      Date.now = realNow
+    }
+    assert.ok(!h.logs.some((m) => m.includes('backlog stalled')), h.logs.filter((m) => /stall|timeout/.test(m)).join('\n'))
+    assert.equal(channel.readyState, 'open')
+  } finally {
+    h.restore()
+  }
+})
