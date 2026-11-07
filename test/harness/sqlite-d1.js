@@ -12,11 +12,11 @@ function writtenTable(sql) {
 }
 
 /** An in-memory D1 with every migration applied, or null when this Node has no node:sqlite. */
-export async function openSqliteD1() {
+export async function openSqliteD1({ migrations = MIGRATIONS } = {}) {
   const sqlite = await import('node:sqlite').catch(() => null);
   if (!sqlite) return null;
   const db = new sqlite.DatabaseSync(':memory:');
-  for (const file of MIGRATIONS) {
+  for (const file of migrations) {
     db.exec(readFileSync(fileURLToPath(new URL(`../../migrations/${file}`, import.meta.url)), 'utf8'));
   }
   // Rows actually changed, by table, across every statement run so far.

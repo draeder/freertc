@@ -35,3 +35,14 @@ test('peers with a role are listed before the rest', () => {
   // With no roles, the list is as it was: the nearest.
   assert.equal(peersNearest(plain, '0000000000001000', 10)[0].peer_id, '0000000000001001');
 });
+
+test('a database without migration 0003 gets the role column on first use', async (t) => {
+  const { openSqliteD1: open } = await import('./harness/sqlite-d1.js');
+  const d1 = await open({ migrations: ['0001_initial.sql', '0002_kademlia_overlay.sql'] }).catch(() => null);
+  if (!d1) return t.skip('harness cannot open a database at an earlier migration');
+  const { ensureRoleColumn } = await import('../src/index.js');
+  await ensureRoleColumn(d1);
+  await ensureRoleColumn(d1);
+  await upsertAnnouncement(d1, { network: 'net', from: 'peer-b', session_id: 'room', ttl_ms: 30_000, body: { capabilities: { role: 'storage' } } });
+  assert.equal(rows(d1, 'SELECT role FROM psp_announcements')[0].role, 'storage');
+});

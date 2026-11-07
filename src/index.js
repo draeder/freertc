@@ -1396,6 +1396,7 @@ async function broadcastPeerList(env, selfRelayUrl, network, room, relayPeerId, 
   const storageScope = scopeKey(network, room);
   const sockets = subscribers.get(storageScope);
   if (!sockets || sockets.size === 0) return;
+  await ensureRoleColumn(db);
 
   const now = Date.now();
   const result = await db.prepare(`
@@ -1430,6 +1431,31 @@ async function broadcastPeerList(env, selfRelayUrl, network, room, relayPeerId, 
  * half its lease left, so a live peer is renewed well before it lapses at a fraction of the
  * writes, and a peer that is gone still ages out on the lease it was given.
  */
+// The role column (migration 0003) on a database that has not run that
+// migration yet: a relay deployed without applying migrations (a linked
+// GitHub build runs no D1 migration) adds the column itself, once, before it
+// first reads or writes a role. Another isolate adding it first is fine.
+const roleColumnReady = new WeakMap();
+export function ensureRoleColumn(db) {
+  if (!db || typeof db !== "object") return Promise.resolve();
+  let ready = roleColumnReady.get(db);
+  if (!ready) {
+    ready = (async () => {
+      try {
+        await db.prepare("SELECT role FROM psp_announcements LIMIT 0").bind().all();
+      } catch {
+        try {
+          await db.prepare("ALTER TABLE psp_announcements ADD COLUMN role TEXT").bind().run();
+        } catch (error) {
+          if (!/duplicate column/i.test(String(error?.message || error))) { roleColumnReady.delete(db); throw error; }
+        }
+      }
+    })();
+    roleColumnReady.set(db, ready);
+  }
+  return ready;
+}
+
 // What the peer says it is (capabilities.role): a short lowercase word, or none.
 export function announcedRole(message) {
   const role = message?.body?.capabilities?.role;
@@ -1437,6 +1463,7 @@ export function announcedRole(message) {
 }
 
 export async function upsertAnnouncement(db, message) {
+  await ensureRoleColumn(db);
   const now = Date.now();
   const ttl = Math.min(message.ttl_ms || DEFAULT_TTL_MS, MAX_TTL_MS);
   const expiresAt = now + ttl;
@@ -1462,6 +1489,7 @@ async function deleteAnnouncement(db, network, room, peerId) {
 }
 
 async function findPeers(db, network, room, requesterPeerId) {
+  await ensureRoleColumn(db);
   const now = Date.now();
   const storageScope = scopeKey(network, room);
   const result = await db.prepare(`
