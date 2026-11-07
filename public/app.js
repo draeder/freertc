@@ -3178,13 +3178,13 @@ createApp({
           <div class="brand-lockup">
             <span class="logo-badge" aria-hidden="true">
               <svg class="brand-icon" viewBox="0 0 48 48" role="img" aria-label="freertc logo">
-                <circle cx="24" cy="24" r="18" fill="none" stroke="#56b09c" stroke-width="2.8" />
-                <circle cx="24" cy="24" r="10" fill="none" stroke="#56b09c" stroke-width="2.4" />
-                <circle cx="24" cy="24" r="3.2" fill="#56b09c" />
-                <path d="M24 7.4v6.2" stroke="#56b09c" stroke-width="2" stroke-linecap="round" />
-                <path d="M24 34.4v6.2" stroke="#56b09c" stroke-width="2" stroke-linecap="round" />
-                <path d="M7.4 24h6.2" stroke="#56b09c" stroke-width="2" stroke-linecap="round" />
-                <path d="M34.4 24h6.2" stroke="#56b09c" stroke-width="2" stroke-linecap="round" />
+                <circle cx="24" cy="24" r="18" fill="none" stroke="#bee6ee" stroke-width="2.8" />
+                <circle cx="24" cy="24" r="10" fill="none" stroke="#bee6ee" stroke-width="2.4" />
+                <circle cx="24" cy="24" r="3.2" fill="#bee6ee" />
+                <path d="M24 7.4v6.2" stroke="#bee6ee" stroke-width="2" stroke-linecap="round" />
+                <path d="M24 34.4v6.2" stroke="#bee6ee" stroke-width="2" stroke-linecap="round" />
+                <path d="M7.4 24h6.2" stroke="#bee6ee" stroke-width="2" stroke-linecap="round" />
+                <path d="M34.4 24h6.2" stroke="#bee6ee" stroke-width="2" stroke-linecap="round" />
               </svg>
             </span>
             <h1 class="brand-wordmark"><span class="brand-free">Free</span><span class="brand-rtc">RTC</span></h1>
