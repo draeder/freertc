@@ -66,6 +66,15 @@ const DATA_CHUNK_THRESHOLD = 15000
 const DATA_CHUNK_FRAME = '~fc'
 const DATA_CHUNK_MAX_FRAMES = 4096
 const DATA_CHUNK_STALE_MS = 30000
+// Bytes (an ArrayBuffer or a typed array) travel as binary frames: no base64, no JSON escaping, and
+// 48 KiB a frame (under Safari's 64 KiB max-message-size) where a string goes 8 KiB a frame. A frame
+// is a 12-byte header, then its slice of the bytes:
+//   'p' 'b' 1 0 | transfer id (u32) | slice (u16) | slices (u16)    (big-endian)
+// and the receiver hands the whole bytes on as one Uint8Array. Callers send bytes only to a peer that
+// said it reads them (PeerPigeon's storage servers and their clients ask first).
+const DATA_BIN_SLICE = 48 * 1024
+const DATA_BIN_HEADER = 12
+const DATA_BIN_MAX_SLICES = 2048
 // A hidden tab cannot answer pings promptly — Safari throttles its JS — so
 // the 4s pong verdict executed every edge to a napping tab, and each thaw
 // redialed and burst into the corpses. A tab that is about to nap says so;
@@ -109,6 +118,7 @@ const RELAY_DEFAULTS = {
 // stalled-negotiation machinery executes the peer.
 const transportReady = (pc) => pc?.connectionState === undefined || pc.connectionState === 'connected'
 let dataChunkCounter = 0
+let dataBinCounter = 0
 // A relay socket is a Durable Object, and every message a peer sends up it is
 // a billable request. At one ping a second that is 86,400 requests a day per
 // socket to say nothing at all — measured on an idle node, 62% of everything
@@ -1790,6 +1800,40 @@ export function createSignalingClient(options = {}) {
     // Reassembly state for chunked payloads on this channel. Bounded: a
     // stale or oversized transfer is dropped, never grown forever.
     const chunkTransfers = new Map()
+    // Binary frames: ArrayBuffers, not Blobs (a Blob would need an async read, out of order).
+    try { channel.binaryType = 'arraybuffer' } catch { /* not settable: Blobs are read below */ }
+    const binTransfers = new Map()
+    const reassembleBinary = (frame) => {
+      if (frame.byteLength < DATA_BIN_HEADER) return null
+      const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength)
+      if (view.getUint8(0) !== 0x70 || view.getUint8(1) !== 0x62 || view.getUint8(2) !== 1) return null
+      const id = view.getUint32(4), seq = view.getUint16(8), total = view.getUint16(10)
+      if (total < 1 || total > DATA_BIN_MAX_SLICES || seq >= total) return null
+      const part = frame.subarray(DATA_BIN_HEADER)
+      if (total === 1) return part.slice()
+      const now = Date.now()
+      for (const [key, t] of binTransfers) if (now - t.startedAt > DATA_CHUNK_STALE_MS) binTransfers.delete(key)
+      let t = binTransfers.get(id)
+      if (!t) { t = { startedAt: now, total, received: 0, size: 0, parts: new Array(total) }; binTransfers.set(id, t) }
+      if (t.total !== total || t.parts[seq] !== undefined) return null
+      t.parts[seq] = part.slice()
+      t.received++
+      t.size += part.length
+      if (t.received < t.total) return null
+      binTransfers.delete(id)
+      const whole = new Uint8Array(t.size)
+      let at = 0
+      for (const p of t.parts) { whole.set(p, at); at += p.length }
+      return whole
+    }
+    const onBinary = (bytes) => {
+      const currentEntry = mesh.connections.get(remotePeerId)
+      if (!(currentEntry?.connection === pc && currentEntry.channel === channel)) return
+      const whole = reassembleBinary(bytes)
+      if (whole === null) return
+      proveOutbound()
+      onDataMessage?.({ peerId: remotePeerId, data: whole })
+    }
     const reassembleChunk = (msg) => {
       const total = Number(msg.n)
       const seq = Number(msg.s)
@@ -1820,6 +1864,14 @@ export function createSignalingClient(options = {}) {
       if (ownsCurrentEntry) currentEntry.lastInboundAt = lastInboundAt
       if (ownsCurrentEntry && currentEntry.dormantAt && String(event.data).indexOf(DATA_DORMANT_FRAME) === -1) {
         currentEntry.dormantAt = 0
+      }
+      if (event.data instanceof ArrayBuffer || ArrayBuffer.isView(event.data)) {
+        onBinary(event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : new Uint8Array(event.data.buffer, event.data.byteOffset, event.data.byteLength))
+        return
+      }
+      if (typeof Blob !== 'undefined' && event.data instanceof Blob) {
+        void event.data.arrayBuffer().then((buf) => onBinary(new Uint8Array(buf)), () => {})
+        return
       }
       let msg
       try {
@@ -3333,6 +3385,24 @@ export function createSignalingClient(options = {}) {
           error.cause = err
           throw error
         }
+      }
+
+      if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+        const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+        const total = Math.max(1, Math.ceil(bytes.length / DATA_BIN_SLICE))
+        if (total > DATA_BIN_MAX_SLICES) throw new Error(`binary payload too large (${bytes.length} bytes)`)
+        const id = (dataBinCounter = (dataBinCounter + 1) >>> 0)
+        for (let seq = 0; seq < total; seq++) {
+          const part = bytes.subarray(seq * DATA_BIN_SLICE, (seq + 1) * DATA_BIN_SLICE)
+          const frame = new Uint8Array(DATA_BIN_HEADER + part.length)
+          const view = new DataView(frame.buffer)
+          view.setUint8(0, 0x70); view.setUint8(1, 0x62); view.setUint8(2, 1); view.setUint8(3, 0)
+          view.setUint32(4, id); view.setUint16(8, seq); view.setUint16(10, total)
+          frame.set(part, DATA_BIN_HEADER)
+          // Node's WebRTC (werift) sends Buffers; a browser, any ArrayBufferView.
+          sendFrame(typeof Buffer === 'function' ? Buffer.from(frame.buffer, 0, frame.byteLength) : frame)
+        }
+        return target
       }
 
       if (typeof data === 'string' && data.length > DATA_CHUNK_THRESHOLD) {
