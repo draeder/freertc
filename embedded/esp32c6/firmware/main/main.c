@@ -42,6 +42,7 @@ static volatile int mode; /* 0 starting, 1 setup network open, 2 joining Wi-Fi, 
 static char setup_ssid[33] = "";
 static char heard[160] = "not scanned";   /* what the scan at setup heard, repeated in the status line */
 static volatile bool ap_on;
+static volatile bool station;   /* joining a saved network (not the setup scan) */
 static httpd_handle_t server;
 static int conn_fd[RELAY_MAX_CONNS];   /* connection index -> socket, -1 free */
 static char ip_text[16] = "";
@@ -146,8 +147,8 @@ static EventGroupHandle_t wifi_events;
 
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
   if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STACONNECTED) ESP_LOGI(TAG, "A device joined the setup network");
-  else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) esp_wifi_connect();
-  else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+  else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) { if (station) esp_wifi_connect(); }
+  else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED && station) {
     wifi_event_sta_disconnected_t *e = data;
     /* 15 or 204: wrong password; 201: that network isn't heard */
     ESP_LOGW(TAG, "Not joined (reason %d%s)", e->reason, e->reason == 15 || e->reason == 204 ? ": wrong password?" : e->reason == 201 ? ": network not heard" : "");
@@ -318,6 +319,7 @@ void app_main(void) {
   if (want_setup || !saved_wifi(ssid, sizeof ssid, pass, sizeof pass)) { run_setup(false); return; }
 
   mode = 2;
+  station = true;
   wifi_events = xEventGroupCreate();
   esp_netif_t *sta = esp_netif_create_default_wifi_sta();
   esp_netif_set_hostname(sta, "freertc-relay");
