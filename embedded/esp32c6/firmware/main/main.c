@@ -34,9 +34,15 @@
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
 
+#include "driver/gpio.h"
 #include "relay.h"
 
 static const char *TAG = "freertc";
+/* The Seeed IoT Button's blue LED: GPIO3 on V2, GPIO2 on V1 (both driven; the other pin is unused). */
+#define LED_V2 GPIO_NUM_3
+#define LED_V1 GPIO_NUM_2
+static volatile int mode; /* 0 starting, 1 setup network open, 2 joining Wi-Fi, 3 relay running */
+static char setup_ssid[33] = "";
 static httpd_handle_t server;
 static int conn_fd[RELAY_MAX_CONNS];   /* connection index -> socket, -1 free */
 static char ip_text[16] = "";
@@ -130,6 +136,7 @@ static void start_relay(void) {
   esp_timer_handle_t timer;
   esp_timer_create(&t, &timer);
   esp_timer_start_periodic(timer, 1000 * 1000);
+  mode = 3;
   ESP_LOGI(TAG, "Relay at ws://%s/ws", ip_text);
 }
 
@@ -225,10 +232,31 @@ static void run_setup(bool also_station) {
   httpd_uri_t save = { .uri = "/save", .method = HTTP_POST, .handler = setup_save };
   httpd_register_uri_handler(server, &page);
   httpd_register_uri_handler(server, &save);
+  snprintf(setup_ssid, sizeof setup_ssid, "%s", (char *)ap.ap.ssid);
+  mode = 1;
   ESP_LOGI(TAG, "Setup: join Wi-Fi \"%s\" and open http://192.168.4.1", ap.ap.ssid);
 }
 
+/* A line every 5 s on the USB log, and the LED: blinking while the setup network is open, on while the
+ * relay runs. */
+static void status_task(void *arg) {
+  gpio_config_t io = { .pin_bit_mask = (1ULL << LED_V2) | (1ULL << LED_V1), .mode = GPIO_MODE_OUTPUT };
+  gpio_config(&io);
+  for (int n = 0;; n++) {
+    int on = mode == 1 ? n & 1 : mode == 3;
+    gpio_set_level(LED_V2, on); gpio_set_level(LED_V1, on);
+    if (n % 10 == 0) {
+      if (mode == 1) ESP_LOGI(TAG, "Setup network \"%s\" is open: join it, then http://192.168.4.1", setup_ssid);
+      else if (mode == 2) ESP_LOGI(TAG, "Joining Wi-Fi…");
+      else if (mode == 3) { relay_stats s = relay_get_stats(); ESP_LOGI(TAG, "Relay ws://%s/ws: %d connections, %d peers, free memory %lu", ip_text, s.conns, s.peers, (unsigned long)esp_get_free_heap_size()); }
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
 void app_main(void) {
+  xTaskCreate(status_task, "status", 3072, NULL, 1, NULL);
+  ESP_LOGI(TAG, "FreeRTC relay starting");
   esp_err_t err = nvs_flash_init();
   if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) { nvs_flash_erase(); err = nvs_flash_init(); }
   ESP_ERROR_CHECK(err);
@@ -238,6 +266,7 @@ void app_main(void) {
   char ssid[33], pass[65];
   if (!saved_wifi(ssid, sizeof ssid, pass, sizeof pass)) { run_setup(false); return; }
 
+  mode = 2;
   wifi_events = xEventGroupCreate();
   esp_netif_t *sta = esp_netif_create_default_wifi_sta();
   esp_netif_set_hostname(sta, "freertc-relay");
