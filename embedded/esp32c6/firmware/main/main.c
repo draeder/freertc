@@ -147,6 +147,8 @@ static EventGroupHandle_t wifi_events;
 
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
   if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STACONNECTED) ESP_LOGI(TAG, "A device joined the setup network");
+  else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STADISCONNECTED) ESP_LOGW(TAG, "A device left the setup network (reason %d)", ((wifi_event_ap_stadisconnected_t *)data)->reason);
+  else if (base == IP_EVENT && id == IP_EVENT_AP_STAIPASSIGNED) ESP_LOGI(TAG, "The setup network gave a device an address: open http://192.168.4.1");
   else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) { if (station) esp_wifi_connect(); }
   else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED && station) {
     wifi_event_sta_disconnected_t *e = data;
@@ -266,15 +268,18 @@ static void run_setup(bool also_station) {
   wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&init));
   esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL, NULL);
+  esp_event_handler_instance_register(IP_EVENT, IP_EVENT_AP_STAIPASSIGNED, wifi_event, NULL, NULL);
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
   ESP_ERROR_CHECK(esp_wifi_start());
   scan_and_print();
   ESP_ERROR_CHECK(esp_wifi_stop());
   uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
-  wifi_config_t ap = { .ap = { .channel = 6, .max_connection = 2, .authmode = WIFI_AUTH_OPEN } };
+  wifi_config_t ap = { .ap = { .channel = 6, .max_connection = 4, .authmode = WIFI_AUTH_OPEN, .pmf_cfg = { .required = false, .capable = false } } };
   int n = snprintf((char *)ap.ap.ssid, sizeof ap.ap.ssid, "FreeRTC-Relay-%02X%02X", mac[4], mac[5]);
   ap.ap.ssid_len = n;
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+  /* 802.11b/g/n only: Macs fail to join the C6's Wi-Fi 6 (ax) access point. */
+  esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
   ESP_ERROR_CHECK(esp_wifi_start());
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
