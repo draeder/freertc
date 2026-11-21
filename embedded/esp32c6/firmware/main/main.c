@@ -39,6 +39,8 @@
 static const char *TAG = "freertc";
 static volatile int mode; /* 0 starting, 1 setup network open, 2 joining Wi-Fi, 3 relay running */
 static char setup_ssid[33] = "";
+static char heard[160] = "not scanned";   /* what the scan at setup heard, repeated in the status line */
+static volatile bool ap_on;
 static httpd_handle_t server;
 static int conn_fd[RELAY_MAX_CONNS];   /* connection index -> socket, -1 free */
 static char ip_text[16] = "";
@@ -150,7 +152,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     ESP_LOGW(TAG, "Not joined (reason %d%s)", e->reason, e->reason == 15 || e->reason == 204 ? ": wrong password?" : e->reason == 201 ? ": network not heard" : "");
     esp_wifi_connect();
   }
-  else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_START) ESP_LOGI(TAG, "Setup network is on the air");
+  else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_START) { ap_on = true; ESP_LOGI(TAG, "Setup network is on the air"); }
   else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
     ip_event_got_ip_t *e = data;
     snprintf(ip_text, sizeof ip_text, IPSTR, IP2STR(&e->ip_info.ip));
@@ -223,6 +225,9 @@ static void scan_and_print(void) {
   uint16_t n = 20; wifi_ap_record_t recs[20];
   esp_wifi_scan_get_ap_records(&n, recs);
   ESP_LOGI(TAG, "It hears %d Wi-Fi networks:", n);
+  int len = snprintf(heard, sizeof heard, "%d networks", n);
+  for (int i = 0; i < n && i < 3 && len < (int)sizeof heard - 1; i++)
+    len += snprintf(heard + len, sizeof heard - len, "%s %s %d dBm", i ? "," : ":", (char *)recs[i].ssid, recs[i].rssi);
   for (int i = 0; i < n; i++) ESP_LOGI(TAG, "  %-32s signal %d dBm, channel %d", (char *)recs[i].ssid, recs[i].rssi, recs[i].primary);
 }
 
@@ -258,7 +263,7 @@ static void run_setup(bool also_station) {
 static void status_task(void *arg) {
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(5000));
-    if (mode == 1) ESP_LOGI(TAG, "Setup network \"%s\" is open: join it, then http://192.168.4.1", setup_ssid);
+    if (mode == 1) ESP_LOGI(TAG, "Setup network \"%s\" %s. It heard %s", setup_ssid, ap_on ? "is on the air" : "did NOT start", heard);
     else if (mode == 2) ESP_LOGI(TAG, "Joining Wi-Fi…");
     else if (mode == 3) { relay_stats s = relay_get_stats(); ESP_LOGI(TAG, "Relay ws://%s/ws: %d connections, %d peers, free memory %lu", ip_text, s.conns, s.peers, (unsigned long)esp_get_free_heap_size()); }
   }
