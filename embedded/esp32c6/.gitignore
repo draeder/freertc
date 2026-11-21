@@ -1,0 +1,5 @@
+linux/freertc-c6-relay
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/managed_components/
