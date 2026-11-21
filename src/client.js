@@ -1,3 +1,4 @@
+import { sha256 } from 'unsea'
 import { directRelayLan, isDirectRelayUrl } from './direct/common.js'
 import { directRelayChannel } from './direct/dial.js'
 export { directRelayChannel }
@@ -1313,8 +1314,8 @@ export function createSignalingClient(options = {}) {
   async function closenessKey(text) {
     let key = closenessKeys.get(text)
     if (key === undefined) {
-      const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))
-      key = BigInt(`0x${Array.from(digest, (byte) => byte.toString(16).padStart(2, '0')).join('')}`)
+      // unsea's SHA-256: WebCrypto's, or its stand-in on a page without crypto.subtle (plain http).
+      key = BigInt(`0x${await sha256(text)}`)
       if (closenessKeys.size > 2000) closenessKeys.clear()
       closenessKeys.set(text, key)
     }

@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { createSignalingClient } from 'freertc/client'
+// Node's own WebCrypto as the reference, so this also runs with crypto.subtle taken away (test/without-webcrypto.mjs).
+import { webcrypto } from 'node:crypto'
 
 // Relay on demand: a peer whose mesh is healthy releases its relay socket unless it is one of the
 // room's anchors (the peers closest to the room key), and wakes it when it needs it again.
@@ -9,8 +11,8 @@ import { createSignalingClient } from 'freertc/client'
 const NETWORK = 'test-network'
 const ROOM = 'test-room'
 const hex = (bytes) => Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
-const keyOf = async (text) => BigInt(`0x${hex(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))))}`)
-const randomId = () => crypto.randomUUID().replaceAll('-', '') + crypto.randomUUID().replaceAll('-', '')
+const keyOf = async (text) => BigInt(`0x${hex(new Uint8Array(await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode(text))))}`)
+const randomId = () => webcrypto.randomUUID().replaceAll('-', '') + webcrypto.randomUUID().replaceAll('-', '')
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 // Peer ids sorted by how close they are to the room, closest first, so a test can say exactly who is
