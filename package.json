@@ -45,6 +45,7 @@
     "src/index.js",
     "src/kademlia.js",
     "src/relay-id.js",
+    "src/relay-fetch.js",
     "src/relay-identity.js",
     "src/relay-overlay.js",
     "wrangler.template.jsonc",
