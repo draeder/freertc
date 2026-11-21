@@ -3,7 +3,8 @@
  * ESP-IDF's HTTP server, on the local network.
  *
  * First boot (no Wi-Fi saved): it opens the Wi-Fi network "FreeRTC-Relay-XXXX"; join it and open
- * http://192.168.4.1 to give it your Wi-Fi's name and password. They are kept in flash (NVS), and it
+ * http://192.168.4.1 to give it your Wi-Fi's name and password. Or, on its USB console, type wifi and
+ * Enter, then the name and the password. They are kept in flash (NVS), and it
  * restarts onto your network.
  *
  * Then: ws://<its address>/ws is the relay, http://<its address>/ shows its counts. It stays on (no
@@ -34,13 +35,11 @@
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
 
-#include "driver/gpio.h"
+#include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_vfs.h"
 #include "relay.h"
 
 static const char *TAG = "freertc";
-/* The Seeed IoT Button's blue LED: GPIO3 on V2, GPIO2 on V1 (both driven; the other pin is unused). */
-#define LED_V2 GPIO_NUM_3
-#define LED_V1 GPIO_NUM_2
 static volatile int mode; /* 0 starting, 1 setup network open, 2 joining Wi-Fi, 3 relay running */
 static char setup_ssid[33] = "";
 static httpd_handle_t server;
@@ -146,7 +145,8 @@ static EventGroupHandle_t wifi_events;
 #define GOT_IP BIT0
 
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
-  if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) esp_wifi_connect();
+  if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STACONNECTED) ESP_LOGI(TAG, "A device joined the setup network");
+  else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) esp_wifi_connect();
   else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) { vTaskDelay(pdMS_TO_TICKS(1000)); esp_wifi_connect(); }
   else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
     ip_event_got_ip_t *e = data;
@@ -227,6 +227,7 @@ static void run_setup(bool also_station) {
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
   if (!also_station) ESP_ERROR_CHECK(esp_wifi_start());
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+  esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, wifi_event, NULL, NULL);
   ESP_ERROR_CHECK(httpd_start(&server, &cfg));
   httpd_uri_t page = { .uri = "/", .method = HTTP_GET, .handler = setup_page };
   httpd_uri_t save = { .uri = "/save", .method = HTTP_POST, .handler = setup_save };
@@ -237,25 +238,61 @@ static void run_setup(bool also_station) {
   ESP_LOGI(TAG, "Setup: join Wi-Fi \"%s\" and open http://192.168.4.1", ap.ap.ssid);
 }
 
-/* A line every 5 s on the USB log, and the LED: blinking while the setup network is open, on while the
- * relay runs. */
+/* A line every 5 s on the USB log. */
 static void status_task(void *arg) {
-  gpio_config_t io = { .pin_bit_mask = (1ULL << LED_V2) | (1ULL << LED_V1), .mode = GPIO_MODE_OUTPUT };
-  gpio_config(&io);
-  for (int n = 0;; n++) {
-    int on = mode == 1 ? n & 1 : mode == 3;
-    gpio_set_level(LED_V2, on); gpio_set_level(LED_V1, on);
-    if (n % 10 == 0) {
-      if (mode == 1) ESP_LOGI(TAG, "Setup network \"%s\" is open: join it, then http://192.168.4.1", setup_ssid);
-      else if (mode == 2) ESP_LOGI(TAG, "Joining Wi-Fi…");
-      else if (mode == 3) { relay_stats s = relay_get_stats(); ESP_LOGI(TAG, "Relay ws://%s/ws: %d connections, %d peers, free memory %lu", ip_text, s.conns, s.peers, (unsigned long)esp_get_free_heap_size()); }
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    if (mode == 1) ESP_LOGI(TAG, "Setup network \"%s\" is open (join it, then http://192.168.4.1), or type wifi and Enter here", setup_ssid);
+    else if (mode == 2) ESP_LOGI(TAG, "Joining Wi-Fi… (type wifi and Enter here to change it)");
+    else if (mode == 3) { relay_stats s = relay_get_stats(); ESP_LOGI(TAG, "Relay ws://%s/ws: %d connections, %d peers, free memory %lu", ip_text, s.conns, s.peers, (unsigned long)esp_get_free_heap_size()); }
+  }
+}
+
+/* Wi-Fi set from the USB console: type wifi, Enter, then the name and the password. */
+static int read_line(char *out, size_t cap, bool secret) {
+  size_t n = 0;
+  for (;;) {
+    uint8_t c;
+    if (usb_serial_jtag_read_bytes(&c, 1, portMAX_DELAY) != 1) continue;
+    if (c == '\r' || c == '\n') { if (n || !secret) { usb_serial_jtag_write_bytes("\r\n", 2, 100); out[n] = 0; return (int)n; } continue; }
+    if ((c == 8 || c == 127) && n) { n--; usb_serial_jtag_write_bytes("\b \b", 3, 100); continue; }
+    if (c < 32 || n + 1 >= cap) continue;
+    out[n++] = (char)c;
+    usb_serial_jtag_write_bytes(secret ? "*" : (const char *)&c, 1, 100);
+  }
+}
+static void console_task(void *arg) {
+  usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+  if (usb_serial_jtag_driver_install(&cfg) != ESP_OK) { vTaskDelete(NULL); return; }
+  usb_serial_jtag_vfs_use_driver(); /* the log and this console share the port */
+  char line[80];
+  for (;;) {
+    read_line(line, sizeof line, false);
+    if (strcmp(line, "wifi")) { if (line[0]) printf("Type wifi and Enter to set the Wi-Fi it joins.\n"); continue; }
+    char ssid[33], pass[65];
+    printf("Wi-Fi name: "); fflush(stdout);
+    read_line(ssid, sizeof ssid, false);
+    if (!ssid[0]) continue;
+    printf("Password (Enter for none): "); fflush(stdout);
+    size_t n = 0; pass[0] = 0;
+    for (;;) { /* like read_line, but Enter on an empty password is allowed */
+      uint8_t c;
+      if (usb_serial_jtag_read_bytes(&c, 1, portMAX_DELAY) != 1) continue;
+      if (c == '\r' || c == '\n') { pass[n] = 0; usb_serial_jtag_write_bytes("\r\n", 2, 100); break; }
+      if ((c == 8 || c == 127) && n) { n--; usb_serial_jtag_write_bytes("\b \b", 3, 100); continue; }
+      if (c >= 32 && n + 1 < sizeof pass) { pass[n++] = (char)c; usb_serial_jtag_write_bytes("*", 1, 100); }
     }
-    vTaskDelay(pdMS_TO_TICKS(500));
+    nvs_handle_t h;
+    if (nvs_open("wifi", NVS_READWRITE, &h) == ESP_OK) { nvs_set_str(h, "ssid", ssid); nvs_set_str(h, "pass", pass); nvs_commit(h); nvs_close(h); }
+    printf("Saved \"%s\". Restarting onto it…\n", ssid);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
   }
 }
 
 void app_main(void) {
   xTaskCreate(status_task, "status", 3072, NULL, 1, NULL);
+  xTaskCreate(console_task, "console", 4096, NULL, 2, NULL);
   ESP_LOGI(TAG, "FreeRTC relay starting");
   esp_err_t err = nvs_flash_init();
   if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) { nvs_flash_erase(); err = nvs_flash_init(); }
