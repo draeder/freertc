@@ -34,6 +34,7 @@
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
 
+#include "driver/gpio.h"
 #include "relay.h"
 
 static const char *TAG = "freertc";
@@ -218,14 +219,41 @@ static esp_err_t setup_save(httpd_req_t *req) {
 
 /* Its own Wi-Fi network and the form. `also_station`: Wi-Fi is already started, trying the saved network
  * (which it keeps trying). */
+/* Seeed's C6 boards switch the radio to an antenna: GPIO3 low powers the switch, GPIO14 picks the
+ * antenna (low: the one on the board, high: the external connector). */
+static int antenna = 0;
+static void set_antenna(int external) {
+  gpio_config_t io = { .pin_bit_mask = (1ULL << GPIO_NUM_3) | (1ULL << GPIO_NUM_14), .mode = GPIO_MODE_OUTPUT };
+  gpio_config(&io);
+  gpio_set_level(GPIO_NUM_3, 0);
+  gpio_set_level(GPIO_NUM_14, external);
+  antenna = external;
+  vTaskDelay(pdMS_TO_TICKS(100));
+}
+
+static int scan_count(void) {
+  wifi_scan_config_t sc = { .show_hidden = false };
+  if (esp_wifi_scan_start(&sc, true) != ESP_OK) return -1;
+  uint16_t n = 0; esp_wifi_scan_get_ap_num(&n);
+  esp_wifi_clear_ap_list();
+  return n;
+}
+
 /* The networks it hears, strongest first: shows its radio works (and what it can join). */
 static void scan_and_print(void) {
+  /* Which antenna hears more: kept for the rest of the run, and saved. */
+  set_antenna(0); int a = scan_count();
+  set_antenna(1); int b = scan_count();
+  set_antenna(b > a ? 1 : 0);
+  nvs_handle_t h;
+  if (nvs_open("wifi", NVS_READWRITE, &h) == ESP_OK) { nvs_set_u8(h, "ant", antenna); nvs_commit(h); nvs_close(h); }
+  char note[64]; snprintf(note, sizeof note, "board antenna %d, external %d; ", a, b);
   wifi_scan_config_t sc = { .show_hidden = false };
   if (esp_wifi_scan_start(&sc, true) != ESP_OK) { ESP_LOGW(TAG, "Wi-Fi scan failed"); return; }
   uint16_t n = 20; wifi_ap_record_t recs[20];
   esp_wifi_scan_get_ap_records(&n, recs);
   ESP_LOGI(TAG, "It hears %d Wi-Fi networks:", n);
-  int len = snprintf(heard, sizeof heard, "%d networks", n);
+  int len = snprintf(heard, sizeof heard, "%s%d networks", note, n);
   for (int i = 0; i < n && i < 3 && len < (int)sizeof heard - 1; i++)
     len += snprintf(heard + len, sizeof heard - len, "%s %s %d dBm", i ? "," : ":", (char *)recs[i].ssid, recs[i].rssi);
   for (int i = 0; i < n; i++) ESP_LOGI(TAG, "  %-32s signal %d dBm, channel %d", (char *)recs[i].ssid, recs[i].rssi, recs[i].primary);
@@ -297,6 +325,11 @@ void app_main(void) {
   ESP_ERROR_CHECK(esp_wifi_init(&init));
   esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL, NULL);
   esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event, NULL, NULL);
+  {
+    uint8_t ant = 0; nvs_handle_t ah;
+    if (nvs_open("wifi", NVS_READONLY, &ah) == ESP_OK) { nvs_get_u8(ah, "ant", &ant); nvs_close(ah); }
+    set_antenna(ant);
+  }
   ESP_LOGI(TAG, "Joining \"%s\"", ssid);
   wifi_config_t sc = { 0 };
   /* Wi-Fi names and passwords fill these fields whole (32 and 64 bytes) with no terminator needed. */
