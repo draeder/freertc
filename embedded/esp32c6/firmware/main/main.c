@@ -3,8 +3,7 @@
  * ESP-IDF's HTTP server, on the local network.
  *
  * First boot (no Wi-Fi saved): it opens the Wi-Fi network "FreeRTC-Relay-XXXX"; join it and open
- * http://192.168.4.1 to give it your Wi-Fi's name and password. Or, on its USB console, type wifi and
- * Enter, then the name and the password. They are kept in flash (NVS), and it
+ * http://192.168.4.1 to give it your Wi-Fi's name and password. They are kept in flash (NVS), and it
  * restarts onto your network.
  *
  * Then: ws://<its address>/ws is the relay, http://<its address>/ shows its counts. It stays on (no
@@ -35,8 +34,6 @@
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
 
-#include "driver/usb_serial_jtag.h"
-#include "driver/usb_serial_jtag_vfs.h"
 #include "relay.h"
 
 static const char *TAG = "freertc";
@@ -147,7 +144,13 @@ static EventGroupHandle_t wifi_events;
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
   if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STACONNECTED) ESP_LOGI(TAG, "A device joined the setup network");
   else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) esp_wifi_connect();
-  else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) { vTaskDelay(pdMS_TO_TICKS(1000)); esp_wifi_connect(); }
+  else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+    wifi_event_sta_disconnected_t *e = data;
+    /* 15 or 204: wrong password; 201: that network isn't heard */
+    ESP_LOGW(TAG, "Not joined (reason %d%s)", e->reason, e->reason == 15 || e->reason == 204 ? ": wrong password?" : e->reason == 201 ? ": network not heard" : "");
+    esp_wifi_connect();
+  }
+  else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_START) ESP_LOGI(TAG, "Setup network is on the air");
   else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
     ip_event_got_ip_t *e = data;
     snprintf(ip_text, sizeof ip_text, IPSTR, IP2STR(&e->ip_info.ip));
@@ -213,21 +216,34 @@ static esp_err_t setup_save(httpd_req_t *req) {
 
 /* Its own Wi-Fi network and the form. `also_station`: Wi-Fi is already started, trying the saved network
  * (which it keeps trying). */
+/* The networks it hears, strongest first: shows its radio works (and what it can join). */
+static void scan_and_print(void) {
+  wifi_scan_config_t sc = { .show_hidden = false };
+  if (esp_wifi_scan_start(&sc, true) != ESP_OK) { ESP_LOGW(TAG, "Wi-Fi scan failed"); return; }
+  uint16_t n = 20; wifi_ap_record_t recs[20];
+  esp_wifi_scan_get_ap_records(&n, recs);
+  ESP_LOGI(TAG, "It hears %d Wi-Fi networks:", n);
+  for (int i = 0; i < n; i++) ESP_LOGI(TAG, "  %-32s signal %d dBm, channel %d", (char *)recs[i].ssid, recs[i].rssi, recs[i].primary);
+}
+
 static void run_setup(bool also_station) {
   esp_netif_create_default_wifi_ap();
-  if (!also_station) {
-    wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&init));
-  }
+  esp_netif_create_default_wifi_sta();
+  wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
+  ESP_ERROR_CHECK(esp_wifi_init(&init));
+  esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL, NULL);
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+  ESP_ERROR_CHECK(esp_wifi_start());
+  scan_and_print();
+  ESP_ERROR_CHECK(esp_wifi_stop());
   uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
   wifi_config_t ap = { .ap = { .channel = 6, .max_connection = 2, .authmode = WIFI_AUTH_OPEN } };
   int n = snprintf((char *)ap.ap.ssid, sizeof ap.ap.ssid, "FreeRTC-Relay-%02X%02X", mac[4], mac[5]);
   ap.ap.ssid_len = n;
-  ESP_ERROR_CHECK(esp_wifi_set_mode(also_station ? WIFI_MODE_APSTA : WIFI_MODE_AP));
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
-  if (!also_station) ESP_ERROR_CHECK(esp_wifi_start());
+  ESP_ERROR_CHECK(esp_wifi_start());
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-  esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, wifi_event, NULL, NULL);
   ESP_ERROR_CHECK(httpd_start(&server, &cfg));
   httpd_uri_t page = { .uri = "/", .method = HTTP_GET, .handler = setup_page };
   httpd_uri_t save = { .uri = "/save", .method = HTTP_POST, .handler = setup_save };
@@ -242,57 +258,14 @@ static void run_setup(bool also_station) {
 static void status_task(void *arg) {
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(5000));
-    if (mode == 1) ESP_LOGI(TAG, "Setup network \"%s\" is open (join it, then http://192.168.4.1), or type wifi and Enter here", setup_ssid);
-    else if (mode == 2) ESP_LOGI(TAG, "Joining Wi-Fi… (type wifi and Enter here to change it)");
+    if (mode == 1) ESP_LOGI(TAG, "Setup network \"%s\" is open: join it, then http://192.168.4.1", setup_ssid);
+    else if (mode == 2) ESP_LOGI(TAG, "Joining Wi-Fi…");
     else if (mode == 3) { relay_stats s = relay_get_stats(); ESP_LOGI(TAG, "Relay ws://%s/ws: %d connections, %d peers, free memory %lu", ip_text, s.conns, s.peers, (unsigned long)esp_get_free_heap_size()); }
-  }
-}
-
-/* Wi-Fi set from the USB console: type wifi, Enter, then the name and the password. */
-static int read_line(char *out, size_t cap, bool secret) {
-  size_t n = 0;
-  for (;;) {
-    uint8_t c;
-    if (usb_serial_jtag_read_bytes(&c, 1, portMAX_DELAY) != 1) continue;
-    if (c == '\r' || c == '\n') { if (n || !secret) { usb_serial_jtag_write_bytes("\r\n", 2, 100); out[n] = 0; return (int)n; } continue; }
-    if ((c == 8 || c == 127) && n) { n--; usb_serial_jtag_write_bytes("\b \b", 3, 100); continue; }
-    if (c < 32 || n + 1 >= cap) continue;
-    out[n++] = (char)c;
-    usb_serial_jtag_write_bytes(secret ? "*" : (const char *)&c, 1, 100);
-  }
-}
-static void console_task(void *arg) {
-  usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
-  if (usb_serial_jtag_driver_install(&cfg) != ESP_OK) { vTaskDelete(NULL); return; }
-  usb_serial_jtag_vfs_use_driver(); /* the log and this console share the port */
-  char line[80];
-  for (;;) {
-    read_line(line, sizeof line, false);
-    if (strcmp(line, "wifi")) { if (line[0]) printf("Type wifi and Enter to set the Wi-Fi it joins.\n"); continue; }
-    char ssid[33], pass[65];
-    printf("Wi-Fi name: "); fflush(stdout);
-    read_line(ssid, sizeof ssid, false);
-    if (!ssid[0]) continue;
-    printf("Password (Enter for none): "); fflush(stdout);
-    size_t n = 0; pass[0] = 0;
-    for (;;) { /* like read_line, but Enter on an empty password is allowed */
-      uint8_t c;
-      if (usb_serial_jtag_read_bytes(&c, 1, portMAX_DELAY) != 1) continue;
-      if (c == '\r' || c == '\n') { pass[n] = 0; usb_serial_jtag_write_bytes("\r\n", 2, 100); break; }
-      if ((c == 8 || c == 127) && n) { n--; usb_serial_jtag_write_bytes("\b \b", 3, 100); continue; }
-      if (c >= 32 && n + 1 < sizeof pass) { pass[n++] = (char)c; usb_serial_jtag_write_bytes("*", 1, 100); }
-    }
-    nvs_handle_t h;
-    if (nvs_open("wifi", NVS_READWRITE, &h) == ESP_OK) { nvs_set_str(h, "ssid", ssid); nvs_set_str(h, "pass", pass); nvs_commit(h); nvs_close(h); }
-    printf("Saved \"%s\". Restarting onto it…\n", ssid);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    esp_restart();
   }
 }
 
 void app_main(void) {
   xTaskCreate(status_task, "status", 3072, NULL, 1, NULL);
-  xTaskCreate(console_task, "console", 4096, NULL, 2, NULL);
   ESP_LOGI(TAG, "FreeRTC relay starting");
   esp_err_t err = nvs_flash_init();
   if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) { nvs_flash_erase(); err = nvs_flash_init(); }
@@ -301,7 +274,15 @@ void app_main(void) {
   ESP_ERROR_CHECK(esp_event_loop_create_default());
 
   char ssid[33], pass[65];
-  if (!saved_wifi(ssid, sizeof ssid, pass, sizeof pass)) { run_setup(false); return; }
+  /* No Wi-Fi saved, or the saved one failed last time (setup asked for): the setup network. */
+  bool want_setup = false;
+  nvs_handle_t h;
+  if (nvs_open("wifi", NVS_READWRITE, &h) == ESP_OK) {
+    uint8_t flag = 0;
+    if (nvs_get_u8(h, "setup", &flag) == ESP_OK && flag) { want_setup = true; nvs_erase_key(h, "setup"); nvs_commit(h); }
+    nvs_close(h);
+  }
+  if (want_setup || !saved_wifi(ssid, sizeof ssid, pass, sizeof pass)) { run_setup(false); return; }
 
   mode = 2;
   wifi_events = xEventGroupCreate();
@@ -311,6 +292,7 @@ void app_main(void) {
   ESP_ERROR_CHECK(esp_wifi_init(&init));
   esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL, NULL);
   esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event, NULL, NULL);
+  ESP_LOGI(TAG, "Joining \"%s\"", ssid);
   wifi_config_t sc = { 0 };
   /* Wi-Fi names and passwords fill these fields whole (32 and 64 bytes) with no terminator needed. */
   memcpy(sc.sta.ssid, ssid, strnlen(ssid, sizeof sc.sta.ssid));
@@ -319,13 +301,11 @@ void app_main(void) {
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sc));
   ESP_ERROR_CHECK(esp_wifi_start());
   esp_wifi_set_ps(WIFI_PS_NONE);   /* a relay answers at once: no Wi-Fi power save */
-  /* Not on the saved network within a minute (a new password, another place): its setup network opens
-   * too, while it keeps trying; once on the network it restarts as the relay. */
-  if (!(xEventGroupWaitBits(wifi_events, GOT_IP, false, true, pdMS_TO_TICKS(60000)) & GOT_IP)) {
-    ESP_LOGW(TAG, "Can't join \"%s\": opening the setup network too", ssid);
-    run_setup(true);
-    xEventGroupWaitBits(wifi_events, GOT_IP, false, true, portMAX_DELAY);
-    vTaskDelay(pdMS_TO_TICKS(2000));
+  /* Not on the saved network within two minutes (a new password, another place): it restarts into the
+   * setup network once (the saved network is kept; the next restart tries it again). */
+  if (!(xEventGroupWaitBits(wifi_events, GOT_IP, false, true, pdMS_TO_TICKS(120000)) & GOT_IP)) {
+    ESP_LOGW(TAG, "Can't join \"%s\": restarting into the setup network", ssid);
+    if (nvs_open("wifi", NVS_READWRITE, &h) == ESP_OK) { nvs_set_u8(h, "setup", 1); nvs_commit(h); nvs_close(h); }
     esp_restart();
   }
 
