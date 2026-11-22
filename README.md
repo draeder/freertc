@@ -191,6 +191,27 @@ Worker without running `freertc name`. A Worker with `NAMES_OPEN=1` names any
 relay (a public naming service). The Worker side is `src/direct/names.js`; the
 relay side `src/node/relay-name.js`; the command `scripts/name-setup.mjs`.
 
+### Your relay in the PeerPigeon console
+
+[console.peerpigeon.io](https://console.peerpigeon.io) lists the relays you run.
+Sign in there, copy your account key from Relays → Add, and on the relay's
+machine run:
+
+```bash
+npx freertc claim <account key>
+```
+
+For a FreeRTC Worker, name it instead: `npx freertc claim <account key> --worker <name>`
+(it sets the Worker's `RELAY_OWNER` secret with wrangler).
+`npx freertc claim --remove` undoes it.
+
+The relay then answers `GET /api/v1/owner?nonce=<16-64 characters>` with its
+owner, signed by the relay's own key for that nonce, so the console can tell the
+relay names you now. A Node relay also lets its owner read `/api/v1/stats` from
+anywhere, by a request the owner signs (`?at=<ms>&sig=<signature>`); the account
+numbers are left out. The relay keeps nothing about the owner but the key, in
+`owner.json` in its data folder. The code is in `src/relay-owner.js`.
+
 ## Kademlia relay overlay
 
 FreeRTC uses Kademlia between federated relays—not between browser peers. Relay IDs, scope keys, and exact-peer keys are deterministic 256-bit SHA-256 values produced by UnSEA. Relay and provider records are signed with stable UnSEA P-256 identities before they are accepted or replicated.

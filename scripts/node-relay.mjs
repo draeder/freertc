@@ -83,6 +83,8 @@ import { createRelayIdentity, createSignedNodeRecord, decodeRelayIdentitySecret,
 import { heartbeatKademlia, isPublicRelay, listKnownRelays, relayReachOf } from '../src/relay-overlay.js';
 import { RelayTunnel } from '../src/tunnel/home.js';
 import { loadNameSettings } from '../src/node/relay-name.js';
+import { readOwnerFile } from '../src/node/owner-file.js';
+import { ownerAsked } from '../src/relay-owner.js';
 
 // The relay runs as a child of this process, which restarts it when the
 // machine moves to another network (exit code NETWORK_CHANGED_EXIT): a new
@@ -251,6 +253,10 @@ const env = {
   KADEMLIA_BOOTSTRAP_URLS: federating ? bootstrap.join(',') : '',
   // Without an identity the worker code runs no overlay at all: that is what off means.
   ...(federating ? { RELAY_IDENTITY_SECRET: await relayIdentitySecret() } : {}),
+  // Who runs this relay (src/relay-owner.js): the key `freertc claim` wrote, read on each ask so a claim
+  // needs no restart. The relay answers for it with its identity even when federation is off.
+  OWNER_IDENTITY_SECRET: await relayIdentitySecret(),
+  RELAY_OWNER: () => process.env.FREERTC_OWNER || readOwnerFile(DATA_DIR),
   ASSETS,
 };
 // Any Node relay can be a tunnel home for relays behind NAT, as a worker can.
@@ -400,6 +406,14 @@ const handler = async (req, res) => {
       return;
     }
     if ((pathname === '/stats' || pathname === '/api/v1/stats') && req.method === 'GET' && STATS_MODE !== 'off') {
+      // The relay's owner, signed in to console.peerpigeon.io, reads the numbers from anywhere (src/relay-owner.js).
+      const query = new URL(req.url, 'http://relay').searchParams;
+      const byOwner = pathname === '/api/v1/stats' && query.has('sig') && await ownerAsked(env, query.get('at'), query.get('sig'));
+      if (byOwner) {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify(statsFor(stats.snapshot(), null)));
+        return;
+      }
       if (!statsAllowed({ mode: STATS_MODE, address: req.socket?.remoteAddress, encrypted: req.socket?.encrypted, host: req.headers.host, name: relayName?.name })) {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('Not found');

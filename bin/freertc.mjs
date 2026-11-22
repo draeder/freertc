@@ -24,6 +24,8 @@ Usage:
   freertc dev                      (a relay on this machine: ws://127.0.0.1:8788/ws)
   freertc dev:cf [-- <dev-args>]
   freertc name [--domain example.com] [--worker <name>]
+  freertc claim <account key> [--worker <name>]   (the relay is yours, in console.peerpigeon.io)
+  freertc claim --remove [--worker <name>]
 
 Examples:
   npx freertc
@@ -107,6 +109,10 @@ if (subcommand === 'deploy') {
 
 if (subcommand === 'name') {
   runInProject(process.execPath, [path.join(PACKAGE_ROOT, 'scripts', 'name-setup.mjs'), ...rest]);
+}
+
+if (subcommand === 'claim') {
+  runInProject(process.execPath, [path.join(PACKAGE_ROOT, 'scripts', 'claim.mjs'), ...rest]);
 }
 
 if (subcommand === 'dev') {

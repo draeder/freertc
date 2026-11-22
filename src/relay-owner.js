@@ -1,0 +1,88 @@
+// Who runs this relay, for the PeerPigeon console (console.peerpigeon.io).
+//
+// An owner is the signing key of a PigeonIdP account. Whoever controls the
+// relay names it: `npx freertc claim <key>` writes it to the relay's data
+// folder (<data dir>/owner.json), and a Worker takes it from its RELAY_OWNER
+// secret. Anyone can then ask the relay who owns it:
+//
+//   GET /api/v1/owner?nonce=<16-64 characters>
+//   -> { ok, node_id, relay_pub, owner, nonce, signature }
+//
+// The relay signs [ 'freertc-owner', 1, node_id, owner, nonce ] with its own
+// signing key, so the answer proves the relay with that node id names that
+// owner now: a stale answer cannot be replayed (the asker picks the nonce), and
+// nobody but the relay's operator can change the owner. The relay keeps no
+// account, password or anything else about the owner: just the key it was told.
+import { signMessage, verifyMessage } from 'unsea';
+import { canonicalJson, relayNodeId } from './kademlia.js';
+import { createRelayIdentity, decodeRelayIdentitySecret } from './relay-identity.js';
+
+const NONCE_RE = /^[\w-]{16,64}$/;
+// An unsea public key: base64url halves joined by a dot (P-256 x.y).
+const OWNER_RE = /^[\w-]{20,100}\.[\w-]{20,100}$/;
+
+export const isOwnerKey = (value) => typeof value === 'string' && OWNER_RE.test(value);
+export const ownerText = (nodeId, owner, nonce) => canonicalJson(['freertc-owner', 1, nodeId, owner, nonce]);
+
+const identities = new WeakMap();
+
+async function identityOf(env) {
+  const secret = env?.RELAY_IDENTITY_SECRET || env?.OWNER_IDENTITY_SECRET;
+  const keys = secret
+    ? decodeRelayIdentitySecret(secret)
+    : env?.RELAY_SIGNING_PUBLIC_KEY && env?.RELAY_SIGNING_PRIVATE_KEY
+      ? { publicKey: env.RELAY_SIGNING_PUBLIC_KEY, privateKey: env.RELAY_SIGNING_PRIVATE_KEY }
+      : null;
+  if (!keys) return null;
+  if (!identities.has(env)) identities.set(env, createRelayIdentity(keys.publicKey, keys.privateKey));
+  return identities.get(env);
+}
+
+/** The owner this relay was told, or null. RELAY_OWNER is a key, or (a Node relay) a function reading one. */
+export async function configuredOwner(env) {
+  const value = typeof env?.RELAY_OWNER === 'function' ? await env.RELAY_OWNER() : env?.RELAY_OWNER;
+  const owner = typeof value === 'string' ? value.trim() : '';
+  return isOwnerKey(owner) ? owner : null;
+}
+
+/** The answer to GET /api/v1/owner. */
+export async function ownerProof(env, nonce) {
+  if (typeof nonce !== 'string' || !NONCE_RE.test(nonce)) return { status: 400, body: { ok: false, error: 'nonce: 16 to 64 letters, digits, - or _' } };
+  let identity = null;
+  try { identity = await identityOf(env); } catch { identity = null; }
+  if (!identity) return { status: 200, body: { ok: false, error: 'no identity' } };
+  const owner = await configuredOwner(env);
+  if (!owner) return { status: 200, body: { ok: true, node_id: identity.nodeId, owner: null } };
+  const signature = await signMessage(ownerText(identity.nodeId, owner, nonce), identity.privateKey);
+  return { status: 200, body: { ok: true, node_id: identity.nodeId, relay_pub: identity.publicKey, owner, nonce, signature } };
+}
+
+/**
+ * Whether an answer proves that the relay with `nodeId` names `owner`, for the nonce the asker sent.
+ * Used by the console; here so both sides share one definition.
+ */
+export async function verifyOwnerProof(proof, { nonce, nodeId, owner }) {
+  if (!proof?.ok || proof.nonce !== nonce || proof.owner !== owner || !isOwnerKey(owner)) return false;
+  if (typeof proof.relay_pub !== 'string' || typeof proof.signature !== 'string') return false;
+  if (await relayNodeId(proof.relay_pub) !== proof.node_id) return false;
+  if (nodeId && proof.node_id !== nodeId) return false;
+  try { return await verifyMessage(ownerText(proof.node_id, owner, nonce), proof.signature, proof.relay_pub); } catch { return false; }
+}
+
+/**
+ * What an owner signs to read the relay's numbers from elsewhere (GET /api/v1/stats?at=<ms>&sig=<sig>, a
+ * Node relay): good for this relay only, for five minutes.
+ */
+export const ownerStatsText = (nodeId, at) => canonicalJson(['freertc-owner-stats', 1, nodeId, at]);
+const OWNER_ASK_SKEW_MS = 5 * 60_000;
+
+/** Whether `sig` is this relay's owner asking, at `at` (ms), recently. */
+export async function ownerAsked(env, at, sig, now = Date.now()) {
+  const when = Number(at);
+  if (!Number.isFinite(when) || Math.abs(now - when) > OWNER_ASK_SKEW_MS || typeof sig !== 'string' || sig.length > 4096) return false;
+  const owner = await configuredOwner(env);
+  let identity = null;
+  try { identity = await identityOf(env); } catch { identity = null; }
+  if (!owner || !identity) return false;
+  try { return await verifyMessage(ownerStatsText(identity.nodeId, when), sig, owner); } catch { return false; }
+}

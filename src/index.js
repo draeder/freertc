@@ -15,6 +15,7 @@ import {
   relayNodeIdOf,
 } from "./relay-overlay.js";
 import { relayPeerIdFor } from "./relay-id.js";
+import { ownerProof } from "./relay-owner.js";
 import { tunnelRoute } from "./tunnel/frames.js";
 import { DIRECTORY_PATH, directoryEnabled, handleDirectoryRequest } from "./direct/directory.js";
 import { NAMES_PATH, handleNameRequest } from "./direct/names.js";
@@ -667,6 +668,13 @@ async function handleFetch(request, env, ctx) {
         kademlia_enabled: isKademliaEnabled(env),
         bootstrap_urls: await listBootstrapUrls(env, selfRelayUrl).catch(() => configuredBootstrapUrls(env).filter((seed) => seed !== selfRelayUrl)),
       }, 200);
+    }
+
+    // Who runs this relay (src/relay-owner.js), signed by the relay for the asker's nonce.
+    if (url.pathname === "/api/v1/owner") {
+      if (request.method !== "GET") return jsonResponse({ ok: false, error: "Method not allowed" }, 405);
+      const { status, body } = await ownerProof(env, url.searchParams.get("nonce"));
+      return jsonResponse(body, status);
     }
 
     if (url.pathname.startsWith("/api/v1/kad/")) {
