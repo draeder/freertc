@@ -227,12 +227,25 @@ setInterval(saveCredit, 60_000).unref();
 process.on('exit', saveCredit);
 // Punched connections need WebRTC in this process (werift, an optional dependency).
 const PUNCH = !isOff(process.env.FREERTC_PUNCH) && await punchOfferAvailable();
+// The name it goes by until it has its own (src/node/relay-name.js) or RELAY_NAME: once it federates,
+// freertc-<the first 16 hex of its node id>, the label its wss:// name will have; pages show it, so it
+// is never its loopback address. A relay that does not federate keeps host and port (seen locally only).
+async function defaultRelayName() {
+  if (federating) {
+    try {
+      const { publicKey, privateKey } = decodeRelayIdentitySecret(await relayIdentitySecret());
+      const { nodeId } = await createRelayIdentity(publicKey, privateKey);
+      if (/^[0-9a-f]{16}/i.test(nodeId)) return `freertc-${nodeId.slice(0, 16).toLowerCase()}`;
+    } catch { /* below */ }
+  }
+  return `freertc-node-${SELF_HOST}-${PORT}`;
+}
 const env = {
   RELAY_KIND: process.env.RELAY_KIND === 'cloud' ? 'cloud' : 'local',
   ...(PUNCH ? { PUNCH_OFFER: 'on' } : {}),
   DB: meter.wrapD1(await openSqliteD1({ filename: path.resolve(process.env.DB_PATH || path.join(DATA_DIR, 'relay.sqlite')), migrationsDir: path.join(ROOT, 'migrations') })),
   RELAY_URL,
-  RELAY_NAME: process.env.RELAY_NAME || `freertc-node-${SELF_HOST}-${PORT}`,
+  RELAY_NAME: process.env.RELAY_NAME || await defaultRelayName(),
   ...(process.env.FREERTC_VERBOSE ? { FREERTC_VERBOSE: process.env.FREERTC_VERBOSE } : {}),
   FREERTC_PUBLIC: PUBLIC ? 'true' : 'false',
   KADEMLIA_BOOTSTRAP_URLS: federating ? bootstrap.join(',') : '',
