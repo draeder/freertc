@@ -59,6 +59,8 @@ const FEDERATED_PEER_QUERY_TIMEOUT_MS = 2_500;
 // the local peers are sent alone if the federated lookup is still running.
 const DISCOVER_REPLY_DEADLINE_MS = 4_000;
 const MAX_TTL_MS = 120_000;
+// The shortest lease an announcement is given (see upsertAnnouncement).
+const MIN_ANNOUNCE_TTL_MS = 60_000;
 const MAX_MESSAGE_SIZE = 64 * 1024;
 const MAX_BATCH = 50;
 const RELAY_EXPIRY_MS = 5 * 60_000;       // relay entry expires after 5 min without heartbeat
@@ -1465,7 +1467,9 @@ export function announcedRole(message) {
 export async function upsertAnnouncement(db, message) {
   await ensureRoleColumn(db);
   const now = Date.now();
-  const ttl = Math.min(message.ttl_ms || DEFAULT_TTL_MS, MAX_TTL_MS);
+  // Never a lease shorter than a client's heartbeat (40 s): clients before 0.5.2 asked for 30 s when they
+  // registered, and were gone from the list for 10 s before their first heartbeat renewed it.
+  const ttl = Math.min(Math.max(message.ttl_ms || DEFAULT_TTL_MS, MIN_ANNOUNCE_TTL_MS), MAX_TTL_MS);
   const expiresAt = now + ttl;
 
   await db.prepare(`

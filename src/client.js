@@ -2909,7 +2909,10 @@ export function createSignalingClient(options = {}) {
       lastSignalPingSentAt = 0
 
       send(pspEnvelope('announce', {
-        ttl_ms: 30000,
+        // The same lease the heartbeat asks for. This asked for 30 s while the first heartbeat comes 40 s
+        // later: every peer dropped out of the relay's list for those 10 s, each time it registered, and a
+        // newcomer asking in that gap was not told of it (a storage server nobody could find, say).
+        ttl_ms: ADVERTISE_TTL_MS,
         body: {
           instance_id: networkId,
           capabilities,
@@ -3176,7 +3179,7 @@ export function createSignalingClient(options = {}) {
     advertise(nextCapabilities) {
       if (!registered) return
       send(pspEnvelope('announce', {
-        ttl_ms: 30000,
+        ttl_ms: ADVERTISE_TTL_MS,
         body: { instance_id: networkId, capabilities: nextCapabilities, hints: { wants_peers: true } },
       }))
     },

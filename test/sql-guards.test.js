@@ -43,17 +43,17 @@ test('a live peer is renewed at half its lease, not on every heartbeat', async (
   await withClock(T0, async (clock) => {
     await announce();
     assert.equal(d1.writes.psp_announcements, 1);
-    assert.equal(lease(), T0 + 30_000);
+    assert.equal(lease(), T0 + 60_000, 'a lease is never shorter than 60 s, whatever was asked (30 s here)');
 
-    clock.advance(12_000); // the client's heartbeat: 18 s of the lease remain, over half
+    clock.advance(24_000); // 36 s of the lease remain, over half
     await announce();
     assert.equal(d1.writes.psp_announcements, 1, 'a lease with most of its life left is not rewritten');
-    assert.equal(lease(), T0 + 30_000);
+    assert.equal(lease(), T0 + 60_000);
 
-    clock.advance(12_000); // 6 s remain: renewed before it can lapse
+    clock.advance(24_000); // 12 s remain: renewed before it can lapse
     await announce();
     assert.equal(d1.writes.psp_announcements, 2);
-    assert.equal(lease(), T0 + 24_000 + 30_000);
+    assert.equal(lease(), T0 + 48_000 + 60_000);
 
     clock.advance(1_000);
     await announce('room-b'); // another room is its own announcement, never skipped
@@ -67,9 +67,9 @@ test('a peer that stops heartbeating still lapses on the lease it was given', as
   if (!d1) return t.skip('node:sqlite is not available on this Node');
   await withClock(T0, async (clock) => {
     await upsertAnnouncement(d1, { network: 'net', from: 'peer-a', session_id: 'room-a', ttl_ms: 30_000 });
-    clock.advance(12_000);
+    clock.advance(24_000);
     await upsertAnnouncement(d1, { network: 'net', from: 'peer-a', session_id: 'room-a', ttl_ms: 30_000 });
-    clock.advance(20_000); // past the original 30 s lease; no renewal came
+    clock.advance(40_000); // past the 60 s lease it was given; no renewal came
     const live = rows(d1, 'SELECT peer_id FROM psp_announcements WHERE expires_at_ms > ?1', clock.now());
     assert.deepEqual(live, []);
   });

@@ -46,3 +46,21 @@ test('a database without migration 0003 gets the role column on first use', asyn
   await upsertAnnouncement(d1, { network: 'net', from: 'peer-b', session_id: 'room', ttl_ms: 30_000, body: { capabilities: { role: 'storage' } } });
   assert.equal(rows(d1, 'SELECT role FROM psp_announcements')[0].role, 'storage');
 });
+
+test('a peer is listed without a gap from registering to its first heartbeat', async (t) => {
+  const d1 = await openSqliteD1();
+  if (!d1) return t.skip('node:sqlite is not available on this Node');
+  // A client before 0.5.2 registers asking for 30 s; its first heartbeat (120 s) comes 40 s later.
+  const before = Date.now();
+  await upsertAnnouncement(d1, { network: 'net', from: 'peer-old', session_id: 'room', ttl_ms: 30_000, body: { capabilities: { role: 'storage' } } });
+  const lease = rows(d1, "SELECT expires_at_ms FROM psp_announcements WHERE peer_id = 'peer-old'")[0].expires_at_ms - before;
+  assert.ok(lease >= 60_000, `its lease (${lease} ms) outlasts the 40 s to the first heartbeat`);
+  // And the client itself asks for the heartbeat's lease when it registers.
+  const { readFileSync } = await import('node:fs');
+  const client = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8');
+  const ttl = Number(/const ADVERTISE_TTL_MS = (\d+)/.exec(client)[1]);
+  const beat = ttl / 3;
+  const asked = [...client.matchAll(/pspEnvelope\('announce', \{\s*(?:\/\/[^\n]*\n\s*)*ttl_ms: ([A-Z_0-9a-z]+)/g)].map((m) => m[1]);
+  assert.ok(asked.length >= 3, 'the registration, the advertise and the heartbeat announces were found');
+  for (const a of asked) assert.ok((a === 'ADVERTISE_TTL_MS' ? ttl : Number(a)) > beat, `an announce asks for ${a}, longer than the ${beat} ms between heartbeats`);
+});
