@@ -4,6 +4,15 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>FreeRTC</title>
+    <script>
+      // The theme before the first paint: the one picked here last time, else the system's.
+      (function () {
+        var t = null;
+        try { t = localStorage.getItem('freertc:theme'); } catch (e) {}
+        if (t !== 'light' && t !== 'dark') t = window.matchMedia && matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+        document.documentElement.dataset.theme = t;
+      })();
+    </script>
     <link rel="icon" type="image/svg+xml" href="/pigeonlogo.svg" />
     <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="/icon-180.png" />
@@ -35,6 +44,23 @@
         --muted: var(--bone-3);
         --success: var(--sheen);
         --warn: var(--warm);
+      }
+      /* By day: Cruise, as peer.ooo, PigeonChess and PigeonFeed. */
+      html[data-theme='light'] {
+        color-scheme: light;
+        --night: #e8f6f9;
+        --night-2: #f5fbfc;
+        --line: #bee6ee;
+        --line-strong: #8aa7b3;
+        --bright: #2a3747;
+        --bone: #2a3747;
+        --bone-2: #46586e;
+        --bone-3: #5a7187;
+        --sheen: #237a50;
+        --info: #2f62a3;
+        --warm: #9a6a1f;
+        --bad: #b4423a;
+        --on-bone: #ffffff;
       }
       *, *::before, *::after { box-sizing: border-box; }
       html, body { margin: 0; }
@@ -71,6 +97,10 @@
       .inline-link, .pill-link { color: var(--bone); text-decoration: underline; text-decoration-color: var(--line-strong); text-underline-offset: 3px; }
       .inline-link:hover, .pill-link:hover { text-decoration-color: var(--sheen); }
       .hero-status { display: flex; align-items: center; gap: 10px; min-width: 0; }
+      /* The theme switch, as on every PeerPigeon site: a bare line icon. */
+      button.theme-switch { display: grid; place-items: center; width: 36px; height: 36px; flex: none; padding: 0; border: 0; background: none; color: var(--bone-2); }
+      button.theme-switch:hover:not(:disabled) { color: var(--bright); }
+      .theme-switch svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 
       /* Status and small labels: plain text with a dot, no pills. */
       .status-pill, .pill { display: inline-flex; align-items: center; gap: 8px; padding: 0; border: 0; background: none; color: var(--bone-2); font-size: 0.85rem; text-transform: none; letter-spacing: 0; border-radius: 0; }

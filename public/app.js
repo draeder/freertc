@@ -168,6 +168,13 @@ function normalizeText(value) {
 
 createApp({
   setup() {
+    // Light or dark (index.html picks it before the first paint; the switch in the top bar changes it).
+    const theme = ref(document.documentElement.dataset.theme === 'light' ? 'light' : 'dark');
+    const toggleTheme = () => {
+      theme.value = theme.value === 'dark' ? 'light' : 'dark';
+      document.documentElement.dataset.theme = theme.value;
+      try { localStorage.setItem('freertc:theme', theme.value); } catch (e) {}
+    };
     const host = window.location.host;
     const wsScheme = window.location.protocol === "https:" ? "wss" : "ws";
 
@@ -3168,7 +3175,9 @@ createApp({
       regenerateNetworkAndRoom,
       selectPeer,
       selectPeerFromUi,
-      handleSpecLinkClick
+      handleSpecLinkClick,
+      theme,
+      toggleTheme
     };
   },
   template: `
@@ -3199,6 +3208,10 @@ createApp({
             <strong><a class="pill-link" :href="pspSpecUrl" target="_blank" rel="noopener noreferrer" @click="handleSpecLinkClick">{{ specPillLabel }}</a></strong>
             {{ specWarningCount > 0 ? specWarningCount + ' warning' + (specWarningCount === 1 ? '' : 's') : 'ok' }}
           </div>
+          <button type="button" class="theme-switch" :aria-label="theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'" :title="theme === 'dark' ? 'Light mode' : 'Dark mode'" @click="toggleTheme">
+            <svg v-if="theme === 'dark'" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.5" /><path d="M12 2.5v2.5M12 19v2.5M2.5 12H5M19 12h2.5M5.3 5.3l1.8 1.8M16.9 16.9l1.8 1.8M5.3 18.7l1.8-1.8M16.9 7.1l1.8-1.8" /></svg>
+            <svg v-else viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z" /></svg>
+          </button>
         </div>
       </section>
 

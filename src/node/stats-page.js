@@ -9,6 +9,16 @@ export const STATS_PAGE = `<!doctype html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="theme-color" content="#1b2430" />
+<script>
+  // The theme before the first paint: the one picked here last time, else the system's.
+  (function () {
+    var t = null;
+    try { t = localStorage.getItem('freertc:theme'); } catch (e) {}
+    if (t !== 'light' && t !== 'dark') t = window.matchMedia && matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+    document.documentElement.dataset.theme = t;
+    if (t === 'light') document.querySelector('meta[name="theme-color"]').setAttribute('content', '#e8f6f9');
+  })();
+</script>
 <title>Relay stats</title>
 <link rel="icon" type="image/svg+xml" href="/pigeonlogo.svg" />
 <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
@@ -21,6 +31,19 @@ export const STATS_PAGE = `<!doctype html>
     --sheen: #7fd8a6; --info: #9cc3f5; --warn: #f2c879; --stop: #f29b91;
     color-scheme: dark;
   }
+  /* By day: Cruise, as peer.ooo, PigeonChess and PigeonFeed. */
+  html[data-theme='light'] {
+    --night: #e8f6f9; --night-2: #f5fbfc; --line: #bee6ee; --line-strong: #8aa7b3;
+    --bright: #2a3747; --bone: #2a3747; --bone-2: #46586e; --bone-3: #5a7187;
+    --sheen: #237a50; --info: #2f62a3; --warn: #9a6a1f; --stop: #b4423a;
+    color-scheme: light;
+  }
+  .top-right { display: flex; align-items: center; gap: 12px; }
+  /* The theme switch, as on every PeerPigeon site: a bare line icon. */
+  .theme-switch { display: grid; place-items: center; width: 36px; height: 36px; border: 0; background: none; color: var(--bone-2); cursor: pointer; }
+  .theme-switch:hover { color: var(--bright); }
+  .theme-switch svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  html[data-theme='dark'] .theme-switch .moon, html[data-theme='light'] .theme-switch .sun { display: none; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--night); color: var(--bone); font: 14px/1.45 'Archivo', system-ui, -apple-system, 'Segoe UI', sans-serif; -webkit-font-smoothing: antialiased; }
   main { max-width: 1180px; margin: 0 auto; padding: 28px clamp(16px, 4vw, 40px) 56px; }
@@ -70,7 +93,10 @@ export const STATS_PAGE = `<!doctype html>
       <h1 id="name">Relay<small id="kind"></small></h1>
       <p class="where" id="url"></p>
     </div>
-    <p class="live" id="live"><i></i><span>Connecting…</span></p>
+    <div class="top-right">
+      <p class="live" id="live"><i></i><span>Connecting…</span></p>
+      <button type="button" class="theme-switch" id="theme-switch" aria-label="Switch theme" title="Switch theme"><svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.5" /><path d="M12 2.5v2.5M12 19v2.5M2.5 12H5M19 12h2.5M5.3 5.3l1.8 1.8M16.9 16.9l1.8 1.8M5.3 18.7l1.8-1.8M16.9 7.1l1.8-1.8" /></svg><svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z" /></svg></button>
+    </div>
   </header>
 
   <div class="tiles">
@@ -158,13 +184,20 @@ export const STATS_PAGE = `<!doctype html>
       if (values.length < 2) return '';
       const step = w / (values.length - 1);
       const points = values.map((v, j) => (j * step).toFixed(1) + ',' + (h - pad - (v / max) * (h - pad * 2)).toFixed(1)).join(' ');
-      const area = i === 0 ? '<polygon points="0,' + h + ' ' + points + ' ' + w + ',' + h + '" fill="' + colors[i] + '" fill-opacity="0.08"/>' : '';
-      return area + '<polyline points="' + points + '" fill="none" stroke="' + colors[i] + '" stroke-width="1.5" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>';
+      const area = i === 0 ? '<polygon points="0,' + h + ' ' + points + ' ' + w + ',' + h + '" style="fill:' + colors[i] + '" fill-opacity="0.08"/>' : '';
+      return area + '<polyline points="' + points + '" fill="none" style="stroke:' + colors[i] + '" stroke-width="1.5" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>';
     }).join('');
-    svg.innerHTML = '<line x1="0" x2="' + w + '" y1="' + (h - 0.5) + '" y2="' + (h - 0.5) + '" stroke="#2c394a"/>' + lines;
+    svg.innerHTML = '<line x1="0" x2="' + w + '" y1="' + (h - 0.5) + '" y2="' + (h - 0.5) + '" style="stroke:var(--line)"/>' + lines;
   }
 
-  const SHEEN = '#7fd8a6', BONE = '#9dbfc8';
+  const SHEEN = 'var(--sheen)', BONE = 'var(--bone-2)';
+
+  document.getElementById('theme-switch').addEventListener('click', () => {
+    const t = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = t;
+    document.querySelector('meta[name="theme-color"]').setAttribute('content', t === 'dark' ? '#1b2430' : '#e8f6f9');
+    try { localStorage.setItem('freertc:theme', t); } catch (e) {}
+  });
   let lastOk = 0;
 
   async function refresh() {
