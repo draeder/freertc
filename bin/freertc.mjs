@@ -21,7 +21,7 @@ Usage:
   freertc install
   freertc relay:keygen
   freertc deploy [-- <deploy-args>]
-  freertc dev [-- <dev-args>]
+  freertc dev                      (a relay on this machine: ws://127.0.0.1:8788/ws)
   freertc dev:cf [-- <dev-args>]
   freertc name [--domain example.com] [--worker <name>]
 
@@ -110,7 +110,9 @@ if (subcommand === 'name') {
 }
 
 if (subcommand === 'dev') {
-  runInProject(process.execPath, [path.join(PACKAGE_ROOT, 'scripts', 'node-relay.mjs'), ...rest], { bootstrap: true });
+  // A relay on this machine (Node). It runs from the package's own files, so nothing is copied into the
+  // folder it is started from (the Worker's files are for deploy and dev:cf).
+  runInProject(process.execPath, [path.join(PACKAGE_ROOT, 'scripts', 'node-relay.mjs'), ...rest]);
 }
 
 if (subcommand === 'dev:cf' || subcommand === 'dev-cf') {

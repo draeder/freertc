@@ -43,5 +43,11 @@ for (const section of ['dependencies', 'optionalDependencies', 'peerDependencies
 }
 
 writeFileSync('package.json', `${JSON.stringify(pkg, null, 2)}\n`);
+// The relay reports its version (WORKER_VERSION in src/index.js, as /health shows it): the same as the package's.
+try {
+  const source = readFileSync('src/index.js', 'utf8');
+  const next = source.replace(/^const WORKER_VERSION = "[^"]*";/m, `const WORKER_VERSION = "${version}";`);
+  if (next !== source) writeFileSync('src/index.js', next);
+} catch { /* no relay source here */ }
 console.log(`${pkg.name}@${version}${bumped ? ' (next patch: the version in package.json is already on npm)' : ''}`);
 if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\nbumped=${bumped}\n`);

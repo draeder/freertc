@@ -53,11 +53,13 @@ jobs:
       - name: Record the version here
         if: steps.v.outputs.bumped == 'true'
         run: |
-          git checkout -- package.json
+          git checkout -- package.json src/index.js
           npm pkg set version=${{ steps.v.outputs.version }}
+          # The relay's own version line (what /health reports) moves with it.
+          sed -i 's/^const WORKER_VERSION = "[^"]*";/const WORKER_VERSION = "${{ steps.v.outputs.version }}";/' src/index.js
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "Version ${{ steps.v.outputs.version }} (published to npm) [skip ci]" -- package.json
+          git commit -m "Version ${{ steps.v.outputs.version }} (published to npm) [skip ci]" -- package.json src/index.js
           # What the build changed (PeerPigeon's rewrites its lockfiles) is not kept.
           git reset --hard HEAD
           git clean -fdq
