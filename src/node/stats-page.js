@@ -105,7 +105,7 @@ export const STATS_PAGE = `<!doctype html>
     <div class="tile"><h2>Messages</h2><p class="big" id="msgs">–</p><p class="sub" id="msgs-sub"></p></div>
     <div class="tile"><h2>Bandwidth</h2><p class="big" id="bw">–</p><p class="sub" id="bw-sub"></p></div>
     <div class="tile"><h2>Pigeon Seeds</h2><p class="big" id="credit">–</p><p class="sub" id="credit-sub"></p></div>
-    <div class="tile" id="acc-tile"><h2>Accounts kept</h2><p class="big" id="acc">–</p><p class="sub" id="acc-sub"></p></div>
+    <div class="tile" id="acc-tile" hidden><h2>Accounts kept</h2><p class="big" id="acc">–</p><p class="sub" id="acc-sub"></p></div>
   </div>
 
   <div class="charts">
@@ -119,7 +119,7 @@ export const STATS_PAGE = `<!doctype html>
     <div class="chart"><div class="chart-head"><h3>Memory (this relay)</h3><span id="c-mem"></span></div><svg id="g-mem" preserveAspectRatio="none"></svg></div>
   </div>
 
-  <section id="acc-section">
+  <section id="acc-section" hidden>
     <h2>Accounts</h2>
     <div class="cols">
       <dl id="acc-browsers"></dl>
@@ -127,7 +127,7 @@ export const STATS_PAGE = `<!doctype html>
     </div>
   </section>
 
-  <section id="events-section">
+  <section id="events-section" hidden>
     <h2>Account events between relays</h2>
     <ul class="relays" id="events"></ul>
   </section>
