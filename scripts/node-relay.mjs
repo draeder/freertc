@@ -416,13 +416,20 @@ const handler = async (req, res) => {
         return;
       }
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*' });
-      const send = () => res.write(`data: ${JSON.stringify(statsFor(stats.snapshot(), null))}\n\n`);
-      send();
+      // Without the history and events (the one-off ask has them): the numbers, small, and how many peers
+      // the relay has now (what /health says), every 2 seconds.
+      let peers = null;
+      const send = async () => {
+        try { peers = (await (await worker.fetch(new Request('http://relay/health'), env, ctx)).json())?.peers ?? peers; } catch { /* the last count */ }
+        const { history, events, ...now } = statsFor(stats.snapshot(), null);
+        res.write(`data: ${JSON.stringify({ ...now, peers })}\n\n`);
+      };
+      await send();
       let ticks = 0;
       const timer = setInterval(async () => {
         // A pass taken back (or run out) ends its stream within a minute.
         if (++ticks % 30 === 0 && !(await passHolds(env, pass).catch(() => false))) { clearInterval(timer); res.end(); return; }
-        send();
+        await send();
       }, 2000);
       timer.unref?.();
       req.on('close', () => clearInterval(timer));
