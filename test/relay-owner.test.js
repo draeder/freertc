@@ -91,3 +91,52 @@ test('the owner, and nobody else, may read the relay\'s numbers from elsewhere',
   assert.equal(await ownerAsked(env, old, await signMessage(ownerStatsText(nodeId, old), owner.priv)), false, 'too old');
   assert.equal(await ownerAsked(await relayEnv(), at, await signMessage(ownerStatsText(nodeId, at), owner.priv)), false, 'no owner');
 });
+
+test('someone on the owner\'s team reads the numbers with the owner\'s pass, until it runs out', async () => {
+  const { signMessage } = await import('unsea');
+  const { ownerAsked, ownerStatsText, grantText } = await import('../src/relay-owner.js');
+  const owner = await generateRandomPair();
+  const member = await generateRandomPair();
+  const env = await relayEnv({ RELAY_OWNER: owner.pub });
+  const nodeId = await relayNodeIdOf(env);
+  const at = Date.now();
+  const until = at + 7 * 86400_000;
+  const gsig = await signMessage(grantText(owner.pub, member.pub, until), owner.priv);
+  const ask = await signMessage(ownerStatsText(nodeId, at), member.priv);
+  assert.equal(await ownerAsked(env, at, ask, { by: member.pub, until, gsig }), true);
+  assert.equal(await ownerAsked(env, at, ask), false, 'not without the pass');
+  const stranger = await generateRandomPair();
+  assert.equal(await ownerAsked(env, at, await signMessage(ownerStatsText(nodeId, at), stranger.priv), { by: stranger.pub, until, gsig }), false, 'a pass for someone else');
+  const selfMade = await signMessage(grantText(owner.pub, member.pub, until), member.priv);
+  assert.equal(await ownerAsked(env, at, ask, { by: member.pub, until, gsig: selfMade }), false, 'a pass not from the owner');
+  assert.equal(await ownerAsked(env, at, ask, { by: member.pub, until: until + 1, gsig }), false, 'a changed expiry');
+  const past = at - 1000;
+  const old = await signMessage(grantText(owner.pub, member.pub, past), owner.priv);
+  assert.equal(await ownerAsked(env, at, ask, { by: member.pub, until: past, gsig: old }), false, 'run out');
+});
+
+test('a pass that never runs out holds until the owner takes it back, and again once restored', async () => {
+  const { signMessage } = await import('unsea');
+  const { ownerAsked, ownerStatsText, grantText, revokeText } = await import('../src/relay-owner.js');
+  const owner = await generateRandomPair();
+  const member = await generateRandomPair();
+  const { openSqliteD1 } = await import('./harness/sqlite-d1.js');
+  const env = await relayEnv({ RELAY_OWNER: owner.pub, DB: await openSqliteD1() });
+  const nodeId = await relayNodeIdOf(env);
+  const pass = { by: member.pub, until: 0, gsig: await signMessage(grantText(owner.pub, member.pub, 0), owner.priv) };
+  const ask = async () => { const at = Date.now(); return ownerAsked(env, at, await signMessage(ownerStatsText(nodeId, at), member.priv), pass); };
+  assert.equal(await ask(), true, 'no end date');
+
+  const post = async (signer, restore = false) => {
+    const at = Date.now();
+    const sig = await signMessage(revokeText(nodeId, member.pub, at, restore), signer.priv);
+    const res = await worker.fetch(new Request('https://owned.example/api/v1/owner/revoke', { method: 'POST', body: JSON.stringify({ member: member.pub, at, sig, restore }) }), env, { waitUntil() {} });
+    return { status: res.status, body: await res.json() };
+  };
+  assert.equal((await post(member)).status, 403, 'only the owner takes a pass back');
+  assert.equal(await ask(), true);
+  assert.deepEqual((await post(owner)).body.revoked, true);
+  assert.equal(await ask(), false, 'taken back');
+  assert.equal((await post(owner, true)).body.revoked, false);
+  assert.equal(await ask(), true, 'let back in');
+});

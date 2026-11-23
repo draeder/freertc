@@ -15,7 +15,7 @@ import {
   relayNodeIdOf,
 } from "./relay-overlay.js";
 import { relayPeerIdFor } from "./relay-id.js";
-import { ownerProof } from "./relay-owner.js";
+import { ownerProof, ownerRevoke } from "./relay-owner.js";
 import { tunnelRoute } from "./tunnel/frames.js";
 import { DIRECTORY_PATH, directoryEnabled, handleDirectoryRequest } from "./direct/directory.js";
 import { NAMES_PATH, handleNameRequest } from "./direct/names.js";
@@ -675,6 +675,16 @@ async function handleFetch(request, env, ctx) {
       if (request.method !== "GET") return jsonResponse({ ok: false, error: "Method not allowed" }, 405);
       const { status, body } = await ownerProof(env, url.searchParams.get("nonce"));
       return jsonResponse(body, status);
+    }
+
+    if (url.pathname === "/api/v1/owner/revoke") {
+      if (request.method !== "POST") return jsonResponse({ ok: false, error: "Method not allowed" }, 405);
+      const text = await request.text().catch(() => "");
+      if (text.length > 16 * 1024) return jsonResponse({ ok: false, error: "too large" }, 413);
+      let body = null;
+      try { body = JSON.parse(text); } catch { /* answered below */ }
+      const { status, body: answer } = await ownerRevoke(env, body);
+      return jsonResponse(answer, status);
     }
 
     if (url.pathname.startsWith("/api/v1/kad/")) {

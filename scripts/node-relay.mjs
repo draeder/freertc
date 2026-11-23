@@ -408,7 +408,8 @@ const handler = async (req, res) => {
     if ((pathname === '/stats' || pathname === '/api/v1/stats') && req.method === 'GET' && STATS_MODE !== 'off') {
       // The relay's owner, signed in to console.peerpigeon.io, reads the numbers from anywhere (src/relay-owner.js).
       const query = new URL(req.url, 'http://relay').searchParams;
-      const byOwner = pathname === '/api/v1/stats' && query.has('sig') && await ownerAsked(env, query.get('at'), query.get('sig'));
+      const byOwner = pathname === '/api/v1/stats' && query.has('sig') && await ownerAsked(env, query.get('at'), query.get('sig'),
+        query.has('by') ? { by: query.get('by'), until: query.get('until'), gsig: query.get('gsig') } : null);
       if (byOwner) {
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' });
         res.end(JSON.stringify(statsFor(stats.snapshot(), null)));
