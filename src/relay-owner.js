@@ -132,6 +132,15 @@ export async function ownerRevoke(env, body, now = Date.now()) {
  * Whether `sig` is this relay's owner asking at `at` (ms), recently; or, with `pass`
  * ({ by, until, gsig }), someone the owner's signed pass names, signing the ask themselves, and not taken back.
  */
+/** Whether a pass a stream was opened with still holds: the owner hasn't taken it back, nor has it run out. */
+export async function passHolds(env, pass, now = Date.now()) {
+  if (!pass || !pass.by) return true;
+  const owner = await configuredOwner(env);
+  const until = Number(pass.until);
+  if (!owner || (until !== 0 && until < now)) return false;
+  return !(await isRevoked(env, owner, pass.by));
+}
+
 export async function ownerAsked(env, at, sig, pass = null, now = Date.now()) {
   const when = Number(at);
   if (!Number.isFinite(when) || Math.abs(now - when) > OWNER_ASK_SKEW_MS || typeof sig !== 'string' || sig.length > 4096) return false;

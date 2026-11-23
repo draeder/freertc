@@ -84,7 +84,7 @@ import { heartbeatKademlia, isPublicRelay, listKnownRelays, relayReachOf } from 
 import { RelayTunnel } from '../src/tunnel/home.js';
 import { loadNameSettings } from '../src/node/relay-name.js';
 import { readOwnerFile } from '../src/node/owner-file.js';
-import { ownerAsked } from '../src/relay-owner.js';
+import { ownerAsked, passHolds } from '../src/relay-owner.js';
 
 // The relay runs as a child of this process, which restarts it when the
 // machine moves to another network (exit code NETWORK_CHANGED_EXIT): a new
@@ -403,6 +403,29 @@ const handler = async (req, res) => {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
       await writeResponse(res, await handlePunchOffer(toRequest(req, chunks.length ? Buffer.concat(chunks) : undefined)));
+      return;
+    }
+    // The same numbers as they change, for the owner (or a pass holder): one signed ask opens a stream
+    // (Server-Sent Events) that sends them every 2 seconds, so the console never has to ask again.
+    if (pathname === '/api/v1/stats/stream' && req.method === 'GET' && STATS_MODE !== 'off') {
+      const query = new URL(req.url, 'http://relay').searchParams;
+      const pass = query.has('by') ? { by: query.get('by'), until: query.get('until'), gsig: query.get('gsig') } : null;
+      if (!(await ownerAsked(env, query.get('at'), query.get('sig'), pass))) {
+        res.writeHead(403, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
+        res.end('Not the owner');
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*' });
+      const send = () => res.write(`data: ${JSON.stringify(statsFor(stats.snapshot(), null))}\n\n`);
+      send();
+      let ticks = 0;
+      const timer = setInterval(async () => {
+        // A pass taken back (or run out) ends its stream within a minute.
+        if (++ticks % 30 === 0 && !(await passHolds(env, pass).catch(() => false))) { clearInterval(timer); res.end(); return; }
+        send();
+      }, 2000);
+      timer.unref?.();
+      req.on('close', () => clearInterval(timer));
       return;
     }
     if ((pathname === '/stats' || pathname === '/api/v1/stats') && req.method === 'GET' && STATS_MODE !== 'off') {
