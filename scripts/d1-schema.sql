@@ -78,6 +78,3 @@ CREATE INDEX IF NOT EXISTS idx_kad_records_expires
 -- "storage"): relays store it and list it, so peers in a scope can tell
 -- the kinds of peer apart before they dial. Most peers have none.
 ALTER TABLE psp_announcements ADD COLUMN role TEXT;
--- A load test's peer (src/relay-limits.js): 1, and never listed to other
--- relays. Everyone else's is NULL.
-ALTER TABLE psp_announcements ADD COLUMN local_only INTEGER;

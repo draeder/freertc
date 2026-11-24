@@ -38,11 +38,6 @@ async function identityOf(env) {
   return identities.get(env);
 }
 
-/** This relay's node id, as its owner answers give it (with federation off too), or null. */
-export async function ownNodeId(env) {
-  try { return (await identityOf(env))?.nodeId ?? null; } catch { return null; }
-}
-
 /** The owner this relay was told, or null. RELAY_OWNER is a key, or (a Node relay) a function reading one. */
 export async function configuredOwner(env) {
   const value = typeof env?.RELAY_OWNER === 'function' ? await env.RELAY_OWNER() : env?.RELAY_OWNER;

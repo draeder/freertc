@@ -58,11 +58,6 @@
 //   FREERTC_LAN                on (default) | off — find relays on this network by UDP broadcast
 //                              (only when HOST is a LAN address, e.g. 0.0.0.0; never loopback)
 //   FREERTC_LAN_PORT           UDP port for LAN beacons (default 41235)
-//   RELAY_MAX_SOCKETS_PER_ADDRESS     connections at once from one address (default 64; 0 for no limit)
-//   RELAY_MAX_PEERS_PER_ADDRESS_ROOM  peers in one room from one address (default 16; 0 for no limit)
-//   RELAY_MAX_NEW_SOCKETS_PER_MINUTE  new connections a minute from one address (default 60; 0 for none)
-//                              (src/relay-limits.js). A relay with federation off, and this machine
-//                              itself, have no limits; the owner's load-test pass lifts them
 //   PUNCH_RENDEZVOUS_URL       also accept hole-punched connections through this rendezvous
 //   PUNCH_LISTENER_ID          the id to register there
 import { createServer } from 'node:http';
@@ -86,7 +81,7 @@ import { hasLanAddress, startLanBeacon, DEFAULT_LAN_PORT } from '../src/node/lan
 import { nodeDurableNamespace } from '../src/node/durable-object.js';
 import { createRelayIdentity, createSignedNodeRecord, decodeRelayIdentitySecret, isPrivateRelayUrl, tunnelNodeIdOf } from '../src/relay-identity.js';
 import { heartbeatKademlia, isPublicRelay, listKnownRelays, relayReachOf } from '../src/relay-overlay.js';
-import { RelayTunnel, TUNNEL_CLIENT_HEADER } from '../src/tunnel/home.js';
+import { RelayTunnel } from '../src/tunnel/home.js';
 import { loadNameSettings } from '../src/node/relay-name.js';
 import { readOwnerFile } from '../src/node/owner-file.js';
 import { ownerAsked, passHolds } from '../src/relay-owner.js';
@@ -247,11 +242,6 @@ async function defaultRelayName() {
   }
   return `freertc-node-${SELF_HOST}-${PORT}`;
 }
-// The header this relay writes with a socket's address (src/relay-limits.js). A client's own is dropped.
-const CLIENT_ADDRESS_HEADER = 'x-freertc-client';
-// This machine: the operator, never limited.
-const isLoopback = (address) => /^(127\.|::1$|::ffff:127\.)/.test(String(address || ''));
-
 const env = {
   RELAY_KIND: process.env.RELAY_KIND === 'cloud' ? 'cloud' : 'local',
   ...(PUNCH ? { PUNCH_OFFER: 'on' } : {}),
@@ -268,11 +258,6 @@ const env = {
   OWNER_IDENTITY_SECRET: await relayIdentitySecret(),
   RELAY_OWNER: () => process.env.FREERTC_OWNER || readOwnerFile(DATA_DIR),
   ASSETS,
-  // Who a socket came from (src/relay-limits.js): written here, never taken from the client.
-  CLIENT_ADDRESS_HEADER: CLIENT_ADDRESS_HEADER,
-  // Limits per address. A relay with federation off reaches no public relay: none, unless set.
-  ...Object.fromEntries(['RELAY_MAX_SOCKETS_PER_ADDRESS', 'RELAY_MAX_PEERS_PER_ADDRESS_ROOM', 'RELAY_MAX_NEW_SOCKETS_PER_MINUTE']
-    .map((name) => [name, process.env[name] ?? (federating ? undefined : '0')])),
 };
 // Any Node relay can be a tunnel home for relays behind NAT, as a worker can.
 env.RELAY_TUNNEL = nodeDurableNamespace(RelayTunnel, env);
@@ -388,12 +373,9 @@ const ctx = { waitUntil: (work) => { Promise.resolve(work).catch((error) => cons
 function toRequest(req, body) {
   const headers = new Headers();
   for (const [name, value] of Object.entries(req.headers)) {
-    if (name.toLowerCase() === CLIENT_ADDRESS_HEADER) continue;
     if (Array.isArray(value)) for (const item of value) headers.append(name, item);
     else if (value !== undefined) headers.set(name, value);
   }
-  const address = req.socket?.remoteAddress;
-  if (address && !isLoopback(address)) headers.set(CLIENT_ADDRESS_HEADER, address);
   return new Request(`http://${req.headers.host || `${HOST}:${PORT}`}${req.url}`, {
     method: req.method,
     headers,
@@ -569,11 +551,6 @@ server.on('upgrade', onUpgrade);
 async function acceptSocket(socket, pathname = '/ws', headers = []) {
   const upgrade = new Request(new URL(pathname, env.RELAY_URL.replace(/^ws/, 'http')), { headers });
   upgrade.headers.set('Upgrade', 'websocket');
-  // Through the tunnel the home names the browser's address (src/tunnel/home.js); a punched or
-  // linked socket has none, and is not counted.
-  upgrade.headers.delete(CLIENT_ADDRESS_HEADER);
-  const via = upgrade.headers.get(TUNNEL_CLIENT_HEADER);
-  if (via && !isLoopback(via)) upgrade.headers.set(CLIENT_ADDRESS_HEADER, via);
   const response = await worker.fetch(upgrade, env, ctx);
   const serverSocket = serverSocketOf(response);
   if (serverSocket) serverSocket.attach(stats.watchSocket(socket));

@@ -22,8 +22,6 @@
   },
   "exports": {
     "./client": "./src/client.js",
-    "./relay-owner": "./src/relay-owner.js",
-    "./relay-limits": "./src/relay-limits.js",
     "./package.json": "./package.json"
   },
   "type": "module",
@@ -52,7 +50,6 @@
     "src/relay-identity.js",
     "src/relay-overlay.js",
     "src/relay-owner.js",
-    "src/relay-limits.js",
     "wrangler.template.jsonc",
     "wrangler.workers-dev.jsonc",
     "scripts/node-relay.mjs",
