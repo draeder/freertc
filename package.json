@@ -52,6 +52,7 @@
     "src/relay-identity.js",
     "src/relay-overlay.js",
     "src/relay-owner.js",
+    "src/relay-limits.js",
     "wrangler.template.jsonc",
     "wrangler.workers-dev.jsonc",
     "scripts/node-relay.mjs",
