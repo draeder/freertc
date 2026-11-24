@@ -22,6 +22,8 @@
   },
   "exports": {
     "./client": "./src/client.js",
+    "./relay-owner": "./src/relay-owner.js",
+    "./relay-limits": "./src/relay-limits.js",
     "./package.json": "./package.json"
   },
   "type": "module",
