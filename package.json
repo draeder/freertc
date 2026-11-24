@@ -1,6 +1,6 @@
 {
   "name": "freertc",
-  "version": "0.5.10",
+  "version": "0.5.11",
   "description": "WebRTC browser client and Cloudflare Worker signaling relay with D1 storage.",
   "keywords": [
     "webrtc",
