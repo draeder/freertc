@@ -38,7 +38,7 @@ function relayLog(what, line) {
 export { RelayTunnel } from "./tunnel/home.js";
 
 const PSP_VERSION = "1.0";
-const WORKER_VERSION = "0.5.5";
+const WORKER_VERSION = "0.5.7";
 
 const DISCOVERY_TYPES = new Set(["announce", "withdraw", "discover", "peer_list", "redirect"]);
 const NEGOTIATION_TYPES = new Set(["connect_request", "connect_accept", "connect_reject", "offer", "answer", "ice_candidate", "ice_end", "renegotiate"]);
