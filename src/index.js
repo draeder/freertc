@@ -15,7 +15,7 @@ import {
   relayNodeIdOf,
 } from "./relay-overlay.js";
 import { relayPeerIdFor } from "./relay-id.js";
-import { ownerProof, ownerRevoke } from "./relay-owner.js";
+import { ownNodeId, ownerProof, ownerRevoke } from "./relay-owner.js";
 import { clientAddressOf, createRelayLimits, loadTestHolds, parseLoadTestPass } from "./relay-limits.js";
 import { tunnelRoute } from "./tunnel/frames.js";
 import { DIRECTORY_PATH, directoryEnabled, handleDirectoryRequest } from "./direct/directory.js";
@@ -1646,7 +1646,7 @@ async function openWebSocket(request, env, ctx, selfRelayUrl) {
   const passText = url.searchParams.get("load_test");
   let loadTest = false;
   if (passText) {
-    const nodeId = relayNodeIdsByUrl.get(selfRelayUrl) ?? null;
+    const nodeId = await ownNodeId(env);
     loadTest = await loadTestHolds(env, nodeId, parseLoadTestPass(passText)).catch(() => false);
     if (!loadTest) {
       return jsonResponse({ ok: false, error: "This load-test pass is not this relay owner's, or has run out" }, 403);
