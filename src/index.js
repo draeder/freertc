@@ -15,7 +15,8 @@ import {
   relayNodeIdOf,
 } from "./relay-overlay.js";
 import { relayPeerIdFor } from "./relay-id.js";
-import { ownerProof, ownerRevoke } from "./relay-owner.js";
+import { ownNodeId, ownerProof, ownerRevoke } from "./relay-owner.js";
+import { clientAddressOf, createRelayLimits, loadTestHolds, parseLoadTestPass } from "./relay-limits.js";
 import { tunnelRoute } from "./tunnel/frames.js";
 import { DIRECTORY_PATH, directoryEnabled, handleDirectoryRequest } from "./direct/directory.js";
 import { NAMES_PATH, handleNameRequest } from "./direct/names.js";
@@ -269,14 +270,18 @@ async function runDeferredTask(env, task) {
   const relayPeerId = resolveRelayPeerId(selfRelayUrl);
   const liveSocket = () => livePeers.get(peerScopeKey(network, room, peerId))?.socket ?? null;
 
+  // task.local: a load test's peer (src/relay-limits.js). Nothing of it reaches the
+  // federation: not published, not looked up elsewhere, not forwarded.
+  const local = Boolean(task.local);
+
   if (kind === "announce") {
-    let federatedPeers = null;
+    let federatedPeers = local ? [] : null;
     if (db) {
-      await upsertAnnouncement(db, task.message);
+      await upsertAnnouncement(db, task.message, { local });
       const socket = liveSocket();
       if (socket) await deliverQueuedRelayMessages(db, socket, network, room, peerId);
     }
-    if (selfRelayUrl && isKademliaEnabled(env)) {
+    if (!local && selfRelayUrl && isKademliaEnabled(env)) {
       if (task.isHeartbeat) {
         await publishPeerProviderRecords(env, selfRelayUrl, network, room, peerId, { connections: livePeers.size });
       } else {
@@ -318,6 +323,10 @@ async function runDeferredTask(env, task) {
     const localOnly = async () => {
       try { return db ? await findPeers(db, network, room, peerId) : []; } catch { return []; }
     };
+    if (local) {
+      reply(await localOnly());
+      return;
+    }
     const deadline = setTimeout(() => { localOnly().then(reply); }, DISCOVER_REPLY_DEADLINE_MS);
     try {
       const peers = await findFederatedPeers(env, selfRelayUrl, network, room, peerId, livePeers.size);
@@ -333,7 +342,7 @@ async function runDeferredTask(env, task) {
   if (kind === "peer-left") {
     if (!db) return;
     await deleteAnnouncement(db, network, room, peerId);
-    await broadcastPeerList(env, selfRelayUrl, network, room, relayPeerId).catch(() => {});
+    await broadcastPeerList(env, selfRelayUrl, network, room, relayPeerId, local ? { federatedPeers: [] } : {}).catch(() => {});
     return;
   }
 
@@ -367,7 +376,7 @@ async function runDeferredTask(env, task) {
       console.warn(`[RELAY] Could not deliver ${type} to ${message.to}; persistence unavailable`);
       return;
     }
-    if (!selfRelayUrl) {
+    if (!selfRelayUrl || local) {
       await insertRelayMessage(db, message);
       return;
     }
@@ -640,7 +649,7 @@ async function handleFetch(request, env, ctx) {
       }
       const coordinator = relayCoordinatorStub(env);
       if (coordinator) return coordinator.fetch(request);
-      return handleWebSocket(request, env, ctx, selfRelayUrl);
+      return openWebSocket(request, env, ctx, selfRelayUrl);
     }
 
     if (url.pathname === "/ws") {
@@ -783,9 +792,11 @@ export class RelayCoordinator {
     // before, and the sockets below are the ones that are open now.
     livePeers.clear();
     networkSubscribers.clear();
+    relayLimits.clear();
     for (const socket of this.state.getWebSockets()) {
       const peer = attachmentOf(socket);
       if (!peer) continue;
+      if (peer.counted) relayLimits.restore(peer.address ?? null);
       if (peer.gen > nextSocketGeneration) nextSocketGeneration = peer.gen;
       if (!peer.network || !peer.room) continue;
       const scope = scopeKey(peer.network, peer.room);
@@ -811,7 +822,7 @@ export class RelayCoordinator {
     await primeRelayNodeId(this.env, peer.selfRelayUrl);
     const text = typeof data === "string" ? data : new TextDecoder().decode(data);
     try {
-      const result = await handleClientMessage(socket, text, this.env, this.state, peer.selfRelayUrl, peer.gen, peer.peerKey ?? null, peer.network ?? null, peer.room ?? null);
+      const result = await handleClientMessage(socket, text, this.env, this.state, peer.selfRelayUrl, peer.gen, peer.peerKey ?? null, peer.network ?? null, peer.room ?? null, { address: peer.address ?? null, loadTest: Boolean(peer.loadTest) });
       if (result) {
         try { socket.serializeAttachment({ ...peer, peerKey: result.peerKey, network: result.network, room: result.room, peerId: result.peerId }); } catch {}
       }
@@ -840,14 +851,15 @@ export class RelayCoordinator {
     this.restoreSockets();
     const peer = attachmentOf(socket);
     if (!peer) return;
-    try { socket.serializeAttachment({ ...peer, peerKey: null, network: null, room: null, peerId: null }); } catch {}
+    try { socket.serializeAttachment({ ...peer, peerKey: null, network: null, room: null, peerId: null, counted: false }); } catch {}
+    if (peer.counted) relayLimits.release(peer.address ?? null);
     if (!peer.network || !peer.room) return;
     networkSubscribers.get(scopeKey(peer.network, peer.room))?.delete(socket);
     if (!peer.peerId || !peer.peerKey) return;
     // A replaced socket can close after its successor has already announced.
     // Only the socket that still owns this peer ID may delete the shared lease.
     if (deleteLivePeerIfOwned(livePeers, peer.peerKey, socket) && this.env.DB) {
-      deferWork(this.state, this.env, { kind: "peer-left", network: peer.network, room: peer.room, peerId: peer.peerId, selfRelayUrl: peer.selfRelayUrl })
+      deferWork(this.state, this.env, { kind: "peer-left", network: peer.network, room: peer.room, peerId: peer.peerId, selfRelayUrl: peer.selfRelayUrl, local: Boolean(peer.loadTest) })
         .catch(() => {});
     }
   }
@@ -860,11 +872,7 @@ export class RelayCoordinator {
     await primeRelayNodeId(this.env, selfRelayUrl);
 
     if (upgrade && upgrade.toLowerCase() === "websocket" && url.pathname === "/ws") {
-      if (!this.state.acceptWebSocket) return handleWebSocket(request, this.env, this.state, selfRelayUrl);
-      const { 0: client, 1: server } = new WebSocketPair();
-      this.state.acceptWebSocket(server);
-      server.serializeAttachment({ gen: ++nextSocketGeneration, selfRelayUrl, peerKey: null, network: null, room: null, peerId: null });
-      return new Response(null, { status: 101, webSocket: client });
+      return openWebSocket(request, this.env, this.state, selfRelayUrl);
     }
     if (url.pathname === "/api/v1/relay" && request.method === "POST") {
       return handleRelayForward(request, this.env);
@@ -980,7 +988,7 @@ async function handleListPeers(request, env) {
   const excludePeerId = (url.searchParams.get("exclude") || "").trim();
   if (!network) return jsonResponse({ ok: false, error: "Missing network" }, 400);
   if (!room) return jsonResponse({ ok: false, error: "Missing room" }, 400);
-  const peers = await findPeers(env.DB, network, room, excludePeerId);
+  const peers = await findPeers(env.DB, network, room, excludePeerId, { forOtherRelays: true });
   return jsonResponse({ ok: true, peers });
 }
 
@@ -1573,6 +1581,16 @@ export function ensureRoleColumn(db) {
           if (!/duplicate column/i.test(String(error?.message || error))) { roleColumnReady.delete(db); throw error; }
         }
       }
+      // local_only: a load test's peer, never listed to other relays (src/relay-limits.js).
+      try {
+        await db.prepare("SELECT local_only FROM psp_announcements LIMIT 0").bind().all();
+      } catch {
+        try {
+          await db.prepare("ALTER TABLE psp_announcements ADD COLUMN local_only INTEGER").bind().run();
+        } catch (error) {
+          if (!/duplicate column/i.test(String(error?.message || error))) { roleColumnReady.delete(db); throw error; }
+        }
+      }
     })();
     roleColumnReady.set(db, ready);
   }
@@ -1585,7 +1603,7 @@ export function announcedRole(message) {
   return typeof role === "string" && /^[a-z0-9][a-z0-9-]{0,31}$/.test(role) ? role : null;
 }
 
-export async function upsertAnnouncement(db, message) {
+export async function upsertAnnouncement(db, message, { local = false } = {}) {
   await ensureRoleColumn(db);
   const now = Date.now();
   // Never a lease shorter than a client's heartbeat (40 s): clients before 0.5.2 asked for 30 s when they
@@ -1594,18 +1612,20 @@ export async function upsertAnnouncement(db, message) {
   const expiresAt = now + ttl;
 
   await db.prepare(`
-    INSERT INTO psp_announcements (network, peer_id, session_id, expires_at_ms, updated_at_ms, role)
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+    INSERT INTO psp_announcements (network, peer_id, session_id, expires_at_ms, updated_at_ms, role, local_only)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
     ON CONFLICT(network, peer_id) DO UPDATE SET
       session_id = excluded.session_id,
       expires_at_ms = excluded.expires_at_ms,
       updated_at_ms = excluded.updated_at_ms,
-      role = excluded.role
+      role = excluded.role,
+      local_only = excluded.local_only
     WHERE psp_announcements.session_id IS NOT excluded.session_id
       OR psp_announcements.role IS NOT excluded.role
+      OR psp_announcements.local_only IS NOT excluded.local_only
       OR (psp_announcements.expires_at_ms - excluded.updated_at_ms) * 2
          <= (excluded.expires_at_ms - excluded.updated_at_ms)
-  `).bind(scopeKey(message.network, normalizeRoom(message.session_id)), message.from, message.session_id, expiresAt, now, announcedRole(message)).run();
+  `).bind(scopeKey(message.network, normalizeRoom(message.session_id)), message.from, message.session_id, expiresAt, now, announcedRole(message), local ? 1 : null).run();
 }
 
 async function deleteAnnouncement(db, network, room, peerId) {
@@ -1613,14 +1633,15 @@ async function deleteAnnouncement(db, network, room, peerId) {
     .bind(scopeKey(network, room), peerId).run();
 }
 
-async function findPeers(db, network, room, requesterPeerId) {
+async function findPeers(db, network, room, requesterPeerId, { forOtherRelays = false } = {}) {
   await ensureRoleColumn(db);
   const now = Date.now();
   const storageScope = scopeKey(network, room);
+  // Another relay asking never hears of a load test's peers.
   const result = await db.prepare(`
     SELECT peer_id, session_id, updated_at_ms, role
     FROM psp_announcements
-    WHERE network = ?1 AND peer_id != ?2 AND expires_at_ms > ?3
+    WHERE network = ?1 AND peer_id != ?2 AND expires_at_ms > ?3${forOtherRelays ? " AND local_only IS NULL" : ""}
     ORDER BY peer_id ASC
     LIMIT ?4
   `).bind(storageScope, requesterPeerId, now, PEER_SCAN_LIMIT).all();
@@ -1714,8 +1735,73 @@ async function cleanupExpired(db) {
 
 // ===================== WebSocket Handler =====================
 
-function handleWebSocket(request, env, ctx, selfRelayUrl) {
+// Per address: sockets, peers per room, new sockets a minute (src/relay-limits.js).
+const relayLimits = createRelayLimits();
+export const relayLimitCounts = () => relayLimits.counts();
+
+/**
+ * A socket asking to open: within its address's limits, or with the owner's load-test pass
+ * for this relay (then not counted, and kept off the federation).
+ */
+async function openWebSocket(request, env, ctx, selfRelayUrl) {
+  const url = new URL(request.url);
+  const passText = url.searchParams.get("load_test");
+  let loadTest = false;
+  if (passText) {
+    const nodeId = await ownNodeId(env);
+    loadTest = await loadTestHolds(env, nodeId, parseLoadTestPass(passText)).catch(() => false);
+    if (!loadTest) {
+      return jsonResponse({ ok: false, error: "This load-test pass is not this relay owner's, or has run out" }, 403);
+    }
+  }
+  const address = loadTest ? null : clientAddressOf(request, env);
+  if (!loadTest) {
+    const admitted = relayLimits.admit(env, address);
+    if (!admitted.ok) {
+      relayLog("connections refused over an address's limits", `[LIMIT] ${admitted.error}`);
+      return jsonResponse({ ok: false, error: admitted.error }, 429);
+    }
+  }
+  try {
+    // A Worker relay's coordinator: a hibernatable socket, which is not billed while it waits. What it is
+    // rides with it (RelayCoordinator.webSocketMessage).
+    if (ctx?.acceptWebSocket && ctx?.getWebSockets) {
+      const { 0: client, 1: server } = new WebSocketPair();
+      ctx.acceptWebSocket(server);
+      server.serializeAttachment({ gen: ++nextSocketGeneration, selfRelayUrl, peerKey: null, network: null, room: null, peerId: null, address, loadTest, counted: !loadTest });
+      return new Response(null, { status: 101, webSocket: client });
+    }
+    return handleWebSocket(request, env, ctx, selfRelayUrl, { address, loadTest });
+  } catch (error) {
+    if (!loadTest) relayLimits.release(address);
+    throw error;
+  }
+}
+
+// When a sender was last told it is sending too fast: once a second at most.
+const toldTooFastAt = new WeakMap();
+function tellTooFast(socket, message, relayPeerId) {
+  const now = Date.now();
+  if (now - (toldTooFastAt.get(socket) ?? 0) < 1000) return;
+  toldTooFastAt.set(socket, now);
+  try {
+    socket.send(JSON.stringify({
+      psp_version: PSP_VERSION, type: "error", network: message?.network, session_id: message?.session_id,
+      from: relayPeerId, to: message?.from || "client", message_id: crypto.randomUUID(), timestamp: now,
+      ttl_ms: DEFAULT_TTL_MS, body: { error: "Too many messages from one address: some were dropped", code: "too_fast" },
+    }));
+  } catch {}
+}
+
+function handleWebSocket(request, env, ctx, selfRelayUrl, { address = null, loadTest = false } = {}) {
   const { 0: client, 1: server } = new WebSocketPair();
+  // What this socket counts against its address: released once, when it closes.
+  const limit = { address, loadTest, released: false };
+  const releaseLimits = () => {
+    if (limit.released || limit.loadTest) return;
+    limit.released = true;
+    relayLimits.release(limit.address);
+  };
   const relayPeerId = resolveRelayPeerId(selfRelayUrl);
   const socketGeneration = ++nextSocketGeneration;
 
@@ -1745,7 +1831,7 @@ function handleWebSocket(request, env, ctx, selfRelayUrl) {
     // A replaced socket can close after its successor has already announced.
     // Only the socket that still owns this peer ID may delete the shared lease.
     if (env.DB && releasedLivePeer) {
-      deferWork(ctx, env, { kind: "peer-left", network: currentNetwork, room: currentRoom, peerId: currentPeerId, selfRelayUrl })
+      deferWork(ctx, env, { kind: "peer-left", network: currentNetwork, room: currentRoom, peerId: currentPeerId, selfRelayUrl, local: limit.loadTest })
         .catch(() => {});
     }
 
@@ -1763,7 +1849,8 @@ function handleWebSocket(request, env, ctx, selfRelayUrl) {
         socketGeneration,
         peerKey,
         network,
-        room
+        room,
+        limit
       );
       if (result) {
         peerKey = result.peerKey;
@@ -1784,6 +1871,7 @@ function handleWebSocket(request, env, ctx, selfRelayUrl) {
   });
 
   server.addEventListener("close", () => {
+    releaseLimits();
     const subscriberScope = cleanupPeerState();
     if (subscriberScope) {
       const sockets = networkSubscribers.get(subscriberScope);
@@ -1794,6 +1882,7 @@ function handleWebSocket(request, env, ctx, selfRelayUrl) {
   });
 
   server.addEventListener("error", () => {
+    releaseLimits();
     const subscriberScope = cleanupPeerState();
     if (subscriberScope) {
       const sockets = networkSubscribers.get(subscriberScope);
@@ -1817,7 +1906,8 @@ async function handleClientMessage(
   socketGeneration,
   prevPeerKey = null,
   prevNetwork = null,
-  prevRoom = null
+  prevRoom = null,
+  limit = null
 ) {
   try {
     const relayPeerId = resolveRelayPeerId(selfRelayUrl);
@@ -1871,6 +1961,15 @@ async function handleClientMessage(
       return { peerKey, network, room, peerId };
     }
 
+    // Messages from one address are rate-limited (src/relay-limits.js): over the rate, dropped.
+    if (limit && !limit.loadTest && !relayLimits.message(env, limit.address)) {
+      relayLog("messages dropped over an address's rate", `[LIMIT] ${type} from ${peerId} dropped`);
+      tellTooFast(socket, message, relayPeerId);
+      return null;
+    }
+    // A load test's peers stay on this relay: nothing of theirs goes to the federation.
+    const local = Boolean(limit?.loadTest);
+
     // Subscribe to the exact Network + Room scope. A domain is only a relay;
     // domain boundaries do not replace application scope boundaries.
     if (!prevPeerKey || prevNetwork !== network || prevRoom !== room) {
@@ -1918,7 +2017,7 @@ async function handleClientMessage(
       // The registry write, queued deliveries, provider publication and the
       // joining peer's discovery all leave the runtime; they run on the
       // coordinator's alarm, never on this socket's request.
-      await deferWork(ctx, env, { kind: "announce", network, room, peerId, selfRelayUrl, message, isHeartbeat });
+      await deferWork(ctx, env, { kind: "announce", network, room, peerId, selfRelayUrl, message, isHeartbeat, local });
 
     } else if (type === "withdraw") {
       // A peer that lets go of the relay because its mesh is healthy (relay on
@@ -1929,11 +2028,11 @@ async function handleClientMessage(
       else noteAbsentPeer(peerKey);
       const releasedLivePeer = deleteLivePeerIfOwned(livePeers, peerKey, socket);
       if (db && releasedLivePeer) {
-        await deferWork(ctx, env, { kind: "peer-left", network, room, peerId, selfRelayUrl });
+        await deferWork(ctx, env, { kind: "peer-left", network, room, peerId, selfRelayUrl, local });
       }
 
     } else if (type === "discover") {
-      await deferWork(ctx, env, { kind: "discover", network, room, peerId, selfRelayUrl });
+      await deferWork(ctx, env, { kind: "discover", network, room, peerId, selfRelayUrl, local });
 
     } else if (type === "ext" && message.body?.relay_request === true) {
       // A request to this relay itself (not to a peer), answered on the same
@@ -1981,7 +2080,7 @@ async function handleClientMessage(
     } else if (type === "bye") {
       const releasedLivePeer = deleteLivePeerIfOwned(livePeers, peerKey, socket);
       if (db && releasedLivePeer) {
-        await deferWork(ctx, env, { kind: "peer-left", network, room, peerId, selfRelayUrl });
+        await deferWork(ctx, env, { kind: "peer-left", network, room, peerId, selfRelayUrl, local });
       }
 
     } else if (RELAY_TYPES.has(type)) {
@@ -2007,7 +2106,7 @@ async function handleClientMessage(
       // first, Kademlia is the fallback, and an unreachable peer's message is
       // queued — all on the coordinator's alarm, off this socket's request.
       if (!deliveredLive) {
-        await deferWork(ctx, env, { kind: "forward", network, room, peerId, selfRelayUrl, message });
+        await deferWork(ctx, env, { kind: "forward", network, room, peerId, selfRelayUrl, message, local });
       }
     }
 

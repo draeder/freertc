@@ -14,6 +14,11 @@ import { RELAY_NODE_RECORD_KIND, tunnelNodeIdOf, verifySignedRelayRecord, verify
 import {
   MAX_TUNNEL_BODY_BYTES, TUNNEL_PING, TUNNEL_PONG, decodeBody, encodeBody, forwardHeaders, tunnelRoute,
 } from './frames.js';
+import { clientAddressOf } from '../relay-limits.js';
+
+// The browser's address, for the relay's limits per address (src/relay-limits.js): named by this
+// home, which has it from Cloudflare or from the socket; never taken from the browser.
+export const TUNNEL_CLIENT_HEADER = 'x-freertc-tunnel-client';
 
 // A tunneled request with no reply by then is answered 504, and the tunnel it
 // went down is treated as dead: it is closed so the relay reconnects at once.
@@ -132,7 +137,10 @@ export class RelayTunnel {
       const sid = crypto.randomUUID();
       this.state.acceptWebSocket(server, ['peer', `sid:${sid}`]);
       server.serializeAttachment({ role: 'peer', sid, gen });
-      if (!this.sendToTunnel(tunnel, { t: 'open', sid, path, headers: forwardHeaders(request.headers) })) {
+      const headers = forwardHeaders(request.headers).filter(([name]) => name.toLowerCase() !== TUNNEL_CLIENT_HEADER);
+      const address = clientAddressOf(request, this.env);
+      if (address) headers.push([TUNNEL_CLIENT_HEADER, address]);
+      if (!this.sendToTunnel(tunnel, { t: 'open', sid, path, headers })) {
         closeQuietly(server, 1011, 'Relay tunnel closed');
         return json({ ok: false, error: 'That relay is not connected through this tunnel' }, 502);
       }
