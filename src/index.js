@@ -251,10 +251,7 @@ async function drainDeferredTasks(state, env) {
   await Promise.all(entries.map(async ([key, task]) => {
     const startedAt = Date.now();
     try {
-      await Promise.race([
-        runDeferredTask(env, task),
-        new Promise((_, reject) => setTimeout(() => reject(new Error(`timed out after ${DEFERRED_TASK_TIMEOUT_MS} ms`)), DEFERRED_TASK_TIMEOUT_MS)),
-      ]);
+      await raceTimer(runDeferredTask(env, task), DEFERRED_TASK_TIMEOUT_MS, () => { throw new Error(`timed out after ${DEFERRED_TASK_TIMEOUT_MS} ms`); });
     } catch (error) {
       debugNote({ op: "task-error", kind: task?.kind, error: String(error?.message || error).slice(0, 300), ms: Date.now() - startedAt });
       console.error(`[TASK] ${task?.kind} failed: ${error?.message}`);
@@ -395,10 +392,7 @@ async function runDeferredTask(env, task) {
     try {
       // Bounded: a forward that cannot finish inside the deadline is queued
       // like an unreachable peer instead of silently vanishing.
-      const deliveredRemote = await Promise.race([
-        forwardFederatedMessage(env, selfRelayUrl, network, room, message, livePeers.size),
-        new Promise((resolve) => setTimeout(() => resolve(false), FEDERATED_FORWARD_DEADLINE_MS)),
-      ]);
+      const deliveredRemote = await raceTimer(forwardFederatedMessage(env, selfRelayUrl, network, room, message, livePeers.size), FEDERATED_FORWARD_DEADLINE_MS, () => false);
       debugNote({ op: "forward", type, from: peerId.slice(0, 8), to: message.to.slice(0, 8), hint, delivered: deliveredRemote, ms: Date.now() - startedAt });
       if (deliveredRemote) {
         relayLog('messages routed to other relays', `[FED] Routed ${type} to peer relay for ${message.to}`);
@@ -753,13 +747,23 @@ async function handleFetch(request, env, ctx) {
 // from the destination WebSocket. A single Durable Object per relay owns both
 // entry points so a live peer can receive offers, answers, and ICE immediately
 // instead of waiting for its next ping to drain D1.
+//
+// Peer sockets are accepted through the hibernation API. A socket accepted with
+// accept() kept the object in memory, and billed for duration, for as long as
+// any peer stayed connected: a relay with one peer all day used most of the
+// free plan's daily Durable Object duration, and two went over it. Hibernated,
+// the object is billed only while it handles a message; peers stay connected.
+// What a socket is (its peer, network and room) rides with it as its
+// attachment, and the maps of live peers are rebuilt from the sockets when the
+// object wakes.
 export class RelayCoordinator {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+    this.restored = false;
     // Work queued before a restart is still in storage; make sure an alarm
     // exists to drain it.
-    state.blockConcurrencyWhile(async () => {
+    state.blockConcurrencyWhile?.(async () => {
       const pending = await state.storage.list({ prefix: DEFERRED_TASK_PREFIX, limit: 1 });
       if (pending.size > 0 && (await state.storage.getAlarm()) === null) {
         await state.storage.setAlarm(Date.now());
@@ -767,18 +771,100 @@ export class RelayCoordinator {
     }).catch(() => {});
   }
 
+  /**
+   * After hibernation the object starts afresh: its sockets are still there
+   * (getWebSockets), each with what it is. Put them back in the live maps once.
+   */
+  restoreSockets() {
+    if (this.restored) return;
+    this.restored = true;
+    if (!this.state.getWebSockets) return;
+    // The isolate may have outlived the object: what the maps hold is from
+    // before, and the sockets below are the ones that are open now.
+    livePeers.clear();
+    networkSubscribers.clear();
+    for (const socket of this.state.getWebSockets()) {
+      const peer = attachmentOf(socket);
+      if (!peer) continue;
+      if (peer.gen > nextSocketGeneration) nextSocketGeneration = peer.gen;
+      if (!peer.network || !peer.room) continue;
+      const scope = scopeKey(peer.network, peer.room);
+      if (!networkSubscribers.has(scope)) networkSubscribers.set(scope, new Set());
+      networkSubscribers.get(scope).add(socket);
+      if (!peer.peerId || !peer.peerKey) continue;
+      socketPeerIds.set(socket, peer.peerId);
+      claimLivePeer(livePeers, peer.peerKey, {
+        peerId: peer.peerId, network: peer.network, room: peer.room,
+        socket, socketGeneration: peer.gen, lastSeen: Date.now(),
+      });
+    }
+  }
+
   async alarm() {
+    this.restoreSockets();
     await drainDeferredTasks(this.state, this.env);
   }
 
+  async webSocketMessage(socket, data) {
+    this.restoreSockets();
+    const peer = attachmentOf(socket) ?? { gen: ++nextSocketGeneration, selfRelayUrl: null };
+    await primeRelayNodeId(this.env, peer.selfRelayUrl);
+    const text = typeof data === "string" ? data : new TextDecoder().decode(data);
+    try {
+      const result = await handleClientMessage(socket, text, this.env, this.state, peer.selfRelayUrl, peer.gen, peer.peerKey ?? null, peer.network ?? null, peer.room ?? null);
+      if (result) {
+        try { socket.serializeAttachment({ ...peer, peerKey: result.peerKey, network: result.network, room: result.room, peerId: result.peerId }); } catch {}
+      }
+    } catch (err) {
+      console.error("[WS] Error:", err?.message || String(err));
+      try {
+        socket.send(JSON.stringify({
+          psp_version: PSP_VERSION, type: "error",
+          from: resolveRelayPeerId(peer.selfRelayUrl), to: "client",
+          body: { error: err?.message || "Unknown error" }
+        }));
+      } catch {}
+    }
+  }
+
+  async webSocketClose(socket, code, reason) {
+    this.socketGone(socket);
+    try { socket.close(code, reason); } catch {}
+  }
+
+  async webSocketError(socket) {
+    this.socketGone(socket);
+  }
+
+  socketGone(socket) {
+    this.restoreSockets();
+    const peer = attachmentOf(socket);
+    if (!peer) return;
+    try { socket.serializeAttachment({ ...peer, peerKey: null, network: null, room: null, peerId: null }); } catch {}
+    if (!peer.network || !peer.room) return;
+    networkSubscribers.get(scopeKey(peer.network, peer.room))?.delete(socket);
+    if (!peer.peerId || !peer.peerKey) return;
+    // A replaced socket can close after its successor has already announced.
+    // Only the socket that still owns this peer ID may delete the shared lease.
+    if (deleteLivePeerIfOwned(livePeers, peer.peerKey, socket) && this.env.DB) {
+      deferWork(this.state, this.env, { kind: "peer-left", network: peer.network, room: peer.room, peerId: peer.peerId, selfRelayUrl: peer.selfRelayUrl })
+        .catch(() => {});
+    }
+  }
+
   async fetch(request) {
+    this.restoreSockets();
     const url = new URL(request.url);
     const upgrade = request.headers.get("Upgrade");
     const selfRelayUrl = resolveSelfRelayUrl(request, this.env.RELAY_URL);
     await primeRelayNodeId(this.env, selfRelayUrl);
 
     if (upgrade && upgrade.toLowerCase() === "websocket" && url.pathname === "/ws") {
-      return handleWebSocket(request, this.env, this.state, selfRelayUrl);
+      if (!this.state.acceptWebSocket) return handleWebSocket(request, this.env, this.state, selfRelayUrl);
+      const { 0: client, 1: server } = new WebSocketPair();
+      this.state.acceptWebSocket(server);
+      server.serializeAttachment({ gen: ++nextSocketGeneration, selfRelayUrl, peerKey: null, network: null, room: null, peerId: null });
+      return new Response(null, { status: 101, webSocket: client });
     }
     if (url.pathname === "/api/v1/relay" && request.method === "POST") {
       return handleRelayForward(request, this.env);
@@ -814,6 +900,23 @@ export class RelayCoordinator {
     }
     return jsonResponse({ ok: false, error: "Not Found" }, 404);
   }
+}
+
+/**
+ * `promise`, or what `onTimeout` gives (or throws) after `ms`; the timer is cleared either way. A timer
+ * left pending keeps a Durable Object from hibernating (and billed) until it fires.
+ */
+function raceTimer(promise, ms, onTimeout) {
+  let timer;
+  const deadline = new Promise((resolve, reject) => {
+    timer = setTimeout(() => { try { resolve(onTimeout()); } catch (error) { reject(error); } }, ms);
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
+/** What a hibernatable socket is (RelayCoordinator), or null. */
+function attachmentOf(socket) {
+  try { return socket.deserializeAttachment?.() ?? null; } catch { return null; }
 }
 
 function jsonResponse(body, status = 200) {
@@ -1074,7 +1177,7 @@ async function directoryRelayUrls() {
     .then((records) => records.map((record) => record.ws).filter((url) => typeof url === 'string' && url.startsWith('ws://')))
     .catch(() => [])
     .then((urls) => { directoryUrlsCache = { at: Date.now(), urls, pending: null }; return urls; });
-  return Promise.race([directoryUrlsCache.pending, new Promise((resolve) => setTimeout(() => resolve(directoryUrlsCache.urls), 1_500))]);
+  return raceTimer(directoryUrlsCache.pending, 1_500, () => directoryUrlsCache.urls);
 }
 
 async function findFederatedPeers(
