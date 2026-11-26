@@ -137,6 +137,16 @@ const SIGNAL_PING_MS = 25000
 // relay, dropped the socket, re-registered, and released every peer in the
 // process.
 const SIGNAL_PONG_TIMEOUT_MS = 60000
+// Waking is different. A laptop that slept leaves its relay socket looking OPEN while the relay dropped
+// it long ago, and with the keepalive's timing above nothing noticed for 75 to 100 seconds: the tab showed
+// its old peers, but no newcomer could find it. So a wake asks the relay at once, and a socket that does
+// not answer within a few seconds is replaced on the spot.
+const SIGNAL_RESUME_PROBE_MS = 4000
+// The same for each link: a channel that slept is pinged on waking, and one that neither answers nor sends
+// anything within this long is closed now instead of at the 20-second pong timeout.
+const DATA_RESUME_PROBE_MS = 5000
+// How long a tab must have been hidden for its becoming visible to count as a wake.
+const RESUME_AFTER_HIDDEN_MS = 5000
 // A machine that sleeps freezes this process with it. Browsers announce the
 // thaw (pageshow, resume); a Node peer — the GitPigeon watcher — has no such
 // event and used to trust a signaling socket and ICE candidates that died
@@ -665,6 +675,10 @@ export function createSignalingClient(options = {}) {
   let lastSuspendTick = 0
   let lastTickHidden = false
   let lastSignalPongAt = Date.now()
+  let signalProbeTimer = null
+  let signalInbound = 0
+  let lastSignalProbeAt = 0
+  let hiddenSince = 0
   let lastSignalPingSentAt = 0
   let intentionalClose = false
   let stoppedByUser = false
@@ -1497,6 +1511,7 @@ export function createSignalingClient(options = {}) {
     let lastPingSentAt = 0   // 0 = no ping in flight
     let lastInboundAt = Date.now()
     let lastPingRetryAt = 0
+    let channelHiddenAt = 0
     // werift delivers a message on a channel it still reports as
     // 'connecting': the remote's arming ping lands a beat before our 'open'
     // fires. Its pong is owed, not skipped — it is the only proof the remote
@@ -1541,6 +1556,7 @@ export function createSignalingClient(options = {}) {
     function onVisible() {
       if (typeof document === 'undefined') return
       if (document.hidden) {
+        channelHiddenAt = Date.now()
         // Going dormant: tell the peer BEFORE the freeze lands so it parks
         // this edge instead of executing it at the pong timeout.
         try {
@@ -1550,6 +1566,8 @@ export function createSignalingClient(options = {}) {
         } catch { /* the peer's timeout still covers a lost announcement */ }
         return
       }
+      const slept = channelHiddenAt > 0 && Date.now() - channelHiddenAt >= RESUME_AFTER_HIDDEN_MS
+      channelHiddenAt = 0
       lastPongAt = 0
       const visibleEntry = mesh.connections.get(remotePeerId)
       const owned = visibleEntry?.connection === pc && visibleEntry.channel === channel
@@ -1564,7 +1582,20 @@ export function createSignalingClient(options = {}) {
         }
       } catch {
         closeBrokenChannel('data channel resume probe failed')
+        return
       }
+      if (!slept) return
+      // After a sleep the link is as likely dead as alive: a link that neither answers nor sends anything
+      // within DATA_RESUME_PROBE_MS goes now, so the mesh replaces it, instead of at the pong timeout.
+      const wokeAt = Date.now()
+      setTimeout(() => {
+        const current = mesh.connections.get(remotePeerId)
+        if (current?.connection !== pc || current.channel !== channel) return
+        if (channel.readyState !== 'open') return
+        if (lastPongAt >= wokeAt || lastInboundAt >= wokeAt) return
+        if (typeof document !== 'undefined' && document.hidden) return
+        closeBrokenChannel(`no answer within ${DATA_RESUME_PROBE_MS / 1000}s of waking`)
+      }, DATA_RESUME_PROBE_MS)
     }
 
     function closeBrokenChannel(reason) {
@@ -2936,6 +2967,7 @@ export function createSignalingClient(options = {}) {
       // particular relay version does not emit explicit pong frames.
       lastSignalPongAt = Date.now()
       lastSignalPingSentAt = 0
+      signalInbound += 1
       handleMessage(msg)
     }
 
@@ -3115,8 +3147,54 @@ export function createSignalingClient(options = {}) {
     return true
   }
 
+  // A socket that may have died while this peer slept: ask the relay now, and if nothing at all comes
+  // back within SIGNAL_RESUME_PROBE_MS, replace the socket at once (its own close can take a minute to
+  // arrive). One ask per window, so focus and visibility arriving together send one ping, not several.
+  function probeSignaling(reason = 'resume') {
+    if (stoppedByUser || !ws || ws.readyState !== 1 || !registered) return false
+    const now = Date.now()
+    if (now - lastSignalProbeAt < SIGNAL_RESUME_PROBE_MS) return true
+    lastSignalProbeAt = now
+    const probed = ws
+    const heardBefore = signalInbound
+    lastSignalPingSentAt = now
+    send(pspEnvelope('ping', { body: { nonce: generateMessageId() } }))
+    clearTimeout(signalProbeTimer)
+    signalProbeTimer = setTimeout(() => {
+      signalProbeTimer = null
+      // Anything at all from the relay since the ask proves the socket (not only a pong).
+      if (ws !== probed || stoppedByUser || signalInbound !== heardBefore) return
+      log(`[signal] relay did not answer within ${SIGNAL_RESUME_PROBE_MS / 1000}s of ${reason}; replacing the socket`)
+      retireSignalSocket('resume_probe_timeout')
+    }, SIGNAL_RESUME_PROBE_MS)
+    return true
+  }
+
+  // Drop the current relay socket without waiting for its close, and open a new one now. Peer links are
+  // left alone: they do not depend on the relay socket.
+  function retireSignalSocket(why) {
+    const stale = ws
+    ws = null
+    if (stale) {
+      stale.onopen = null
+      stale.onmessage = null
+      stale.onerror = null
+      stale.onclose = null
+      try { stale.close(4000, why) } catch { /* ignore */ }
+    }
+    registered = false
+    stopAdvertiseHeartbeat()
+    stopKeepalive()
+    setStatus(`disconnected (${why})`)
+    resetReconnectBackoff()
+    openSocket()
+  }
+
   function handleVisibilityChange() {
-    if (typeof document === 'undefined' || document.hidden) return
+    if (typeof document === 'undefined') return
+    if (document.hidden) { hiddenSince = Date.now(); return }
+    const slept = hiddenSince > 0 && Date.now() - hiddenSince >= RESUME_AFTER_HIDDEN_MS
+    hiddenSince = 0
     // Tab became visible (or resumed from freeze) — check if WebSocket dropped
     // while the tab was inactive.
     _reacquireWakeLockIfNeeded()
@@ -3138,6 +3216,7 @@ export function createSignalingClient(options = {}) {
             onConnectionStateChangeCb?.({ peerId: rPeerId, state: 'closed', ts: Date.now() })
           }
         }
+        if (slept) probeSignaling('waking')
         client.requestBootstrap([peerId])
       }
     }
@@ -3150,6 +3229,11 @@ export function createSignalingClient(options = {}) {
       startSuspendWatch()
       startRelayWatch()
       openSocket()
+    },
+
+    /** After a wake (or the network coming back): check the relay socket answers, and replace it at once if not. */
+    probeSignaling(reason = 'resume') {
+      return probeSignaling(reason)
     },
 
     requestBootstrap(excludePeerIds = [peerId]) {
