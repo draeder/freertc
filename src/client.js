@@ -63,6 +63,7 @@ const DATA_SUSPECT_MS = 4000
 // ordered chunk frames and is reassembled on receive; 8 KiB raw slices keep
 // each JSON-escaped frame safely under the proven 16 KiB interop ceiling.
 const DATA_CHUNK_SLICE = 8192
+const SIDE_CHANNEL_PREFIX = 'side:'
 const DATA_CHUNK_THRESHOLD = 15000
 const DATA_CHUNK_FRAME = '~fc'
 const DATA_CHUNK_MAX_FRAMES = 4096
@@ -592,6 +593,7 @@ export function createSignalingClient(options = {}) {
     // A relay said no relay has this peer: ({ peerId }). The peer has left.
     onPeerGone,
     onConnectionStateChange,
+    onSideChannel,
     onStatusChange,
     onDataMessage,
     // Optional first-choice path for addressed signaling frames. Called with
@@ -683,6 +685,7 @@ export function createSignalingClient(options = {}) {
   let intentionalClose = false
   let stoppedByUser = false
   let onConnectionStateChangeCb = onConnectionStateChange
+  let onSideChannelCb = onSideChannel
   let lastBootstrapCountLogged = null
 
   // ── Relay on demand ───────────────────────────────────────────────────────
@@ -2168,6 +2171,11 @@ export function createSignalingClient(options = {}) {
         try { event.channel?.close?.() } catch {}
         return
       }
+      // A side channel (label side:<name>) is the host's, on this link: never the mesh channel.
+      if (String(event.channel?.label || '').startsWith(SIDE_CHANNEL_PREFIX)) {
+        acceptSideChannel(remotePeerId, event.channel)
+        return
+      }
       // Glare leaves BOTH peers with a channel on this connection: the one
       // each created for its own offer, and the one the other created. SCTP
       // opens both once the winning offer connects. The two peers must keep
@@ -2211,6 +2219,35 @@ export function createSignalingClient(options = {}) {
     }
 
     return pc
+  }
+
+  // Side channels: more data channels on a peer's existing WebRTC link, for a host's own traffic (media,
+  // say) with its own delivery rules: unordered, no retransmits. They open in band, so no new offer or
+  // answer goes through the relay, and the relay never carries them: a link through the relay (relayed)
+  // has none.
+  function acceptSideChannel(remotePeerId, channel) {
+    channel.binaryType = 'arraybuffer'
+    const name = String(channel.label).slice(SIDE_CHANNEL_PREFIX.length)
+    if (!onSideChannelCb) {
+      try { channel.close() } catch {}
+      return
+    }
+    try { onSideChannelCb({ peerId: remotePeerId, name, channel }) } catch (error) {
+      log(`[webrtc] side channel ${name} from ${remotePeerId}: ${error?.message || error}`)
+    }
+  }
+
+  function openSideChannel(remotePeerId, name, init = {}) {
+    const entry = mesh.connections.get(remotePeerId)
+    const pc = entry?.connection
+    if (!pc || entry.relayed || pc.relayed || typeof pc.createDataChannel !== 'function') return null
+    if (entry.channel?.readyState !== 'open') return null
+    const channel = pc.createDataChannel(SIDE_CHANNEL_PREFIX + String(name), {
+      ordered: init.ordered ?? false,
+      ...(init.maxPacketLifeTime != null ? { maxPacketLifeTime: init.maxPacketLifeTime } : { maxRetransmits: init.maxRetransmits ?? 0 }),
+    })
+    channel.binaryType = 'arraybuffer'
+    return channel
   }
 
   async function initiateWebRTCConnection(toPeerId, iceServers = null) {
@@ -3232,6 +3269,20 @@ export function createSignalingClient(options = {}) {
     },
 
     /** After a wake (or the network coming back): check the relay socket answers, and replace it at once if not. */
+    /**
+     * Another data channel on the WebRTC link to a peer, for the host's own traffic: unordered with no
+     * retransmits unless `init` says otherwise. Null when there is no open WebRTC link (a link through
+     * the relay has none: the relay never carries it). The peer receives it through onSideChannel.
+     */
+    openSideChannel(remotePeerId, name, init) {
+      return openSideChannel(remotePeerId, name, init)
+    },
+
+    /** Side channels a peer opens to this one: ({ peerId, name, channel }). None set: they are refused. */
+    onSideChannel(handler) {
+      onSideChannelCb = typeof handler === 'function' ? handler : null
+    },
+
     probeSignaling(reason = 'resume') {
       return probeSignaling(reason)
     },
