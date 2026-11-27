@@ -122,6 +122,8 @@ test('a side channel opens on an open link, unordered with no retransmits, and n
     assert.deepEqual(side.init, { ordered: false, maxRetransmits: 0 })
     assert.equal(side.binaryType, 'arraybuffer')
     assert.equal(h.client.mesh.connections.get('z-remote').channel, pc.channels[0])
+    const files = h.client.openSideChannel('z-remote', 'files', { reliable: true })
+    assert.deepEqual(files.init, { ordered: true }, 'reliable: no limit on resending')
   } finally {
     h.restore()
   }

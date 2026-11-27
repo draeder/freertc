@@ -2242,10 +2242,14 @@ export function createSignalingClient(options = {}) {
     const pc = entry?.connection
     if (!pc || entry.relayed || pc.relayed || typeof pc.createDataChannel !== 'function') return null
     if (entry.channel?.readyState !== 'open') return null
-    const channel = pc.createDataChannel(SIDE_CHANNEL_PREFIX + String(name), {
-      ordered: init.ordered ?? false,
-      ...(init.maxPacketLifeTime != null ? { maxPacketLifeTime: init.maxPacketLifeTime } : { maxRetransmits: init.maxRetransmits ?? 0 }),
-    })
+    // reliable: every message arrives (ordered unless asked otherwise), as for files. Otherwise unordered,
+    // and each message resent for at most maxPacketLifeTime ms, or maxRetransmits times (0 by default).
+    const channel = pc.createDataChannel(SIDE_CHANNEL_PREFIX + String(name), init.reliable === true
+      ? { ordered: init.ordered ?? true }
+      : {
+          ordered: init.ordered ?? false,
+          ...(init.maxPacketLifeTime != null ? { maxPacketLifeTime: init.maxPacketLifeTime } : { maxRetransmits: init.maxRetransmits ?? 0 }),
+        })
     channel.binaryType = 'arraybuffer'
     return channel
   }
