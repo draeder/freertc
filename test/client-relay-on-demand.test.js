@@ -339,6 +339,24 @@ test('a peer tells its live neighbours which peers it can vouch for', async () =
   } finally { h.restore() }
 })
 
+test('a peer on the relay tells it which peers it has live links to, when that changes', async () => {
+  const pool = await poolByCloseness()
+  const h = harness(pool[0])
+  try {
+    const members = () => h.socket.sent.filter((m) => m.type === 'ext' && m.body?.action === 'members')
+    for (const id of pool.slice(20, 23)) await h.addLiveNeighbour(id)
+    await h.client.evaluateRelay()
+    assert.deepEqual(members().at(-1)?.body.ids, [...pool.slice(20, 23)].sort(), 'its live neighbours, by name')
+    const sent = members().length
+    await h.client.evaluateRelay()
+    assert.equal(members().length, sent, 'the same list is not sent again (until the heartbeat)')
+    // A neighbour gone: told at once.
+    h.client.mesh.connections.get(pool[21]).channel.close()
+    await h.client.evaluateRelay()
+    assert.ok(!members().at(-1).body.ids.includes(pool[21]), 'the one that went is no longer named')
+  } finally { h.restore() }
+})
+
 test('the anchor count and minimum mesh size cannot be configured to zero', async () => {
   const pool = await poolByCloseness()
   const h = harness(pool[10], { relay: { mode: 'on-demand', anchors: 0, minMeshPeers: 0, settleMs: 0, evalMs: 3_600_000 } })

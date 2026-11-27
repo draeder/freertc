@@ -141,6 +141,54 @@ test('a watch hears who is in every room of its network, then each change, throu
   assert.equal((await open('https://watch.example/watch?network=bad%20name')).status, 400);
 });
 
+test('peers that let go of the relay are known by name from their neighbour on it, and go when it stops naming them', async () => {
+  const env = { DB: new MemoryD1(), RELAY_URL: 'wss://watch.example/ws' };
+  let object;
+  const state = objectState(() => object);
+  object = new RelayCoordinator(state, env);
+  const open = async (url) => {
+    const response = await object.fetch(new Request(url, { headers: { Upgrade: 'websocket' } }));
+    const socket = new Socket();
+    serverSocketOf(response).attach(socket);
+    return socket;
+  };
+  const members = (from, room, ids) => envelope(from, 'ext', room, { body: { action: 'members', ids } });
+  const anchor = await open('https://watch.example/ws');
+  anchor.emit('message', announce('anchor', 'temp'));
+  const other = await open('https://watch.example/ws');
+  other.emit('message', announce('other', 'temp'));
+  await tick();
+  const watch = await open('https://watch.example/watch?network=app');
+  const seen = () => events(watch).slice(1).map((m) => `${m.t} ${m.id}@${m.room}`);
+
+  // The anchor names its neighbours: the one with no socket here comes, by name.
+  anchor.emit('message', members('anchor', 'temp', ['other', 'resting-1']));
+  await tick();
+  assert.deepEqual(seen(), ['join resting-1@temp']);
+  // A neighbour that lets go of the relay while named is still in the room: nothing is told.
+  other.emit('message', envelope('other', 'withdraw', 'temp', { body: { reason: 'relay_idle' } }));
+  other.close(1000, 'relay_idle'); // as the client does: it withdraws, then closes its socket
+  await tick();
+  assert.deepEqual(seen(), ['join resting-1@temp'], 'no rest, no leave: it is named');
+  // A new watch sees all three.
+  const late = await open('https://watch.example/watch?network=app');
+  assert.deepEqual(events(late)[0].peers.filter((p) => p.room === 'temp').map((p) => p.id).sort(), ['anchor', 'other', 'resting-1']);
+  // Through hibernation the names are kept (with the anchor's socket), and nobody is told anything again.
+  object = new RelayCoordinator(state, env);
+  anchor.emit('message', envelope('anchor', 'ping', 'temp'));
+  await tick();
+  const later = await open('https://watch.example/watch?network=app');
+  assert.deepEqual(events(later)[0].peers.filter((p) => p.room === 'temp').map((p) => p.id).sort(), ['anchor', 'other', 'resting-1']);
+  // One leaves the mesh: the anchor stops naming it, and it is gone at once.
+  anchor.emit('message', members('anchor', 'temp', ['other']));
+  await tick();
+  assert.equal(seen().at(-1), 'leave resting-1@temp');
+  // The anchor itself goes: it and the peers only it named.
+  anchor.close(1000, 'bye');
+  await tick();
+  assert.deepEqual(seen().slice(-2).sort(), ['leave anchor@temp', 'leave other@temp']);
+});
+
 test('watchedNetworks and networkSnapshot', () => {
   assert.deepEqual(watchedNetworks(new URL('https://x/watch?network=a&network=a&network=b')), { networks: ['a', 'b'] });
   assert.ok(watchedNetworks(new URL(`https://x/watch?${Array.from({ length: 21 }, (_, i) => `network=n${i}`).join('&')}`)).error);

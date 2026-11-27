@@ -84,6 +84,44 @@ const networkSubscribers = new Map(); // key: JSON [network, room] -> Set of soc
 const networkWatch = createNetworkWatch();
 // Set while a woken coordinator rebuilds its live peers: they were there all along, so nobody is told.
 let restoringLivePeers = false;
+// The peers each peer on this relay has live mesh links to in its room (it reports them: freertc's
+// reportMembers). Most peers let go of the relay once their mesh is up (relay on demand); this is how the
+// relay still knows them by name, and knows the moment they go. Memory only: no database write.
+const meshMembers = new Map(); // reporter's peerKey -> { network, room, ids: Set }
+const MAX_REPORTED_MEMBERS = 64;
+// What a reporter's socket keeps of its list, to have it back after hibernation (an attachment is small).
+const MAX_KEPT_MEMBERS = 30;
+const PEER_ID = /^[\w.:-]{1,128}$/;
+
+function memberVouches(network, room, id) {
+  let n = 0;
+  for (const m of meshMembers.values()) if (m.network === network && m.room === room && m.ids.has(id)) n++;
+  return n;
+}
+function isLive(network, room, id) {
+  return livePeers.has(peerScopeKey(network, room, id));
+}
+/** A reporter's new list: who it names for the first time comes, who no one names any more goes. */
+function setMeshMembers(reporterKey, network, room, ids, { quiet = false } = {}) {
+  const before = meshMembers.get(reporterKey)?.ids ?? new Set();
+  const after = new Set(ids);
+  if (after.size) meshMembers.set(reporterKey, { network, room, ids: after });
+  else meshMembers.delete(reporterKey);
+  if (quiet) return;
+  for (const id of after) {
+    if (!before.has(id) && !isLive(network, room, id) && memberVouches(network, room, id) === 1) {
+      networkWatch.joined({ peerId: id, network, room });
+    }
+  }
+  for (const id of before) {
+    if (!after.has(id) && !isLive(network, room, id) && memberVouches(network, room, id) === 0) {
+      networkWatch.left({ peerId: id, network, room });
+    }
+  }
+}
+function cleanMemberIds(value) {
+  return Array.isArray(value) ? [...new Set(value.filter((id) => typeof id === "string" && PEER_ID.test(id)))].slice(0, MAX_REPORTED_MEMBERS) : [];
+}
 const peerRelayHints = new Map(); // key: JSON [network, room, peerId] -> { url, expiresAt }
 // Diagnostic trail of federation work done on behalf of live sockets. Read
 // through GET /debug/state on the coordinator. Bounded; newest last.
@@ -491,10 +529,15 @@ export function deleteLivePeerIfOwned(livePeerMap, key, socket) {
   if (!current || current.socket !== socket) return false;
   livePeerMap.delete(key);
   if (livePeerMap === livePeers && !current.local) {
-    // A peer that let go of the relay because its mesh is healthy is still in the room: resting, not gone.
-    const restingUntil = relayIdlePeerUntilMs.get(key) ?? 0;
-    if (restingUntil > Date.now()) networkWatch.rested(current, restingUntil);
-    else networkWatch.left(current);
+    // A peer another names as its mesh neighbour is still in the room, whether or not it holds a socket here.
+    if (!memberVouches(current.network, current.room, current.peerId)) {
+      // A peer that let go of the relay because its mesh is healthy is still in the room: resting, not gone.
+      const restingUntil = relayIdlePeerUntilMs.get(key) ?? 0;
+      if (restingUntil > Date.now()) networkWatch.rested(current, restingUntil);
+      else networkWatch.left(current);
+    }
+    // What it named is no longer said by it.
+    setMeshMembers(key, current.network, current.room, []);
   }
   return true;
 }
@@ -814,6 +857,7 @@ export class RelayCoordinator {
     livePeers.clear();
     networkSubscribers.clear();
     networkWatch.clear();
+    meshMembers.clear();
     relayLimits.clear();
     restoringLivePeers = true;
     try { this.restoreSocketList(); } finally { restoringLivePeers = false; }
@@ -827,6 +871,7 @@ export class RelayCoordinator {
       if (peer.gen > nextSocketGeneration) nextSocketGeneration = peer.gen;
       if (Array.isArray(peer.watch)) { networkWatch.add(socket, peer.watch); continue; }
       if (!peer.network || !peer.room) continue;
+      if (peer.peerKey && Array.isArray(peer.members) && peer.members.length) setMeshMembers(peer.peerKey, peer.network, peer.room, peer.members, { quiet: true });
       const scope = scopeKey(peer.network, peer.room);
       if (!networkSubscribers.has(scope)) networkSubscribers.set(scope, new Set());
       networkSubscribers.get(scope).add(socket);
@@ -848,13 +893,15 @@ export class RelayCoordinator {
     this.restoreSockets();
     const peer = attachmentOf(socket) ?? { gen: ++nextSocketGeneration, selfRelayUrl: null };
     // A watch only listens: what its socket sends (other than the auto-answered ping) is ignored.
-    if (Array.isArray(peer.watch)) return;
+    if (Array.isArray(peer.watch) || peer.gone) return;
     await primeRelayNodeId(this.env, peer.selfRelayUrl);
+    // Closed while this message waited: it must not bring the peer back.
+    if (attachmentOf(socket)?.gone) return;
     const text = typeof data === "string" ? data : new TextDecoder().decode(data);
     try {
       const result = await handleClientMessage(socket, text, this.env, this.state, peer.selfRelayUrl, peer.gen, peer.peerKey ?? null, peer.network ?? null, peer.room ?? null, { address: peer.address ?? null, loadTest: Boolean(peer.loadTest) });
       if (result) {
-        try { socket.serializeAttachment({ ...peer, peerKey: result.peerKey, network: result.network, room: result.room, peerId: result.peerId, role: livePeers.get(result.peerKey)?.role ?? null }); } catch {}
+        try { socket.serializeAttachment({ ...peer, peerKey: result.peerKey, network: result.network, room: result.room, peerId: result.peerId, role: livePeers.get(result.peerKey)?.role ?? null, members: [...(meshMembers.get(result.peerKey)?.ids ?? [])].slice(0, MAX_KEPT_MEMBERS) }); } catch {}
       }
     } catch (err) {
       console.error("[WS] Error:", err?.message || String(err));
@@ -881,7 +928,7 @@ export class RelayCoordinator {
     this.restoreSockets();
     const peer = attachmentOf(socket);
     if (!peer) return;
-    try { socket.serializeAttachment({ ...peer, peerKey: null, network: null, room: null, peerId: null, watch: null, counted: false }); } catch {}
+    try { socket.serializeAttachment({ ...peer, peerKey: null, network: null, room: null, peerId: null, watch: null, counted: false, gone: true }); } catch {}
     if (peer.counted) relayLimits.release(peer.address ?? null);
     if (Array.isArray(peer.watch)) { networkWatch.remove(socket); return; }
     if (!peer.network || !peer.room) return;
@@ -1792,7 +1839,7 @@ async function openWatchSocket(request, env, ctx) {
   const start = () => {
     networkWatch.add(server, asked.networks);
     for (const network of asked.networks) {
-      try { server.send(JSON.stringify(networkSnapshot(network, livePeers, relayIdlePeerUntilMs))); } catch {}
+      try { server.send(JSON.stringify(networkSnapshot(network, livePeers, relayIdlePeerUntilMs, meshMembers))); } catch {}
     }
   };
   try {
@@ -2141,6 +2188,10 @@ async function handleClientMessage(
           body: { ...(result ?? { ok: false, error: "unsupported" }), relay_response: true, request_id: message.body.request_id ?? null },
         }));
       } catch { /* the socket went away */ }
+
+    } else if (type === "ext" && message.body?.action === "members") {
+      // Who this peer has live mesh links to (freertc's reportMembers): told to the network's watchers.
+      if (!local) setMeshMembers(peerKey, network, room, cleanMemberIds(message.body.ids));
 
     } else if (type === "ext" && message.body?.action === "relay_list") {
       // Remote relay is sharing its known relay list — cache any new entries

@@ -6,8 +6,12 @@
 //   { t: "join",  network, id, room, role? }                        a peer arrived (or its role changed)
 //   { t: "leave", network, id, room }                               a peer left
 //   { t: "rest",  network, id, room, until }                        a peer let go of the relay on purpose
-//                                                                   (its mesh is healthy) and is in the
-//                                                                   room until `until` unless it says more
+//                                                                   (its mesh is healthy), and no peer on
+//                                                                   the relay names it: in the room until
+//                                                                   `until` unless it says more
+//
+// A peer on the relay names its live mesh neighbours (freertc's reportMembers): those are in the room by
+// name whether or not they hold a socket here, and leave the moment no one names them.
 //
 // Each relay tells of the peers it has; a watcher watches every relay it knows. The relay never asks
 // anything to keep a watch going: a change it already handles is told as it happens, and nothing runs on a
@@ -71,11 +75,16 @@ export function createNetworkWatch() {
  * Who a network has here: its live peers, and the peers resting off the relay whose lease has not ended.
  * `live` is the relay's map of live peers, `resting` its map of [network, room, peerId] keys to lease ends.
  */
-export function networkSnapshot(network, live, resting, now = Date.now()) {
+export function networkSnapshot(network, live, resting, members = new Map(), now = Date.now()) {
   const peers = new Map();
   for (const peer of live.values()) {
     if (peer.network !== network || peer.local) continue;
     peers.set(`${peer.room}\n${peer.peerId}`, { id: peer.peerId, room: peer.room, ...(peer.role ? { role: peer.role } : {}) });
+  }
+  // Peers a peer on the relay names as its live mesh neighbours (they let go of the relay, or never held it).
+  for (const m of members.values()) {
+    if (m.network !== network) continue;
+    for (const id of m.ids) if (!peers.has(`${m.room}\n${id}`)) peers.set(`${m.room}\n${id}`, { id, room: m.room });
   }
   for (const [key, until] of resting) {
     if (until <= now) continue;
