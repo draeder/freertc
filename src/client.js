@@ -186,6 +186,8 @@ const NEGOTIATION_TTL_MS = 10000
 // leaves room for two lost beats before the peer disappears from the registry.
 const ADVERTISE_TTL_MS = 120000
 const ADVERTISE_HEARTBEAT_MS = ADVERTISE_TTL_MS / 3
+// The most mesh neighbours one report to the relay names (reportMembers).
+const MEMBERS_REPORT_MAX = 64
 const NEGOTIATION_TYPES = new Set(['offer', 'answer', 'ice_candidate', 'ice_end', 'renegotiate'])
 // Frames addressed to one peer that can travel over an established mesh
 // instead of the relay: everything a negotiation needs, plus the goodbye.
@@ -707,6 +709,8 @@ export function createSignalingClient(options = {}) {
   let relayEvaluating = false
   let pendingBootstrapPeerIds = null
   let lastAnchorBroadcast = { key: '', at: 0 }
+  // What this peer last told its relay about its mesh (reportMembers).
+  let lastMembersReport = { key: '', at: 0 }
   const closenessKeys = new Map()
 
   // ── Wake Lock ─────────────────────────────────────────────────────────────
@@ -1389,6 +1393,20 @@ export function createSignalingClient(options = {}) {
     return { neighbours, direct, anchors, isolated, isAnchor, awake, held, local, wantRelay: local || isolated || isAnchor || awake || held || relayedLinks.size > 0 }
   }
 
+  // Tell the relay which peers this one has live links to in the room. Those that let go of the relay
+  // (relay on demand) are then still known to it by name, so a watcher of the network (an app's console)
+  // sees them, and sees them leave the moment this peer's link to them goes. Sent when the list changes,
+  // and with the heartbeat while it has anyone in it; handled in the relay's memory (no database write).
+  function reportMembers(ids) {
+    if (!registered || relayIdle || !ws || ws.readyState !== WebSocket.OPEN) return
+    const list = [...new Set(ids)].filter((id) => typeof id === 'string' && id !== peerId).sort().slice(0, MEMBERS_REPORT_MAX)
+    const key = list.join(',')
+    const now = Date.now()
+    if (key === lastMembersReport.key && (!list.length || now - lastMembersReport.at < ADVERTISE_HEARTBEAT_MS)) return
+    lastMembersReport = { key, at: now }
+    send(pspEnvelope('ext', { body: { action: 'members', ids: list } }))
+  }
+
   // Tell each live neighbour which ids this peer can vouch for. Sent when the answer changes and
   // otherwise often enough that it never goes stale at the other end.
   function broadcastAnchors(neighbourIds, direct) {
@@ -1455,6 +1473,7 @@ export function createSignalingClient(options = {}) {
     try {
       const decision = await relayDecision()
       broadcastAnchors(decision.neighbours, decision.direct)
+      reportMembers(decision.neighbours)
       if (decision.wantRelay) {
         relayReleasableSince = 0
         if (relayIdle) wakeRelay(decision.isolated ? 'cut off from the mesh' : decision.held ? 'held by the host' : 'anchor')
@@ -2848,6 +2867,7 @@ export function createSignalingClient(options = {}) {
     const completeRegistration = (registrationMessage, source = 'ack') => {
       if (registered) return
       registered = true
+      lastMembersReport = { key: '', at: 0 }
       setStatus('registered')
       log(`[signal] registered as ${peerId} on network ${networkId} (${source})`)
       startAdvertiseHeartbeat()

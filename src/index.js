@@ -21,6 +21,7 @@ import { tunnelRoute } from "./tunnel/frames.js";
 import { DIRECTORY_PATH, directoryEnabled, handleDirectoryRequest } from "./direct/directory.js";
 import { NAMES_PATH, handleNameRequest } from "./direct/names.js";
 import { REACHABLE_PATH, handleReachableRequest } from "./direct/reachable.js";
+import { WATCH_PATH, createNetworkWatch, networkSnapshot, watchedNetworks } from "./network-watch.js";
 
 // Per-message log lines (one for every offer, answer and ICE candidate a relay
 // passes on) only with FREERTC_VERBOSE; otherwise they are counted, and a
@@ -79,6 +80,48 @@ const PEER_RELAY_HINT_TTL_MS = 60_000;
 
 const livePeers = new Map(); // key: JSON [network, room, peerId]
 const networkSubscribers = new Map(); // key: JSON [network, room] -> Set of sockets
+// Who watches which network's peers (src/network-watch.js): told of each live peer that comes or goes.
+const networkWatch = createNetworkWatch();
+// Set while a woken coordinator rebuilds its live peers: they were there all along, so nobody is told.
+let restoringLivePeers = false;
+// The peers each peer on this relay has live mesh links to in its room (it reports them: freertc's
+// reportMembers). Most peers let go of the relay once their mesh is up (relay on demand); this is how the
+// relay still knows them by name, and knows the moment they go. Memory only: no database write.
+const meshMembers = new Map(); // reporter's peerKey -> { network, room, ids: Set }
+const MAX_REPORTED_MEMBERS = 64;
+// What a reporter's socket keeps of its list, to have it back after hibernation (an attachment is small).
+const MAX_KEPT_MEMBERS = 30;
+const PEER_ID = /^[\w.:-]{1,128}$/;
+
+function memberVouches(network, room, id) {
+  let n = 0;
+  for (const m of meshMembers.values()) if (m.network === network && m.room === room && m.ids.has(id)) n++;
+  return n;
+}
+function isLive(network, room, id) {
+  return livePeers.has(peerScopeKey(network, room, id));
+}
+/** A reporter's new list: who it names for the first time comes, who no one names any more goes. */
+function setMeshMembers(reporterKey, network, room, ids, { quiet = false } = {}) {
+  const before = meshMembers.get(reporterKey)?.ids ?? new Set();
+  const after = new Set(ids);
+  if (after.size) meshMembers.set(reporterKey, { network, room, ids: after });
+  else meshMembers.delete(reporterKey);
+  if (quiet) return;
+  for (const id of after) {
+    if (!before.has(id) && !isLive(network, room, id) && memberVouches(network, room, id) === 1) {
+      networkWatch.joined({ peerId: id, network, room });
+    }
+  }
+  for (const id of before) {
+    if (!after.has(id) && !isLive(network, room, id) && memberVouches(network, room, id) === 0) {
+      networkWatch.left({ peerId: id, network, room });
+    }
+  }
+}
+function cleanMemberIds(value) {
+  return Array.isArray(value) ? [...new Set(value.filter((id) => typeof id === "string" && PEER_ID.test(id)))].slice(0, MAX_REPORTED_MEMBERS) : [];
+}
 const peerRelayHints = new Map(); // key: JSON [network, room, peerId] -> { url, expiresAt }
 // Diagnostic trail of federation work done on behalf of live sockets. Read
 // through GET /debug/state on the coordinator. Bounded; newest last.
@@ -474,6 +517,10 @@ export function claimLivePeer(livePeerMap, key, value) {
     return false;
   }
   livePeerMap.set(key, value);
+  // A peer that arrives (or announces another role) is told to whoever watches its network.
+  if (livePeerMap === livePeers && !restoringLivePeers && !value.local && (!current || (current.role ?? null) !== (value.role ?? null))) {
+    networkWatch.joined(value);
+  }
   return true;
 }
 
@@ -481,6 +528,17 @@ export function deleteLivePeerIfOwned(livePeerMap, key, socket) {
   const current = livePeerMap.get(key);
   if (!current || current.socket !== socket) return false;
   livePeerMap.delete(key);
+  if (livePeerMap === livePeers && !current.local) {
+    // A peer another names as its mesh neighbour is still in the room, whether or not it holds a socket here.
+    if (!memberVouches(current.network, current.room, current.peerId)) {
+      // A peer that let go of the relay because its mesh is healthy is still in the room: resting, not gone.
+      const restingUntil = relayIdlePeerUntilMs.get(key) ?? 0;
+      if (restingUntil > Date.now()) networkWatch.rested(current, restingUntil);
+      else networkWatch.left(current);
+    }
+    // What it named is no longer said by it.
+    setMeshMembers(key, current.network, current.room, []);
+  }
   return true;
 }
 
@@ -643,6 +701,12 @@ async function handleFetch(request, env, ctx) {
       });
     }
 
+    if (upgrade && upgrade.toLowerCase() === "websocket" && url.pathname === WATCH_PATH) {
+      const coordinator = relayCoordinatorStub(env);
+      if (coordinator) return coordinator.fetch(request);
+      return openWatchSocket(request, env, ctx);
+    }
+
     if (upgrade && upgrade.toLowerCase() === "websocket") {
       if (url.pathname !== "/ws") {
         return jsonResponse({ ok: false, error: "WebSocket endpoint is /ws" }, 404);
@@ -792,20 +856,29 @@ export class RelayCoordinator {
     // before, and the sockets below are the ones that are open now.
     livePeers.clear();
     networkSubscribers.clear();
+    networkWatch.clear();
+    meshMembers.clear();
     relayLimits.clear();
+    restoringLivePeers = true;
+    try { this.restoreSocketList(); } finally { restoringLivePeers = false; }
+  }
+
+  restoreSocketList() {
     for (const socket of this.state.getWebSockets()) {
       const peer = attachmentOf(socket);
       if (!peer) continue;
       if (peer.counted) relayLimits.restore(peer.address ?? null);
       if (peer.gen > nextSocketGeneration) nextSocketGeneration = peer.gen;
+      if (Array.isArray(peer.watch)) { networkWatch.add(socket, peer.watch); continue; }
       if (!peer.network || !peer.room) continue;
+      if (peer.peerKey && Array.isArray(peer.members) && peer.members.length) setMeshMembers(peer.peerKey, peer.network, peer.room, peer.members, { quiet: true });
       const scope = scopeKey(peer.network, peer.room);
       if (!networkSubscribers.has(scope)) networkSubscribers.set(scope, new Set());
       networkSubscribers.get(scope).add(socket);
       if (!peer.peerId || !peer.peerKey) continue;
       socketPeerIds.set(socket, peer.peerId);
       claimLivePeer(livePeers, peer.peerKey, {
-        peerId: peer.peerId, network: peer.network, room: peer.room,
+        peerId: peer.peerId, network: peer.network, room: peer.room, role: peer.role ?? null, local: Boolean(peer.loadTest),
         socket, socketGeneration: peer.gen, lastSeen: Date.now(),
       });
     }
@@ -819,12 +892,16 @@ export class RelayCoordinator {
   async webSocketMessage(socket, data) {
     this.restoreSockets();
     const peer = attachmentOf(socket) ?? { gen: ++nextSocketGeneration, selfRelayUrl: null };
+    // A watch only listens: what its socket sends (other than the auto-answered ping) is ignored.
+    if (Array.isArray(peer.watch) || peer.gone) return;
     await primeRelayNodeId(this.env, peer.selfRelayUrl);
+    // Closed while this message waited: it must not bring the peer back.
+    if (attachmentOf(socket)?.gone) return;
     const text = typeof data === "string" ? data : new TextDecoder().decode(data);
     try {
       const result = await handleClientMessage(socket, text, this.env, this.state, peer.selfRelayUrl, peer.gen, peer.peerKey ?? null, peer.network ?? null, peer.room ?? null, { address: peer.address ?? null, loadTest: Boolean(peer.loadTest) });
       if (result) {
-        try { socket.serializeAttachment({ ...peer, peerKey: result.peerKey, network: result.network, room: result.room, peerId: result.peerId }); } catch {}
+        try { socket.serializeAttachment({ ...peer, peerKey: result.peerKey, network: result.network, room: result.room, peerId: result.peerId, role: livePeers.get(result.peerKey)?.role ?? null, members: [...(meshMembers.get(result.peerKey)?.ids ?? [])].slice(0, MAX_KEPT_MEMBERS) }); } catch {}
       }
     } catch (err) {
       console.error("[WS] Error:", err?.message || String(err));
@@ -851,8 +928,9 @@ export class RelayCoordinator {
     this.restoreSockets();
     const peer = attachmentOf(socket);
     if (!peer) return;
-    try { socket.serializeAttachment({ ...peer, peerKey: null, network: null, room: null, peerId: null, counted: false }); } catch {}
+    try { socket.serializeAttachment({ ...peer, peerKey: null, network: null, room: null, peerId: null, watch: null, counted: false, gone: true }); } catch {}
     if (peer.counted) relayLimits.release(peer.address ?? null);
+    if (Array.isArray(peer.watch)) { networkWatch.remove(socket); return; }
     if (!peer.network || !peer.room) return;
     networkSubscribers.get(scopeKey(peer.network, peer.room))?.delete(socket);
     if (!peer.peerId || !peer.peerKey) return;
@@ -873,6 +951,9 @@ export class RelayCoordinator {
 
     if (upgrade && upgrade.toLowerCase() === "websocket" && url.pathname === "/ws") {
       return openWebSocket(request, this.env, this.state, selfRelayUrl);
+    }
+    if (upgrade && upgrade.toLowerCase() === "websocket" && url.pathname === WATCH_PATH) {
+      return openWatchSocket(request, this.env, this.state);
     }
     if (url.pathname === "/api/v1/relay" && request.method === "POST") {
       return handleRelayForward(request, this.env);
@@ -1743,6 +1824,52 @@ export const relayLimitCounts = () => relayLimits.counts();
  * A socket asking to open: within its address's limits, or with the owner's load-test pass
  * for this relay (then not counted, and kept off the federation).
  */
+/**
+ * A watch (src/network-watch.js): who is in a network's rooms here now, then each change. It counts against
+ * its address like a peer's socket. On a Worker's coordinator it hibernates: nothing is billed while the
+ * network is quiet, and what it is told is not billed at all.
+ */
+async function openWatchSocket(request, env, ctx) {
+  const asked = watchedNetworks(new URL(request.url));
+  if (asked.error) return jsonResponse({ ok: false, error: asked.error }, 400);
+  const address = clientAddressOf(request, env);
+  const admitted = relayLimits.admit(env, address);
+  if (!admitted.ok) return jsonResponse({ ok: false, error: admitted.error }, 429);
+  const { 0: client, 1: server } = new WebSocketPair();
+  const start = () => {
+    networkWatch.add(server, asked.networks);
+    for (const network of asked.networks) {
+      try { server.send(JSON.stringify(networkSnapshot(network, livePeers, relayIdlePeerUntilMs, meshMembers))); } catch {}
+    }
+  };
+  try {
+    if (ctx?.acceptWebSocket && ctx?.getWebSockets) {
+      ctx.acceptWebSocket(server);
+      server.serializeAttachment({ gen: ++nextSocketGeneration, watch: asked.networks, address, counted: true });
+      // A watcher that keeps its connection up with "ping" is answered without waking the coordinator.
+      try { if (!ctx.getWebSocketAutoResponse?.()) ctx.setWebSocketAutoResponse?.(new WebSocketRequestResponsePair("ping", "pong")); } catch {}
+      start();
+      return new Response(null, { status: 101, webSocket: client });
+    }
+    let released = false;
+    const gone = () => {
+      if (released) return;
+      released = true;
+      networkWatch.remove(server);
+      relayLimits.release(address);
+    };
+    server.addEventListener("message", (event) => { if (event.data === "ping") { try { server.send("pong"); } catch {} } });
+    server.addEventListener("close", gone);
+    server.addEventListener("error", gone);
+    server.accept();
+    start();
+    return new Response(null, { status: 101, webSocket: client });
+  } catch (error) {
+    relayLimits.release(address);
+    throw error;
+  }
+}
+
 async function openWebSocket(request, env, ctx, selfRelayUrl) {
   const url = new URL(request.url);
   const passText = url.searchParams.get("load_test");
@@ -1993,6 +2120,9 @@ async function handleClientMessage(
       peerId,
       network,
       room,
+      // What it announced itself as (a storage server, say); kept from its announcement for its other messages.
+      role: type === "announce" ? announcedRole(message) : (livePeers.get(peerKey)?.role ?? null),
+      local,
       socket,
       socketGeneration,
       lastSeen: Date.now(),
@@ -2058,6 +2188,10 @@ async function handleClientMessage(
           body: { ...(result ?? { ok: false, error: "unsupported" }), relay_response: true, request_id: message.body.request_id ?? null },
         }));
       } catch { /* the socket went away */ }
+
+    } else if (type === "ext" && message.body?.action === "members") {
+      // Who this peer has live mesh links to (freertc's reportMembers): told to the network's watchers.
+      if (!local) setMeshMembers(peerKey, network, room, cleanMemberIds(message.body.ids));
 
     } else if (type === "ext" && message.body?.action === "relay_list") {
       // Remote relay is sharing its known relay list — cache any new entries
